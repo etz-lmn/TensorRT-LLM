@@ -46,6 +46,7 @@ from _torch.moe.moe_test_utils import (
     supports_autotuner_capture,
 )
 from _torch.moe.quantize_utils import get_test_quant_params
+from torch.utils._python_dispatch import TorchDispatchMode
 from transformers.configuration_utils import PretrainedConfig
 from utils.util import check_accuracy, skip_pre_blackwell
 
@@ -2503,6 +2504,76 @@ def test_megamoe_staging_cuda_graph_replay_resets_rows_an_eager_launch_wrote():
     assert torch.equal(routes[:2], torch.full((2, top_k), 1, dtype=idx_dtype))
     assert torch.equal(routes[2:], torch.full((6, top_k), -1, dtype=idx_dtype)), routes.tolist()
     assert not bufs.topk_weights[2:].any()
+
+
+class _DeviceOpRecorder(TorchDispatchMode):
+    """Records the tensor ops issued under it, for replay the way a CUDA graph replays
+    its captured kernels: with the arguments seen at capture, without re-running the
+    Python that chose them."""
+
+    def __init__(self):
+        super().__init__()
+        self.ops = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        self.ops.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    def replay(self):
+        for func, args, kwargs in self.ops:
+            func(*args, **kwargs)
+
+
+def _stage_megamoe_routes(moe, bufs, num_tokens: int, expert: int) -> None:
+    moe._stage_inputs(
+        bufs=bufs,
+        x=torch.ones(num_tokens, bufs.activation.shape[1], dtype=torch.uint8, device=bufs.device),
+        x_sf=torch.ones(
+            num_tokens, bufs.activation_sf.shape[1], dtype=torch.uint8, device=bufs.device
+        ),
+        topk_idx=torch.full((num_tokens, 4), expert, dtype=torch.int64, device=bufs.device),
+        topk_weights=torch.full((num_tokens, 4), 0.25, dtype=torch.float32, device=bufs.device),
+        num_tokens=num_tokens,
+        top_k=4,
+        stage_activation=True,
+    )
+
+
+def _megamoe_staging(device) -> tuple[MegaMoECuteDsl, SimpleNamespace]:
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe._wait_rebalance_routes = lambda replica_plan=None: None
+    bufs = SimpleNamespace(
+        device=device,
+        activation=torch.zeros(8, 16, dtype=torch.uint8, device=device),
+        activation_sf=torch.zeros(8, 4, dtype=torch.uint8, device=device),
+        topk_weights=torch.zeros(8, 4, dtype=torch.float32, device=device),
+        topk_idx_local=torch.full((8, 4), -1, dtype=torch.int64, device=device),
+    )
+    return moe, bufs
+
+
+def _assert_only_live_routes_staged(bufs, num_tokens: int, expert: int) -> None:
+    live = torch.full((num_tokens, 4), expert, dtype=torch.int64, device=bufs.device)
+    tail = torch.full((8 - num_tokens, 4), -1, dtype=torch.int64, device=bufs.device)
+    assert torch.equal(bufs.topk_idx_local[:num_tokens], live)
+    assert torch.equal(bufs.topk_idx_local[num_tokens:], tail)
+    assert not bufs.topk_weights[num_tokens:].any()
+
+
+@pytest.mark.cpu_only
+def test_megamoe_staging_replay_resets_rows_a_later_eager_launch_wrote():
+    """Staging captured at 2 rows, an eager launch of 6 rows into the same bucket, then
+    a replay of the capture: the kernel must see -1 past row 2, not the eager routes."""
+    moe, bufs = _megamoe_staging(torch.device("cpu"))
+    with _DeviceOpRecorder() as capture:
+        _stage_megamoe_routes(moe, bufs, num_tokens=2, expert=1)
+    _stage_megamoe_routes(moe, bufs, num_tokens=6, expert=7)
+
+    capture.replay()
+
+    _assert_only_live_routes_staged(bufs, num_tokens=2, expert=1)
 
 
 @pytest.mark.cpu_only
