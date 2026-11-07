@@ -49,6 +49,7 @@ from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -99,6 +100,46 @@ from .modeling_utils import (
     layerwise_moe_quant_config,
     register_auto_model,
 )
+
+# Experiment hook: the MoE layers listed in TRTLLM_EPLB_FROZEN_LAYERS (ascending, comma-separated
+# layer indices) are built without the MoE load balancer -- plain EP with no slots, statistics or
+# host-pool segment, never updated -- so an online balancer's host pool covers only the other
+# layers. Unset or empty: every layer is built as without this hook.
+FROZEN_MOE_LAYERS_ENV = "TRTLLM_EPLB_FROZEN_LAYERS"
+
+
+def frozen_moe_layers() -> frozenset[int]:
+    raw = os.environ.get(FROZEN_MOE_LAYERS_ENV, "").strip()
+    if not raw:
+        return frozenset()
+    layers = [int(token) for token in raw.split(",")]
+    if layers != sorted(set(layers)) or any(layer < 0 for layer in layers):
+        raise ValueError(
+            f"{FROZEN_MOE_LAYERS_ENV}={raw!r}: expected ascending, distinct, non-negative layer indices"
+        )
+    return frozenset(layers)
+
+
+def create_moe_without_load_balancer(**kwargs):
+    """``create_moe`` with neither the thread-local balancer nor ``model_config.moe_load_balancer``.
+
+    A MoE takes its balancer from both (``MoE._init_load_balancer``, ``create_moe``), so the layer
+    is built from a copy of the config without one, while the thread-local balancer is hidden; it
+    is restored afterwards, also on error.
+    """
+    from ..moe.fused_moe.moe_load_balancer import _current_moe_load_balancer
+
+    model_config = copy.copy(kwargs.pop("model_config"))
+    object.__setattr__(model_config, "moe_load_balancer", None)
+    had_balancer = hasattr(_current_moe_load_balancer, "instance")
+    balancer = getattr(_current_moe_load_balancer, "instance", None)
+    if had_balancer:
+        delattr(_current_moe_load_balancer, "instance")
+    try:
+        return create_moe(model_config=model_config, **kwargs)
+    finally:
+        if had_balancer:
+            _current_moe_load_balancer.instance = balancer
 
 
 @triton.jit
@@ -1677,7 +1718,10 @@ class DeepseekV4MoE(nn.Module):
             else DEFAULT_MOE_ACTIVATION
         )
 
-        self.experts = create_moe(
+        frozen = layer_idx is not None and layer_idx in frozen_moe_layers()
+        if frozen:
+            logger.info(f"MoE layer {layer_idx} is built without the MoE load balancer")
+        self.experts = (create_moe_without_load_balancer if frozen else create_moe)(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
             hidden_size=hidden_size,
