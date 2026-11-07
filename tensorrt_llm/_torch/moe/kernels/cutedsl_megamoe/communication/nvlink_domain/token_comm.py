@@ -494,6 +494,8 @@ class _MetadataPushRouter(KernelComponent):
             iket.range_pop()
 
             iket.range_push("router.prefix_and_publish")
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.sync_threads()
             publish_sizes = self._broadcast_sizes_to_peers(
                 cute.make_tensor(histogram.iterator, cute.make_layout((self.expert_count_padded,)))
             )
@@ -651,6 +653,7 @@ class _MetadataPushRouter(KernelComponent):
             expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
             if expert < Int32(self.expert_count_padded):
                 totals[expert] = size_counter[expert]
+        cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_threads()
 
         publish_sizes = self._broadcast_sizes_to_peers(totals)
