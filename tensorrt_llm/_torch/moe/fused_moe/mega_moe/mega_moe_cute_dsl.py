@@ -69,10 +69,11 @@ non-1 scales compute correctly.
 from __future__ import annotations
 
 import functools
+import math
 import os
 import weakref
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -339,6 +340,17 @@ class MegaMoECuteDslWeightView:
     fc1_norm_const: torch.Tensor
 
 
+class MegaMoeRouteStaging(NamedTuple):
+    """The route staging of one bucket a caller may fill in place of ``run_moe``
+    (:meth:`MegaMoECuteDsl.route_staging`)."""
+
+    topk_idx: torch.Tensor
+    """``[bucket, top_k]`` slot ids in the kernel's index dtype; -1 past the live rows."""
+    topk_weights: torch.Tensor
+    """``[bucket, >= top_k]`` float32 gate weights, unit column stride; 0 past the live rows."""
+    bucket: int
+
+
 @dataclass(frozen=True)
 class _MegaMoeBuffers:
     """Unified kernel-ABI view over MegaMoE CuteDSL's user-domain buffers.
@@ -417,6 +429,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         capabilities=MoEStaticCapability(
             supports_eplb=True,
             supports_per_layer_dynamic_eplb=True,
+            supports_adaptive_eplb=True,
         ),
         doc="MegaMoE CuteDSL fused NVFP4 kernels: NVFP4 weights and activations, SM100/103/107.",
     )
@@ -805,6 +818,141 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         and reset by the next ``_run_moe``.
         """
         self._active_launch_max_tokens = chunk_max_tokens
+
+    def route_staging(self, num_tokens: int, top_k: int) -> Optional[MegaMoeRouteStaging]:
+        """The index and weight staging of the bucket the next ``run_moe`` selects, for a
+        load balancer that writes slot ids and gate weights straight into it.
+
+        The bucket is the one ``set_adaptive_launch_tokens`` hinted (so the hint precedes the
+        route). The caller fills rows ``[0, num_tokens)`` with the slots and float32 gate
+        weights, resets rows ``[num_tokens, bucket)`` to -1 and 0, and passes
+        ``topk_idx[:num_tokens]`` as the run's ``token_selected_experts``: ``run_moe``
+        recognises its own staging by address and does not stage the routes again. Returns
+        None when that ``run_moe`` does not stage routes (no hint yet, tactic autotuning, an
+        exact-size direct-input bucket, buffers not built); the caller then routes into a tensor
+        of its own.
+        """
+        staged = self._staging_of_next_run(num_tokens, top_k)
+        if staged is None:
+            return None
+        bufs, bucket = staged
+        return MegaMoeRouteStaging(bufs.topk_idx_local, bufs.topk_weights, bucket)
+
+    def _staging_of_next_run(
+        self, num_tokens: int, top_k: Optional[int] = None
+    ) -> Optional[Tuple[_MegaMoeBuffers, int]]:
+        """The buffers and bucket the next ``run_moe`` stages ``num_tokens`` rows into, or None
+        when it does not stage (no bucket hint, tactic autotuning, an exact-size direct-input
+        bucket, buffers not built). ``top_k`` narrows the bucket's built staging sets."""
+        hint = self._active_launch_max_tokens
+        if hint is None or self.tactic_autotune or not self._weights_created:
+            return None
+        bucket = self._select_launch_max_tokens(hint)
+        if num_tokens > bucket or (
+            self.ep_size > 1
+            and num_tokens == bucket
+            and bucket in self._genphase_direct_input_buckets
+        ):
+            return None
+        output_dtype = self.dtype or torch.bfloat16
+        # The cache keys are _acquire_buffers' (max_T, top_k, hidden, device, output dtype).
+        for cached_t, cached_top_k, hidden, device, dtype in self._local_staging_cache:
+            if (
+                cached_t == bucket
+                and (top_k is None or cached_top_k == top_k)
+                and hidden == self.hidden_size
+                and dtype == output_dtype
+            ):
+                break
+        else:
+            return None
+        bufs = self._acquire_buffers(
+            top_k=cached_top_k,
+            hidden=self.hidden_size,
+            device=torch.device(device),
+            output_dtype=output_dtype,
+            launch_max_T=bucket,
+        )
+        return bufs, bucket
+
+    # ------------------------------------------------------------------
+    # Adaptive EPLB backend methods (``supports_adaptive_eplb``)
+    # ------------------------------------------------------------------
+    # The MNNVL memory the slot parameters point into once adaptive EPLB moved them.
+    adaptive_eplb_block: Optional[object] = None
+
+    _DECODE_DEVICES = {"GB300": (8.0e12, 15.0e15, 0.94)}
+    """Per GPU: the HBM bandwidth (bytes/s) and the dense NVFP4 peak (FLOP/s) of the datasheet, and
+    ``scale``, the one measured number of the decode time model
+    (``tests/microbenchmarks/measure_adaptive_eplb_time_model.py``). Adaptive EPLB on MegaMoE runs
+    only where :meth:`has_decode_time_model` finds an entry; the model is refused at build otherwise.
+    """
+
+    @classmethod
+    def has_decode_time_model(cls, device_name: str) -> bool:
+        """Whether :meth:`decode_time_model` has an entry for ``device_name``."""
+        return any(key in device_name for key in cls._DECODE_DEVICES)
+
+    @property
+    def slot_id_dtype(self) -> torch.dtype:
+        """The integer dtype the kernel reads slot ids in."""
+        return self._topk_idx_dtype
+
+    def slot_weight_planes(self) -> List[Tuple[str, int]]:
+        """Names and byte alignments of the live weight planes, whose leading axis is the slot.
+
+        A load balancer that moves expert weights between ranks relocates these parameters whole;
+        each must start at a multiple of its alignment. Raises ``ValueError`` when a parameter is
+        not the plane the quant method declares.
+        """
+        spec = self.quant_method.live_weight_plane_spec(self)
+        slots = int(self.compute_slot_count)
+        planes = []
+        for plane in spec.planes:
+            shape, stride, dtype_name, _, storage_alignment = plane.storage_metadata(slots)
+            param = self.get_parameter(plane.name)
+            declared = (getattr(torch, dtype_name), tuple(shape), tuple(stride))
+            if (param.dtype, tuple(param.shape), tuple(param.stride())) != declared:
+                raise ValueError(
+                    f"MoE layer {self.layer_idx}, plane {plane.name!r}: the parameter is not the "
+                    "plane the quant method declares"
+                )
+            kernel_alignment = plane.kernel_metadata(slots)[-1]
+            alignment = math.lcm(int(plane.alignment), storage_alignment, kernel_alignment)
+            planes.append((plane.name, alignment))
+        return planes
+
+    def check_weights_movable(self) -> None:
+        """Raise once the kernel holds views of the weight planes (after its first launch)."""
+        if self._cute_weight_cache:
+            raise RuntimeError(
+                f"MoE layer {self.layer_idx} has launched its kernel: its cute weight views "
+                "hold the current plane addresses, so its planes can no longer move"
+            )
+
+    def decode_time_model(self, expert_bytes: int, device_name: str) -> Dict[str, float]:
+        """Parameters of the decode kernels' time model on ``device_name`` (``policy.TimeModel``).
+
+        A slot that receives rows streams its expert's ``expert_bytes`` from HBM once; a row costs
+        its FC1 and FC2 FLOPs at the dense FP4 peak; every 256-row tile of a slot beyond its first
+        costs a tile of rows, and every such tile of the GPU's busiest slot half a tile more, the
+        serial tail of that slot. Raises ``ValueError`` when the device has no entry.
+        """
+        for key, (bandwidth, peak, scale) in self._DECODE_DEVICES.items():
+            if key in device_name:
+                inner = int(self.expand_intermediate_size_per_partition) + int(
+                    self.intermediate_size_per_partition
+                )
+                row_us = 2.0 * self.hidden_size * inner / peak * 1e6
+                return dict(
+                    per_active_slot_us=expert_bytes / bandwidth * 1e6,
+                    per_extra_tile_us=256 * row_us,
+                    per_row_us=row_us,
+                    hot_slot_extra_tile_us=128 * row_us,
+                    scale=scale,
+                    tile_rows=256,
+                )
+        raise ValueError(f"no decode time model of MegaMoE for {device_name!r}")
 
     def _supports_load_balancer(self) -> bool:
         # Both static and dynamic EPLB are supported: the four MegaMoE-
@@ -1934,7 +2082,20 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and topk_idx.data_ptr() % 16 == 0
             and topk_weights.data_ptr() % 16 == 0
         )
-        if not use_direct_routing_inputs:
+        # Routes a load balancer wrote into this bucket's staging (route_staging):
+        # the live rows of topk_idx_local itself, with the index and weight tails
+        # already reset, so only the activation is staged.
+        routes_staged = (
+            topk_idx.data_ptr() == bufs.topk_idx_local.data_ptr()
+            and topk_idx.dtype == bufs.topk_idx_local.dtype
+            and topk_idx.shape == (num_tokens, top_k)
+            and topk_idx.is_contiguous()
+        )
+        if routes_staged:
+            if not use_direct_inputs and num_tokens > 0:
+                bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
+                bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
+        elif not use_direct_routing_inputs:
             self._stage_inputs(
                 bufs=bufs,
                 x=x,

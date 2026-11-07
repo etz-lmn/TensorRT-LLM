@@ -10047,6 +10047,11 @@ class PyExecutor:
 
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
+            balancer = self.model_engine.moe_load_balancer
+            if balancer is not None:
+                balancer.observe_scheduled_batch(scheduled_requests,
+                                                 self.is_warmup)
+
             # Run model forward on the execution stream for proper synchronization
             # with KVCacheTransferManager's onboard/offload operations. With the
             # loop on the execution stream both waits are program order.
