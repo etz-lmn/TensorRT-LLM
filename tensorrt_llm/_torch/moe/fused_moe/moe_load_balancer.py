@@ -307,6 +307,12 @@ class SingleLayerMoeLoadBalancer:
     # Standard EPLB routes to slot IDs and has no per-invocation replica plan.
     produces_replica_plan = False
 
+    # Row observation (enable_row_observation) is off until enabled: counters
+    # for a reader outside the load balancer, which nothing in it reads.
+    observed_expert_rows: Optional[torch.Tensor] = None
+    observed_rank_rows: Optional[torch.Tensor] = None
+    observed_slot_count_per_rank: Optional[int] = None
+
     def __init__(
             self,
             single_layer_load_balancer_impl: _tbr.SingleLayerMoeLoadBalancer,
@@ -652,6 +658,7 @@ class SingleLayerMoeLoadBalancer:
             torch.ops.trtllm.moe_hierarchical_statistic_update(
                 global_statistic_info, self.statistic_flag_tensor,
                 self.single_layer_load_balancer_ptr)
+            self._observe_expert_rows(global_statistic_info)
 
         if self.updates_enabled:
             if do_multi_stream():
@@ -688,6 +695,7 @@ class SingleLayerMoeLoadBalancer:
                 torch.ops.trtllm.moe_hierarchical_statistic_update(
                     global_statistic_info, self.statistic_flag_tensor,
                     self.single_layer_load_balancer_ptr)
+                self._observe_expert_rows(global_statistic_info)
 
         if self.updates_enabled:
             self.update_local_statistic(local_raw_expert_ids, is_first_stage,
@@ -754,9 +762,73 @@ class SingleLayerMoeLoadBalancer:
         if self.is_dynamic_routing():
             assert self.func_called_count["done_wait_gpu_stage"] == 1
             self.func_called_count["route"] += 1
-        return torch.ops.trtllm.moe_load_balance_routing(
+        token_selected_slots = torch.ops.trtllm.moe_load_balance_routing(
             token_selected_experts, offset_by_ep_rank,
             self.single_layer_load_balancer_ptr)
+        self._observe_routed_slots(token_selected_slots)
+        return token_selected_slots
+
+    def enable_row_observation(self,
+                               ep_size: int,
+                               slot_count_per_rank: int,
+                               device: str = 'cuda'):
+        """Count the rows of every later forward, for a reader outside the balancer.
+
+        Two int64 counters accumulate over the forwards whose statistic is
+        enabled, the same forwards the balancer's own statistic counts:
+
+        - ``observed_expert_rows[e]``: the rows all EP ranks route to expert
+          ``e``, taken from the EP-wide statistic this layer already reduces;
+        - ``observed_rank_rows[r]``: the rows of this rank's tokens that
+          ``route`` sends to a slot of EP rank ``r``; the last entry counts
+          invalid slots. Counting the routed slots follows the placement live
+          in each forward, with no copy of the placement.
+
+        Nothing the balancer reads is written. Call it before CUDA graphs are
+        captured, so that the captured forwards count too. Static routing has
+        no statistic, so there it does nothing.
+        """
+        if not self.updates_enabled:
+            return
+        self.observed_expert_rows = torch.zeros((self.expert_count, ),
+                                                dtype=torch.int64,
+                                                device=device)
+        self.observed_rank_rows = torch.zeros((ep_size + 1, ),
+                                              dtype=torch.int64,
+                                              device=device)
+        self.observed_slot_count_per_rank = slot_count_per_rank
+
+    def copy_observed_rows(self, out: torch.Tensor) -> bool:
+        """Enqueue on the current stream a copy of the row counters into ``out``.
+
+        ``out`` holds ``expert_count`` expert rows, then ``ep_size + 1`` rank
+        rows; a pinned host tensor keeps the copy asynchronous, so the caller
+        synchronizes before reading it. Returns False when observation is off.
+        """
+        if self.observed_expert_rows is None:
+            return False
+        out[:self.expert_count].copy_(self.observed_expert_rows,
+                                      non_blocking=True)
+        out[self.expert_count:].copy_(self.observed_rank_rows,
+                                      non_blocking=True)
+        return True
+
+    def _observe_expert_rows(self, global_statistic_info: torch.Tensor):
+        if self.observed_expert_rows is not None:
+            self.observed_expert_rows.add_(global_statistic_info)
+
+    def _observe_routed_slots(self, token_selected_slots: torch.Tensor):
+        if self.observed_rank_rows is None:
+            return
+        last = self.observed_rank_rows.numel() - 1
+        ranks = torch.div(token_selected_slots.reshape(-1),
+                          self.observed_slot_count_per_rank,
+                          rounding_mode='floor').clamp_(0, last).long()
+        # Each row counts the statistic flag of this forward (0 or 1), so
+        # forwards without statistic, such as warmup, add nothing.
+        counted = self.statistic_flag_tensor.to(torch.int64).expand(
+            ranks.numel()).contiguous()
+        self.observed_rank_rows.index_add_(0, ranks, counted)
 
     def py_pre_shutdown_cleanup(self):
         """
@@ -935,6 +1007,16 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         self.enable_update_weights = False
 
         self.next_layer_repeated_count = None
+        self.row_observation = False
+
+    def enable_row_observation(self):
+        """Have every layer count its routed rows for a reader outside the
+        balancer (SingleLayerMoeLoadBalancer.enable_row_observation). Off
+        unless called; call it before the first layer is added."""
+        if self.single_layer_load_balancers:
+            raise RuntimeError(
+                "enable row observation before the first layer is added")
+        self.row_observation = True
 
     # Without per-layer dynamic EPLB, executor teardown is rank-local and this
     # balancer is released by its own finalizer, which unlinks its shared memory.
@@ -1006,6 +1088,9 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
             aux_stream=aux_stream)
         single_layer_load_balancer.set_shared_memory_base_name(
             self.shared_memory_base_name)
+        if self.row_observation:
+            single_layer_load_balancer.enable_row_observation(
+                self.ep_size, slot_count_per_rank)
         self.single_layer_load_balancers.append(single_layer_load_balancer)
         return single_layer_load_balancer
 
