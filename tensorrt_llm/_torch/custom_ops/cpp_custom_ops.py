@@ -883,6 +883,36 @@ def _register_fake():
     ) -> None:
         return None
 
+    @torch.library.register_fake("trtllm::adaptive_eplb_route_into")
+    def _(
+        ids: torch.Tensor,
+        counts: torch.Tensor,
+        starts: torch.Tensor,
+        slots: torch.Tensor,
+        cumulative_shares: torch.Tensor,
+        ep_rank: int,
+        out: torch.Tensor,
+        weights: Optional[torch.Tensor] = None,
+        weights_out: Optional[torch.Tensor] = None,
+        ema: Optional[torch.Tensor] = None,
+        forwards: Optional[torch.Tensor] = None,
+        enabled: Optional[torch.Tensor] = None,
+        decay: float = 0.0,
+        first: bool = True,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::adaptive_eplb_record")
+    def _(
+        ids: torch.Tensor,
+        ema: torch.Tensor,
+        forwards: torch.Tensor,
+        enabled: torch.Tensor,
+        decay: float,
+        first: bool = True,
+    ) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::moe_a2a_get_combine_payload_tensor")
     def _(
         workspace: torch.Tensor,
