@@ -314,3 +314,33 @@ Per-layer dynamic EPLB has the following constraints:
 * **Speculative decoding**: a one-model draft's MoE layers follow the same rule as the target's: every MoE layer that runs on `MEGAMOE_CUTEDSL` registers as one more per-layer dynamic layer after the target layers, is planned and load-balanced like them, and, with `per_layer_resident`, gets its own helper slots. DSpark drafters shipped inside an NVFP4 target checkpoint, such as `DeepSeek-V4-Pro-nvfp4-DSpark`, do so with NVFP4 draft experts. A draft layer only computes correctly if its checkpoint experts are NVFP4: the `mtp.*` routed experts of the `DeepSeek-V4-Pro-NVFP4` checkpoint are MXFP4, which `MEGAMOE_CUTEDSL` does not serve, so MTP on that checkpoint is not supported with or without this load balancer.
 * **DWDP**: not supported; `dwdp_config` must keep `dwdp_size` at 1.
 * **Fields**: only `mode`, `num_slots`, `auxiliary_sms` and `helper_slot_mode`. `num_slots` is required, must be greater than the expert count, and must be divisible by the EP size. `layer_updates_per_iter` and `initial_global_assignments` are `standard`-only and rejected in this mode.
+
+## Adaptive EP Load Balancer
+
+Adaptive EPLB balances the decode steps of a run. Every expert keeps one copy on its home rank, and the slots beyond one per expert hold replicas of hot experts:
+
+1. While the generation steps run, every MoE layer counts its routed tokens per expert on the GPU, in the same launch that maps them to slots, so CUDA graphs capture both. A statistics window covers a few decode steps.
+2. At the end of a window, the ranks gather their statistics. A decision process on every rank plans a new placement per layer and prices it with a time model of the MoE backend's kernels. All ranks reach the same decision.
+3. A layer is installed only when its predicted gain per step, over the decode steps the running requests still have, exceeds the measured cost of copying its experts. The copies go into free slots on a copy stream, between peer ranks over MNNVL memory, and the new routing takes effect on all ranks at the same step.
+
+An example configuration for a model with 384 routed experts on 32 GPUs:
+
+```bash
+cat > ./config_adaptive.yaml <<EOF
+enable_attention_dp: true
+moe_config:
+    backend: MEGAMOE_CUTEDSL
+    load_balancer:
+      mode: adaptive
+      num_slots: 512    # 384 experts + 4 replica slots on each of 32 EP ranks, at most half of them filled
+EOF
+```
+
+Adaptive EPLB has the following constraints:
+
+* **Backend**: a MoE backend that declares `supports_adaptive_eplb`, currently `MEGAMOE_CUTEDSL`; other backends are rejected when the model is built.
+* **GPU type**: the backend provides a time model of its kernels for each GPU type it was measured on, currently GB300 only. On any other GPU, adaptive EPLB is rejected when the model is built.
+* **GPUs**: all EP ranks in one NVLink domain: the expert weights live in MNNVL memory that every rank maps.
+* **Parallelism**: expert parallelism (`moe_expert_parallel_size` greater than 1) without the MoE smart router; the expert count must be divisible by the EP size.
+* **Fields**: only `mode` and `num_slots`. `num_slots` is required, must be at least the expert count, and must be divisible by the EP size.
+* **Replica slots**: a placement fills at most half of the replica slots, `ep_size * ceil(r / 2)` of them for `r` replica slots per rank. The other half stays empty, so that every install has free slots to copy its new replicas into while the current replicas keep serving. In the example above, at most 64 of the 128 replica slots hold replicas at any time.

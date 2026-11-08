@@ -125,6 +125,16 @@ def create_moe_backend(
             and not moe_cls.capabilities.supports_per_layer_dynamic_eplb):
         raise ValueError(
             f"{moe_cls.__name__} does not support per-layer dynamic EPLB.")
+    if eplb_mode == "adaptive":
+        if not moe_cls.capabilities.supports_adaptive_eplb:
+            raise ValueError(
+                f"{moe_cls.__name__} does not support adaptive EPLB.")
+        device = (torch.cuda.get_device_name()
+                  if torch.cuda.is_available() else None)
+        if device is not None and not moe_cls.has_decode_time_model(device):
+            raise ValueError(
+                f"{moe_cls.__name__} has no adaptive EPLB time model for "
+                f"{device!r}.")
 
     if bias and not moe_cls.capabilities.supports_expert_bias:
         raise ValueError(f"bias not supported in {moe_cls.__name__}.")
