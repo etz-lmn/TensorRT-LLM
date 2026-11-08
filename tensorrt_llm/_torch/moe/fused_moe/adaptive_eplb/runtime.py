@@ -552,19 +552,7 @@ class AdaptiveRuntime:
         worker = self.worker
         if worker.failure is not None:
             raise RuntimeError("adaptive EPLB worker thread failed") from worker.failure
-        if self.close_at is None and self.open_at is not None and call >= self.open_at:
-            self._open_window()
-            self.open_at = None
-            self.close_at = call + self.window_forwards
-            self.window_opened_call = call
-        elif call == self.close_at:
-            self._close_window()
-        if self._pending_stats_copy is not None and not self.wants_request_progress:
-            copied = self._pending_stats_copy
-            self._pending_stats_copy = None
-            totals = self.request_totals.copy()
-            window = self.window
-            worker.post(lambda: self._gather_window(copied, totals, window))
+        # The messages first: a window scheduled to open at this call opens at it.
         while worker.inbox:
             message = worker.inbox.popleft()
             if message[0] == "schedule":
@@ -597,6 +585,19 @@ class AdaptiveRuntime:
                         ),
                     )
                 worker.post(lambda update=update: self._install(update))
+        if self.close_at is None and self.open_at is not None and call >= self.open_at:
+            self._open_window()
+            self.open_at = None
+            self.close_at = call + self.window_forwards
+            self.window_opened_call = call
+        elif call == self.close_at:
+            self._close_window()
+        if self._pending_stats_copy is not None and not self.wants_request_progress:
+            copied = self._pending_stats_copy
+            self._pending_stats_copy = None
+            totals = self.request_totals.copy()
+            window = self.window
+            worker.post(lambda: self._gather_window(copied, totals, window))
         if self.pending_updates and self.pending_updates[0][0] <= call:
             self._apply_tables(call, self.pending_updates.popleft()[1])
 

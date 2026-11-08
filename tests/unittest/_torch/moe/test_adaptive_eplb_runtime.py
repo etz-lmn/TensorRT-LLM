@@ -117,6 +117,7 @@ class FakeDecision:
         config = rt.DecisionConfig(GEOMETRY, MODEL, homes, rank, 1)
         self.decider = rt._Decider(config, self.stats.numpy())
         self.script = script
+        self.open_after = 4  # calls from a scripted apply call to the next window's open
         self.queue = []
         self.sent = []
 
@@ -128,7 +129,8 @@ class FakeDecision:
             reply = ("update", self.script(message[1]))
         else:
             apply_call = int(message[2][:, rt.ROW.index("copied_call")].max()) + 1
-            reply = ("schedule", message[1] + 1, apply_call + 4, apply_call, None, FORWARDS)
+            open_call = apply_call + self.open_after
+            reply = ("schedule", message[1] + 1, open_call, apply_call, None, FORWARDS)
         self.queue.append(reply)
 
     def recv(self):
@@ -430,6 +432,24 @@ def test_tables_apply_from_the_call_after_every_rank_copied(host_cuda):
         assert records(runtime)[0]["next_open"] == apply + 4
         assert runtime.applied_window.tolist() == [0, 0]
     assert ranks[0].transport.batches == [[]] and ranks[1].transport.batches == [[(0, 4, 0, 0)]]
+
+
+def test_a_window_opens_at_the_call_it_is_scheduled_for(host_cuda):
+    """The schedule is read before windows open: a window scheduled for the call after its apply
+    call opens at that call, which is when its schedule arrives, not a call later."""
+    clock = [0]
+    decisions = [FakeDecision(rank, script=script(rank)) for rank in range(R)]
+    for decision in decisions:
+        decision.open_after = 1
+    ranks = make_ranks(decisions, clock)
+    opened = {}
+    while len(opened) < R:
+        assert clock[0] < 32, "the second window did not open"
+        run(ranks, clock, 1)
+        opened.update(
+            (r, x.window_opened_call) for r, x in enumerate(ranks) if x.window == 1 and x.close_at
+        )
+    assert [opened[r] for r in range(R)] == [records(x)[0]["next_open"] for x in ranks]
 
 
 def test_ranks_that_decided_differently_stop_before_applying(host_cuda):
