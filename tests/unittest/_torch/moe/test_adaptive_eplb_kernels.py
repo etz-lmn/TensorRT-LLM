@@ -4,7 +4,6 @@
 versions."""
 
 import random
-import struct
 
 import pytest
 import torch
@@ -14,7 +13,6 @@ from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.balancer import (
     ExpertStatistics,
     statistics_buffers,
 )
-from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import EMA_DECAY
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.runtime import RouteTables, build_route_tables
 
 TOP_K = 6
@@ -80,19 +78,16 @@ def _stats(num_experts: int) -> ExpertStatistics:
     return ExpertStatistics.of(statistics_buffers(1, num_experts, "cuda"), 0, on)
 
 
-def _torch_record(ids, ema, forwards, first_call=True):
-    """The statistics in torch: per-expert counts, then the average's multiply and add apart.
-
-    A later call of the same forward adds its counts.
-    """
+def _torch_record(ids, rows, forwards, first_call=True):
+    """The statistics in torch: per-expert counts added to the rows; a forward's first call also
+    counts the forward."""
     experts = ids.reshape(-1).to(torch.int64)
-    valid = (experts >= 0) & (experts < ema.numel())
-    counts = torch.zeros(ema.shape, dtype=torch.int32, device=ema.device)
+    valid = (experts >= 0) & (experts < rows.numel())
+    counts = torch.zeros(rows.shape, dtype=torch.int32, device=rows.device)
     counts.scatter_add_(0, torch.where(valid, experts, 0), valid.int())
     if first_call:
-        ema.mul_(EMA_DECAY)
         forwards.add_(1)
-    ema.add_(counts.to(torch.float32))
+    rows.add_(counts.to(torch.float32))
 
 
 # ------------------------------------------------------------------------------------------------
@@ -124,15 +119,8 @@ def test_build_route_tables():
 
 
 @needs_gpu
-@pytest.mark.parametrize(
-    "id_dtype,slot_dtype",
-    [
-        (torch.int32, torch.int32),
-        (torch.int32, torch.int64),
-        (torch.int64, torch.int32),
-        (torch.int64, torch.int64),
-    ],
-)
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
 # (384, 576, 64) and (576, 768, 48): tables longer than the kernel's first read of 512 entries.
 # The last one has every expert once (no replicas, no shares).
 @pytest.mark.parametrize(
@@ -160,12 +148,8 @@ def test_route_op_matches_the_reference(id_dtype, slot_dtype, geometry):
     for rows in (1, 8, 171, 300, 1100):
         ep_rank = rng.randrange(ep_size)
         ids = _random_ids(rng, rows, num_experts, hot, id_dtype == torch.int64)
-        got = _route(
-            torch.tensor(ids, dtype=id_dtype, device="cuda").view(rows, TOP_K),
-            device_tables,
-            ep_rank,
-            slot_dtype,
-        )
+        ids_device = torch.tensor(ids, dtype=id_dtype, device="cuda").view(rows, TOP_K)
+        got = _route(ids_device, device_tables, ep_rank, slot_dtype)
         assert got.dtype == slot_dtype and tuple(got.shape) == (rows, TOP_K)
         routed = got.view(-1).tolist()
         assert routed == _reference_route(ids, tables, ep_rank)
@@ -197,12 +181,8 @@ def test_route_op_on_unroutable_tables():
     hot = [e for e in range(num_experts) if counts[e] > 1]
     for ep_rank in (0, 13, 31):
         ids = _random_ids(rng, 400, num_experts, hot, True)
-        got = _route(
-            torch.tensor(ids, dtype=torch.int64, device="cuda").view(-1, TOP_K),
-            device_tables,
-            ep_rank,
-            torch.int32,
-        )
+        ids_device = torch.tensor(ids, dtype=torch.int64, device="cuda").view(-1, TOP_K)
+        got = _route(ids_device, device_tables, ep_rank, torch.int32)
         routed = got.view(-1).tolist()
         assert routed == _reference_route(ids, (counts, starts, slots, cumulative_shares), ep_rank)
         for expert, slot in zip(ids, routed):
@@ -247,7 +227,7 @@ def test_record_op_matches_torch(num_experts):
     for step in range(120):
         if step == 60:  # a new window
             for stats in (op, expected):
-                stats.ema.zero_()
+                stats.rows.zero_()
                 stats.forwards.zero_()
         rows = rng.choice((0, 1, 8, 64, 171, 256, 4096 if step % 40 == 0 else 32))
         wide = step % 2 == 1
@@ -256,40 +236,9 @@ def test_record_op_matches_torch(num_experts):
         routes = torch.tensor(ids, dtype=torch.int64 if wide else torch.int32, device="cuda")
         routes = routes.view(rows, TOP_K)
         op.record(routes, first_call)
-        _torch_record(routes, expected.ema, expected.forwards, first_call)
-        assert torch.equal(op.ema.view(torch.int32), expected.ema.view(torch.int32))
+        _torch_record(routes, expected.rows, expected.forwards, first_call)
+        assert torch.equal(op.rows.view(torch.int32), expected.rows.view(torch.int32))
         assert torch.equal(op.forwards, expected.forwards)
-
-
-def _fl32(value: float) -> float:
-    return struct.unpack("f", struct.pack("f", value))[0]
-
-
-@needs_gpu
-def test_record_op_rounds_the_product_and_the_sum_separately():
-    # Averages just below a power of two that the forward's rows push past it: there a fused
-    # multiply-add rounds differently from the multiply and the add.
-    rng = random.Random(3)
-    decay = _fl32(EMA_DECAY)
-    averages = []
-    counts = []
-    for _ in range(4096):
-        count = rng.randrange(1, 8)
-        average = _fl32((2.0 ** rng.randrange(4, 20) - rng.random() * count) / decay)
-        if _fl32(_fl32(average * decay) + count) != _fl32(average * decay + count):
-            averages.append(average)
-            counts.append(count)
-        if len(averages) == 64:
-            break
-    assert len(averages) == 64, "too few averages that tell the two roundings from one"
-    stats = _stats(64)
-    stats.ema.copy_(torch.tensor(averages, dtype=torch.float32))
-    ids = [expert for expert, count in enumerate(counts) for _ in range(count)]
-    ids += [-1] * (-len(ids) % TOP_K)
-    stats.record(torch.tensor(ids, dtype=torch.int32, device="cuda").view(-1, TOP_K))
-    assert stats.ema.tolist() == [
-        _fl32(_fl32(average * decay) + count) for average, count in zip(averages, counts)
-    ]
 
 
 @needs_gpu
@@ -310,15 +259,15 @@ def test_route_into_op_stages_the_routes_and_records(rows, bucket):
     weights_out = torch.full((bucket, TOP_K + 2), 5.0, device="cuda")
     stats, expected = _stats(384), _stats(384)
     torch.ops.trtllm.adaptive_eplb_route_into(
-        ids, *device_tables, 3, out, weights, weights_out, *stats, EMA_DECAY, True
+        ids, *device_tables, 3, out, weights, weights_out, *stats, True
     )
     assert out[:rows].tolist() == _route(ids, device_tables, 3, torch.int64).tolist()
     assert (out[rows:] == -1).all()
     assert torch.equal(weights_out[:rows, :TOP_K], weights)
     assert (weights_out[rows:, :TOP_K] == 0).all() and (weights_out[:, TOP_K:] == 5).all()
-    _torch_record(ids, expected.ema, expected.forwards)
+    _torch_record(ids, expected.rows, expected.forwards)
     assert torch.equal(stats.forwards, expected.forwards)
-    assert torch.equal(stats.ema.view(torch.int32), expected.ema.view(torch.int32))
+    assert torch.equal(stats.rows.view(torch.int32), expected.rows.view(torch.int32))
     # Without weights the buffer holds exactly the ids' elements (a bucket needs the weights).
     plain = torch.empty(rows, TOP_K, dtype=torch.int32, device="cuda")
     torch.ops.trtllm.adaptive_eplb_route_into(ids, *device_tables, 3, plain)

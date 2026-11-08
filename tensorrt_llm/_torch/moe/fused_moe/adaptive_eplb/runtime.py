@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import itertools
+import math
 import mmap
 import os
 import queue
@@ -33,7 +34,6 @@ import numpy as np
 import torch
 
 from .policy import (
-    EMA_DECAY,
     EvaluationScheduler,
     ExpertGeometry,
     TimeModel,
@@ -116,8 +116,11 @@ def build_route_tables(
 
 
 _DECISION_MAIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "decision_main.py")
-WINDOW_FORWARDS = 8
-"""int: Forwards in one statistics window."""
+ROWS_PER_EXPERT = 512
+"""int: Rows a statistics window collects per expert, so that an expert's rows per forward carry a
+relative standard error of about 1 / sqrt(512) = 4.4 % at any batch size or draft length: a window
+lasts as many forwards as the previous window's rows per forward need to reach it. The first window
+lasts one forward; with fewer rows than that it only measures the rows per forward."""
 REQUESTS_PER_CALL = 64
 """int: Generation requests whose progress one call reads (about 20 us of main-thread time)."""
 FIELDS = (
@@ -130,7 +133,7 @@ FIELDS = (
     "applied_ms",
 )
 """tuple: The values at the end of a rank's window statistics, the float32 array the ranks
-all-gather, which holds ``ema [L, E] | forwards [L] | applied window [L] | FIELDS``.
+all-gather, which holds ``rows [L, E] | forwards [L] | applied window [L] | FIELDS``.
 
 ``remaining``, ``requests`` and ``accepted`` sum the tokens the generation requests still have to
 produce, the requests, and the tokens they accept per step. ``stats_copy_ms`` is the GPU time of
@@ -142,9 +145,9 @@ ROW = ("copied_call", "moved", "copy_ms", "digest")
 finished in, the layers it moved, their copy time and the update's digest."""
 
 
-def window_scale(forwards: int) -> float:
-    """The factor that turns a window's average after ``forwards`` forwards into rows per forward."""
-    return (1.0 - EMA_DECAY) / (1.0 - EMA_DECAY**forwards)
+def window_forwards(rows_per_forward: float, experts: int) -> int:
+    """Forwards a window needs to collect :data:`ROWS_PER_EXPERT` rows per expert."""
+    return max(1, math.ceil(ROWS_PER_EXPERT * experts / rows_per_forward))
 
 
 def window_stats_size(layers: int, experts: int) -> int:
@@ -227,6 +230,8 @@ class _Decider:
         self.stats_copies: list[float] = []
         self.evaluations = EvaluationScheduler(config.model, config.geometry)
         self.active = active_slots(config.geometry)
+        self.forwards = 1
+        self.next_forwards: int | None = None
         self.open_call = 0
         self.next_group = 0
         self.awaiting_copy: dict[int, tuple] = {}
@@ -243,17 +248,18 @@ class _Decider:
         per_rank = [[(window, int(n), float(ms))] for n, ms in zip(col["moved"], col["copy_ms"])]
         self.copy_timings.update((g, (n, ms)) for g, n, ms in agreed_timings(per_rank) if n > 0)
         close, growth, steps_left = self.awaiting_copy.pop(window)
+        self.forwards = self.next_forwards or self.forwards
         plan = self.evaluations.plan(
             apply_call,
             close,
-            WINDOW_FORWARDS,
+            self.forwards,
             self.stats_copies,
             _timings(self.install_timings),
             growth,
             steps_left,
         )
         self.open_call = apply_call + plan.open_after
-        return ("schedule", window + 1, self.open_call, apply_call, plan)
+        return ("schedule", window + 1, self.open_call, apply_call, plan, self.forwards)
 
     def decide(self, window: int) -> LayoutUpdate:
         cfg = self.config
@@ -261,7 +267,7 @@ class _Decider:
         geometry = cfg.geometry
         layers, slots = self.layout.shape
         experts = geometry.num_experts
-        close = self.open_call + WINDOW_FORWARDS
+        close = self.open_call + self.forwards
         tail = {name: stats[:, layers * (experts + 2) + i] for i, name in enumerate(FIELDS)}
         applied = [
             [(int(g), int(n), float(ms))] if g >= 0 else []
@@ -271,47 +277,50 @@ class _Decider:
         if (tail["stats_copy_ms"] > 0).all():
             self.stats_copies.append(float(tail["stats_copy_ms"].max()))
         update = LayoutUpdate(window)
-        forwards = stats[:, layers * experts : layers * (experts + 1)]
+        forwards = stats[:, layers * experts : layers * (experts + 1)].astype(np.float64)
         if forwards.min() < 1:
             # A rank counted no forward of some layer: this window gives no rows.
             self.awaiting_copy[window] = (close, None, None)
             return update
-        # Every rank's averages count with the window scale of its own forwards, relative to rank 0's.
-        scale = window_scale(int(forwards[0, 0]))
-        ema_sum = np.zeros((layers, experts))
-        for rank_stats, counted in zip(stats[:, : layers * experts], forwards):
-            ema = rank_stats.reshape(layers, experts)
-            ratio = np.array([window_scale(int(f)) / scale for f in counted])
-            ema_sum += ema if (ratio == 1.0).all() else ema * ratio[:, None]
+        # Rows per forward of every expert: every rank's rows over its own forwards, summed.
+        routed = stats[:, : layers * experts].astype(np.float64).reshape(len(stats), layers, -1)
+        rows = (routed / forwards[:, :, None]).sum(0)
+        per_forward = float(rows.sum(1).mean())
+        counted = float(routed.sum((0, 2)).mean())
+        sizing = self.next_forwards is None and counted < ROWS_PER_EXPERT * experts
+        if per_forward > 0.0:
+            self.next_forwards = window_forwards(per_forward, experts)
+        if sizing:
+            self.awaiting_copy[window] = (close, None, None)
+            return update
         total = {name: float(values.astype(np.float64).sum()) for name, values in tail.items()}
         steps_left = None
         if min(total["accepted"], total["requests"]) > 0:
             accepted_per_step = total["accepted"] / total["requests"]
             steps_left = total["remaining"] / accepted_per_step / total["requests"]
         applied_window = stats[:, layers * (experts + 1) : layers * (experts + 2)].min(0)
-        rows = ema_sum * scale  # rows per forward
         planned = np.flatnonzero(self.committed <= applied_window)
         new_layout = np.empty((len(planned), slots), dtype=np.int64)
         new_shares = np.empty((len(planned), slots))
         for i, layer in enumerate(planned.tolist()):
             homes = cfg.home_layouts[layer]
             current = self.layout[layer]
-            new_layout[i] = plan_layout(
-                ema_sum[layer], geometry, homes, current, self.active
-            ).layout
+            new_layout[i] = plan_layout(rows[layer], geometry, homes, current, self.active).layout
             new_shares[i] = solve_shares(rows[layer], new_layout[i], geometry)
         current = (rows[planned], self.layout[planned], self.shares[planned])
-        gains = evaluate_gains(*current, new_layout, new_shares, cfg.model, geometry, steps_left)
+        gains = evaluate_gains(*current, new_layout, new_shares, cfg.model, geometry)
         previous_load = self.evaluations.previous_load(planned.tolist(), current[0])
         if previous_load is not None:
             # A candidate must also gain on its layer's previous window.
             previous_gains = evaluate_gains(
-                previous_load, *current[1:], new_layout, new_shares, cfg.model, geometry, steps_left
+                previous_load, *current[1:], new_layout, new_shares, cfg.model, geometry
             )
             gains = np.minimum(gains, previous_gains)
         gain = dict(zip(planned.tolist(), gains.tolist()))
         copy_ms = copy_ms_per_layer(_timings(self.copy_timings))
-        chosen = choose_layers_to_install(gain, steps_left, copy_ms or 0.0)
+        chosen = choose_layers_to_install(
+            gain, steps_left, copy_ms or 0.0, self.evaluations.erosion
+        )
         if copy_ms is None:
             # No copy has been timed yet: install the best layer alone to time one.
             chosen = chosen[:1]
@@ -458,7 +467,8 @@ class AdaptiveRuntime:
     * ``"decision"``: ``window``, ``call``, ``copy_items`` (this rank's), ``tables``, ``moved`` and
       ``groups`` of a :class:`LayoutUpdate`.
     * ``"copied"``: ``window`` and ``rows``, every rank's :data:`ROW` after its copies.
-    * ``"scheduled"``: ``window`` (the next one), ``apply_call``, ``next_open`` and ``plan``.
+    * ``"scheduled"``: ``window`` (the next one), ``apply_call``, ``next_open``, ``plan`` and
+      ``forwards`` (the next window's).
     * ``"applied"``: ``window``, ``call`` and ``layers`` whose route tables took effect.
     """
 
@@ -488,6 +498,7 @@ class AdaptiveRuntime:
         self.open_at: int | None = 0
         self.close_at: int | None = None
         self.window_opened_call = -1
+        self.window_forwards = 1
         self.applied_window = np.full(len(layers), -1.0)
         self.request_totals = np.zeros(3)  # the FIELDS remaining, requests and accepted
         self.wants_request_progress = False
@@ -496,7 +507,7 @@ class AdaptiveRuntime:
         self.pending_updates: deque[tuple[int, LayoutUpdate]] = deque()
         self._apply_events: deque = deque()
         self._started = False
-        self._ema = statistics["ema"]
+        self._rows = statistics["rows"]
         self._forwards = statistics["forwards"]
         pin = torch.device(device).type == "cuda" and prefer_pinned()
         self._own_stats = torch.zeros(decision.stats.shape[1], pin_memory=pin)
@@ -544,7 +555,7 @@ class AdaptiveRuntime:
         if self.close_at is None and self.open_at is not None and call >= self.open_at:
             self._open_window()
             self.open_at = None
-            self.close_at = call + WINDOW_FORWARDS
+            self.close_at = call + self.window_forwards
             self.window_opened_call = call
         elif call == self.close_at:
             self._close_window()
@@ -557,7 +568,7 @@ class AdaptiveRuntime:
         while worker.inbox:
             message = worker.inbox.popleft()
             if message[0] == "schedule":
-                _, self.window, self.open_at, apply_call, plan = message
+                _, self.window, self.open_at, apply_call, plan, self.window_forwards = message
                 if self.debug_listener is not None:
                     self.debug_listener(
                         "scheduled",
@@ -566,6 +577,7 @@ class AdaptiveRuntime:
                             apply_call=apply_call,
                             next_open=self.open_at,
                             plan=plan,
+                            forwards=self.window_forwards,
                         ),
                     )
             elif message[0] == "copied":
@@ -593,13 +605,13 @@ class AdaptiveRuntime:
         if not self._started:
             self._started = True
             self._host_tables.copy_(self.tables)
-        self._ema.zero_()
+        self._rows.zero_()
         self._forwards.zero_()
 
     def _close_window(self) -> None:
         """Copy the statistics into this rank's window statistics, timing the copies."""
         self._stats_copy_begin.record()
-        self._own_stats[: self._ema.numel()].copy_(self._ema.view(-1), non_blocking=True)
+        self._own_stats[: self._rows.numel()].copy_(self._rows.view(-1), non_blocking=True)
         self._own_forwards.copy_(self._forwards, non_blocking=True)
         self._stats_copy_end.record()
         self._stats_copied.record()

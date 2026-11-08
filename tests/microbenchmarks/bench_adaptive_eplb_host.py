@@ -129,8 +129,9 @@ def bench_cycle(n: int, calls: int, step_s: float) -> None:
         def open_with_rows() -> None:  # the kernel's part: a window's rows, the hot experts moved
             open_window()
             counts["opened"] += 1
-            buffers["ema"].copy_(rows.roll(counts["opened"] * 8, dims=1))
-            buffers["forwards"].fill_(rt.WINDOW_FORWARDS)
+            forwards = runtime.window_forwards  # the window being opened
+            buffers["rows"].copy_(rows.roll(counts["opened"] * 8, dims=1) * forwards)
+            buffers["forwards"].fill_(forwards)
 
         def close_and_count() -> None:
             counts["closed"] += 1

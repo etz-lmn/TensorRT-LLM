@@ -16,8 +16,7 @@
  */
 
 // Device route and statistics of the adaptive expert load balancer. Both read fixed-address tables and write
-// caller-owned buffers on the given stream, so CUDA graphs can capture them. The statistics round after the multiply
-// and after the add (__fmul_rn, __fadd_rn), whatever the compiler's contraction setting.
+// caller-owned buffers on the given stream, so CUDA graphs can capture them.
 
 #include "tensorrt_llm/kernels/moe/loadBalance/adaptiveEplbKernels.h"
 
@@ -39,15 +38,17 @@ constexpr int kTileThreads = 256; // threads of one route block, which routes kT
 constexpr int kTilesPerSplitBlock = kSplitBlock / kTileThreads;
 constexpr int kWarpsPerTile = kTileThreads / 32;
 constexpr int kWarpWordsPerExpert = kWarpsPerTile / 4; // words of the per-warp byte counts of one expert
-// Table entries every thread loads before the first shared-memory store, so that tables of up to 512 entries take one
-// memory round trip.
+// Table entries every thread loads before the first shared-memory store: the loads of a table of up to
+// kTableEntriesPerThread * kTileThreads = 512 entries (its experts and its slots, e.g. 384 experts in 512 slots) share
+// one memory round trip. A longer table is routed alike; it costs one further round trip per kTileThreads entries,
+// and a larger value would cost every launch four more registers per entry.
 constexpr int kTableEntriesPerThread = 2;
 // The route's offset of a split block: kBlockMultiplier is floor(2^32 / golden ratio), so consecutive blocks' offsets
-// stay far apart; kExpertMultiplier, an odd constant, separates the experts of one block; every rank owns
-// kBlocksPerRank consecutive block numbers, which stay distinct while a launch has at most that many split blocks.
+// stay far apart; kExpertMultiplier and kRankMultiplier, odd constants, separate the experts of one block and the
+// ranks, for any number of split blocks in a launch.
 constexpr uint32_t kBlockMultiplier = 0x9E3779B9u;
 constexpr uint32_t kExpertMultiplier = 0x632BE5ABu;
-constexpr int kBlocksPerRank = 64;
+constexpr uint32_t kRankMultiplier = 0x85EBCA6Bu;
 constexpr int kRecordThreads = 1024;
 constexpr size_t kDefaultSharedBytes = 48 * 1024;
 
@@ -121,7 +122,7 @@ __device__ __forceinline__ int weightedSlot(int expert, int ordinal, uint32_t st
     if (copies > 1)
     {
         uint32_t const point = static_cast<uint32_t>(expert) * kExpertMultiplier
-            + static_cast<uint32_t>(epRank * kBlocksPerRank + block) * kBlockMultiplier
+            + static_cast<uint32_t>(block) * kBlockMultiplier + static_cast<uint32_t>(epRank) * kRankMultiplier
             + static_cast<uint32_t>(ordinal) * step;
         while (k < copies - 1 && point >= cumulativeShares[start + k])
         {
@@ -175,12 +176,11 @@ __device__ __forceinline__ void storeRoute(
     }
 }
 
-__device__ __forceinline__ void addCounts(
-    int const* counts, int numExperts, float* ema, int64_t* forwards, float decay, bool first)
+__device__ __forceinline__ void addCounts(int const* counts, int numExperts, float* rows, int64_t* forwards, bool first)
 {
     for (int e = threadIdx.x; e < numExperts; e += blockDim.x)
     {
-        ema[e] = __fadd_rn(first ? __fmul_rn(ema[e], decay) : ema[e], static_cast<float>(counts[e]));
+        rows[e] += static_cast<float>(counts[e]);
     }
     if (threadIdx.x == 0 && first)
     {
@@ -241,11 +241,11 @@ __global__ void __launch_bounds__(kTileThreads)
 #endif
     int const numExperts = tables.numExperts;
     int const numSlots = tables.numSlots;
-    if (stats.ema != nullptr && blockIdx.x == gridDim.x - 1)
+    if (stats.rows != nullptr && blockIdx.x == gridDim.x - 1)
     {
         if (countIds(ids, 0, count, numExperts, stats.enabled, shared))
         {
-            addCounts(shared, numExperts, stats.ema, stats.forwards, stats.decay, stats.first);
+            addCounts(shared, numExperts, stats.rows, stats.forwards, stats.first);
         }
         return;
     }
@@ -405,13 +405,13 @@ __global__ void __launch_bounds__(kTileThreads)
 // One block counts all the ids and updates the statistics.
 template <typename IdT>
 __global__ void __launch_bounds__(kRecordThreads)
-    adaptiveEplbRecordKernel(IdT const* __restrict__ ids, int64_t count, int numExperts, float* __restrict__ ema,
-        int64_t* __restrict__ forwards, int const* __restrict__ enabled, float decay, bool first)
+    adaptiveEplbRecordKernel(IdT const* __restrict__ ids, int64_t count, int numExperts, float* __restrict__ rows,
+        int64_t* __restrict__ forwards, int const* __restrict__ enabled, bool first)
 {
     extern __shared__ int histogram[];
     if (countIds(ids, 0, count, numExperts, enabled, histogram))
     {
-        addCounts(histogram, numExperts, ema, forwards, decay, first);
+        addCounts(histogram, numExperts, rows, forwards, first);
     }
 }
 
@@ -422,7 +422,7 @@ void adaptiveEplbRoute(IdT const* ids, int64_t count, int epRank, AdaptiveEplbRo
     AdaptiveEplbStaging staging, AdaptiveEplbStats stats, cudaStream_t stream)
 {
     int64_t const extent = staging.weightsOut != nullptr ? staging.total : count;
-    auto blocks = static_cast<unsigned>((extent + kTileThreads - 1) / kTileThreads) + (stats.ema != nullptr ? 1u : 0u);
+    auto blocks = static_cast<unsigned>((extent + kTileThreads - 1) / kTileThreads) + (stats.rows != nullptr ? 1u : 0u);
     if (blocks > 0)
     {
         size_t const bytes = routeSharedBytes(tables.numExperts, tables.numSlots);
@@ -433,13 +433,13 @@ void adaptiveEplbRoute(IdT const* ids, int64_t count, int epRank, AdaptiveEplbRo
 }
 
 template <typename IdT>
-void adaptiveEplbRecord(IdT const* ids, int64_t count, int numExperts, float* ema, int64_t* forwards,
-    int const* enabled, float decay, bool first, cudaStream_t stream)
+void adaptiveEplbRecord(IdT const* ids, int64_t count, int numExperts, float* rows, int64_t* forwards,
+    int const* enabled, bool first, cudaStream_t stream)
 {
     size_t const bytes = static_cast<size_t>(numExperts) * sizeof(int);
     allowSharedBytes<adaptiveEplbRecordKernel<IdT>>(bytes);
     adaptiveEplbRecordKernel<IdT>
-        <<<1, kRecordThreads, bytes, stream>>>(ids, count, numExperts, ema, forwards, enabled, decay, first);
+        <<<1, kRecordThreads, bytes, stream>>>(ids, count, numExperts, rows, forwards, enabled, first);
 }
 
 #define INSTANTIATE_ADAPTIVE_EPLB_ROUTE(IdT, OutT)                                                                     \
@@ -452,8 +452,7 @@ INSTANTIATE_ADAPTIVE_EPLB_ROUTE(int64_t, int32_t)
 INSTANTIATE_ADAPTIVE_EPLB_ROUTE(int64_t, int64_t)
 
 #define INSTANTIATE_ADAPTIVE_EPLB_RECORD(IdT)                                                                          \
-    template void adaptiveEplbRecord<IdT>(                                                                             \
-        IdT const*, int64_t, int, float*, int64_t*, int const*, float, bool, cudaStream_t);
+    template void adaptiveEplbRecord<IdT>(IdT const*, int64_t, int, float*, int64_t*, int const*, bool, cudaStream_t);
 
 INSTANTIATE_ADAPTIVE_EPLB_RECORD(int32_t)
 INSTANTIATE_ADAPTIVE_EPLB_RECORD(int64_t)

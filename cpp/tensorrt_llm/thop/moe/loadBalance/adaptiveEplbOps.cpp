@@ -96,22 +96,20 @@ void routeInto(at::Tensor const& ids, kernels::AdaptiveEplbRouteTables const& ta
 }
 
 kernels::AdaptiveEplbStats checkStats(
-    at::Tensor const& ids, at::Tensor& ema, at::Tensor& forwards, at::Tensor const& enabled, double decay, bool first)
+    at::Tensor const& ids, at::Tensor& rows, at::Tensor& forwards, at::Tensor const& enabled, bool first)
 {
-    checkVector(ema, at::kFloat, ids, "ema");
+    checkVector(rows, at::kFloat, ids, "rows");
     checkVector(forwards, at::kLong, ids, "forwards");
     checkVector(enabled, at::kInt, ids, "enabled");
     TORCH_CHECK(forwards.numel() == 1 && enabled.numel() == 1, "forwards and enabled must be one word each");
-    return {
-        ema.data_ptr<float>(), forwards.data_ptr<int64_t>(), enabled.data_ptr<int>(), static_cast<float>(decay), first};
+    return {rows.data_ptr<float>(), forwards.data_ptr<int64_t>(), enabled.data_ptr<int>(), first};
 }
 
 template <typename IdT>
-void record(
-    at::Tensor const& ids, at::Tensor& ema, at::Tensor& forwards, at::Tensor const& enabled, float decay, bool first)
+void record(at::Tensor const& ids, at::Tensor& rows, at::Tensor& forwards, at::Tensor const& enabled, bool first)
 {
-    kernels::adaptiveEplbRecord(ids.data_ptr<IdT>(), ids.numel(), static_cast<int>(ema.numel()), ema.data_ptr<float>(),
-        forwards.data_ptr<int64_t>(), enabled.data_ptr<int>(), decay, first,
+    kernels::adaptiveEplbRecord(ids.data_ptr<IdT>(), ids.numel(), static_cast<int>(rows.numel()),
+        rows.data_ptr<float>(), forwards.data_ptr<int64_t>(), enabled.data_ptr<int>(), first,
         at::cuda::getCurrentCUDAStream(ids.get_device()));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -122,12 +120,12 @@ void record(
 //! statistics. out receives the [tokens, top_k] slots of the ids in its first ids.numel() elements. With weights
 //! ([tokens, top_k] float32 gate weights) and weights_out ([rows, >= top_k] float32, unit column stride), out is a
 //! bucket of rows >= tokens rows whose elements after the ids get slot -1 and weight 0; without them, out has exactly
-//! the ids' elements. With ema, forwards and enabled, the launch adds the ids to the statistics as
+//! the ids' elements. With rows, forwards and enabled, the launch adds the ids to the statistics as
 //! adaptive_eplb_record does.
 void adaptiveEplbRouteInto(at::Tensor const& ids, at::Tensor const& counts, at::Tensor const& starts,
     at::Tensor const& slots, at::Tensor const& cumulativeShares, int64_t epRank, at::Tensor& out,
-    std::optional<at::Tensor> const& weights, std::optional<at::Tensor> weightsOut, std::optional<at::Tensor> ema,
-    std::optional<at::Tensor> forwards, std::optional<at::Tensor> const& enabled, double decay, bool first)
+    std::optional<at::Tensor> const& weights, std::optional<at::Tensor> weightsOut, std::optional<at::Tensor> rows,
+    std::optional<at::Tensor> forwards, std::optional<at::Tensor> const& enabled, bool first)
 {
     auto const tables = checkTables(ids, counts, starts, slots, cumulativeShares, epRank);
     TORCH_CHECK(out.is_contiguous() && out.device() == ids.device() && out.numel() >= ids.numel(),
@@ -152,31 +150,30 @@ void adaptiveEplbRouteInto(at::Tensor const& ids, at::Tensor const& counts, at::
         TORCH_CHECK(out.numel() == ids.numel(), "without weights, out has exactly the ids' elements");
     }
     kernels::AdaptiveEplbStats stats{};
-    TORCH_CHECK(ema.has_value() == forwards.has_value() && ema.has_value() == enabled.has_value(),
-        "ema, forwards and enabled go together");
-    if (ema.has_value())
+    TORCH_CHECK(rows.has_value() == forwards.has_value() && rows.has_value() == enabled.has_value(),
+        "rows, forwards and enabled go together");
+    if (rows.has_value())
     {
-        stats = checkStats(ids, *ema, *forwards, *enabled, decay, first);
+        stats = checkStats(ids, *rows, *forwards, *enabled, first);
     }
     routeInto(ids, tables, epRank, out, staging, stats);
 }
 
-//! Add expert ids to a layer's statistics while enabled[0] is set. The first call of a forward sets ema to
-//! decay * ema + counts, rounded to float32 after the multiply and after the add, and increments forwards; a later call
-//! of the same forward (a further chunk or repeat) adds its per-expert counts to ema.
+//! Add expert ids to a layer's statistics while enabled[0] is set: every call adds its per-expert counts to rows,
+//! and the first call of a forward (not a further chunk or repeat) also increments forwards.
 void adaptiveEplbRecord(
-    at::Tensor const& ids, at::Tensor& ema, at::Tensor& forwards, at::Tensor const& enabled, double decay, bool first)
+    at::Tensor const& ids, at::Tensor& rows, at::Tensor& forwards, at::Tensor const& enabled, bool first)
 {
     checkIds(ids);
-    checkStats(ids, ema, forwards, enabled, decay, first);
+    checkStats(ids, rows, forwards, enabled, first);
     auto const contiguousIds = ids.contiguous();
     if (ids.scalar_type() == at::kLong)
     {
-        record<int64_t>(contiguousIds, ema, forwards, enabled, static_cast<float>(decay), first);
+        record<int64_t>(contiguousIds, rows, forwards, enabled, first);
     }
     else
     {
-        record<int32_t>(contiguousIds, ema, forwards, enabled, static_cast<float>(decay), first);
+        record<int32_t>(contiguousIds, rows, forwards, enabled, first);
     }
 }
 
@@ -188,10 +185,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "adaptive_eplb_route_into(Tensor ids, Tensor counts, Tensor starts, Tensor slots, Tensor cumulative_shares, "
-        "int ep_rank, Tensor(a!) out, Tensor? weights=None, Tensor(b!)? weights_out=None, Tensor(c!)? ema=None, "
-        "Tensor(d!)? forwards=None, Tensor? enabled=None, float decay=0., bool first=True) -> ()");
+        "int ep_rank, Tensor(a!) out, Tensor? weights=None, Tensor(b!)? weights_out=None, Tensor(c!)? rows=None, "
+        "Tensor(d!)? forwards=None, Tensor? enabled=None, bool first=True) -> ()");
     m.def(
-        "adaptive_eplb_record(Tensor ids, Tensor(a!) ema, Tensor(b!) forwards, Tensor enabled, float decay, "
+        "adaptive_eplb_record(Tensor ids, Tensor(a!) rows, Tensor(b!) forwards, Tensor enabled, "
         "bool first=True) -> ()");
 }
 

@@ -319,9 +319,9 @@ Per-layer dynamic EPLB has the following constraints:
 
 Adaptive EPLB balances the decode steps of a run. Every expert keeps one copy on its home rank, and the slots beyond one per expert hold replicas of hot experts:
 
-1. While the generation steps run, every MoE layer counts its routed tokens per expert on the GPU, in the same launch that maps them to slots, so CUDA graphs capture both. A statistics window covers a few decode steps.
+1. While the generation steps run, every MoE layer counts its routed tokens per expert on the GPU, in the same launch that maps them to slots, so CUDA graphs capture both. A statistics window lasts as many decode steps as it takes to count about 512 routed tokens per expert, a few steps at large batches and a few dozen at small ones.
 2. At the end of a window, the ranks gather their statistics. A decision process on every rank plans a new placement per layer and prices it with a time model of the MoE backend's kernels. All ranks reach the same decision.
-3. A layer is installed only when its predicted gain per step, over the decode steps the running requests still have, exceeds the measured cost of copying its experts. The copies go into free slots on a copy stream, between peer ranks over MNNVL memory, and the new routing takes effect on all ranks at the same step.
+3. A layer is installed only when its predicted gain repays the measured cost of copying its experts: the gain per step shrinks at the measured rate at which installed placements fall behind the load, and counts over at most the decode steps the running requests still have. The copies go into free slots on a copy stream, between peer ranks over MNNVL memory, and the new routing takes effect on all ranks at the same step.
 
 An example configuration for a model with 384 routed experts on 32 GPUs:
 
@@ -339,7 +339,7 @@ EOF
 Adaptive EPLB has the following constraints:
 
 * **Backend**: a MoE backend that declares `supports_adaptive_eplb`, currently `MEGAMOE_CUTEDSL`; other backends are rejected when the model is built.
-* **GPU type**: the backend provides a time model of its kernels for each GPU type it was measured on, currently GB300 only. On any other GPU, adaptive EPLB is rejected when the model is built.
+* **GPU type**: the backend's time model derives its costs from each GPU type's HBM bandwidth and dense FP4 peak and has one scale measured on that GPU type (`tests/microbenchmarks/measure_adaptive_eplb_time_model.py`), currently GB300 only. On any other GPU, adaptive EPLB is rejected when the model is built.
 * **GPUs**: all EP ranks in one NVLink domain: the expert weights live in MNNVL memory that every rank maps.
 * **Parallelism**: expert parallelism (`moe_expert_parallel_size` greater than 1) without the MoE smart router; the expert count must be divisible by the EP size.
 * **Fields**: only `mode` and `num_slots`. `num_slots` is required, must be at least the expert count, and must be divisible by the EP size.

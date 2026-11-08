@@ -56,17 +56,27 @@ def test_weights_stop_being_movable_once_the_kernel_holds_views():
     assert IMPL.slot_id_dtype.fget(SimpleNamespace(_topk_idx_dtype=torch.int32)) is torch.int32
 
 
-def test_decode_time_model_scales_with_the_expert_bytes():
-    gb300 = IMPL._DECODE_TIME_MODELS["GB300"]
-    us, measured = gb300["per_active_slot_us"], gb300["measured_expert_bytes"]
-    model = TimeModel(**IMPL.decode_time_model(IMPL, measured, "NVIDIA GB300"))
-    assert (model.per_active_slot_us, model.tile_rows) == (us, 256)
-    assert (
-        IMPL.decode_time_model(IMPL, 2 * measured, "NVIDIA GB300")["per_active_slot_us"] == 2 * us
+def test_decode_time_model_streams_the_expert_bytes_and_prices_the_row_flops():
+    bandwidth, peak, scale = IMPL._DECODE_DEVICES["GB300"]
+    hidden, expand, inner = 7168, 6144, 3072
+    backend = SimpleNamespace(
+        _DECODE_DEVICES=IMPL._DECODE_DEVICES,
+        hidden_size=hidden,
+        expand_intermediate_size_per_partition=expand,
+        intermediate_size_per_partition=inner,
     )
+    model = TimeModel(**IMPL.decode_time_model(backend, 37158924, "NVIDIA GB300"))
+    # A slot with rows streams its expert once; a row costs its FC1 and FC2 FLOPs at the peak.
+    assert model.per_active_slot_us == pytest.approx(37158924 / bandwidth * 1e6)
+    row_us = 2 * hidden * (expand + inner) / peak * 1e6
+    assert model.per_row_us == pytest.approx(row_us)
+    # A tile is 256 rows; every extra tile of the busiest slot costs half a tile more.
+    assert model.tile_rows == 256 and model.per_extra_tile_us == pytest.approx(256 * row_us)
+    assert model.hot_slot_extra_tile_us == pytest.approx(128 * row_us)
+    assert model.scale == scale
     assert IMPL.has_decode_time_model("NVIDIA GB300") and not IMPL.has_decode_time_model("A100")
     with pytest.raises(ValueError, match="A100"):
-        IMPL.decode_time_model(IMPL, measured, "NVIDIA A100")
+        IMPL.decode_time_model(backend, 37158924, "NVIDIA A100")
 
 
 def test_route_staging_hands_out_the_staging_of_a_run_that_stages():

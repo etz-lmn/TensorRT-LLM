@@ -51,14 +51,13 @@ struct AdaptiveEplbStaging
     int64_t total; //!< elements of the bucket (the out buffer holds that many), >= count
 };
 
-//! A layer's statistics, which the route's launch can update as adaptiveEplbRecord does. Without statistics, ema is
+//! A layer's statistics, which the route's launch can update as adaptiveEplbRecord does. Without statistics, rows is
 //! null.
 struct AdaptiveEplbStats
 {
-    float* ema;
+    float* rows;
     int64_t* forwards;
     int const* enabled;
-    float decay;
     bool first;
 };
 
@@ -68,7 +67,7 @@ struct AdaptiveEplbStats
 //! proportion to their shares, separately in each split block of 1024 consecutive elements: in split block b, the
 //! element that is the j-th of the n elements of e there takes the first copy k < c - 1 with
 //! u < cumulativeShares[starts[e] + k], else copy c - 1, where
-//!     u = e * kExpertMultiplier + (epRank * kBlocksPerRank + b) * kBlockMultiplier + j * floor(2^32 / n)   (mod 2^32)
+//!     u = e * kExpertMultiplier + b * kBlockMultiplier + epRank * kRankMultiplier + j * floor(2^32 / n)   (mod 2^32)
 //! (2^32 - 1 replaces floor(2^32 / n) for n = 1): n evenly spaced points from an offset that differs between experts,
 //! ranks and split blocks. An id outside the experts, or a table entry outside the slots, takes numSlots. With staging,
 //! the launch also writes the gate weights and the staging rows after the routed elements; with statistics, one more
@@ -80,13 +79,12 @@ void adaptiveEplbRoute(IdT const* ids, int64_t count, int epRank, AdaptiveEplbRo
 //! Add a forward's expert ids to a layer's statistics.
 //!
 //! Nothing happens while enabled[0] == 0 (read on the device, so a captured graph records only while it is set).
-//! Otherwise, with n[e] the number of ids equal to e (ids outside [0, numExperts) are not counted), the first call of
-//! a forward sets ema[e] = fl32(fl32(ema[e] * decay) + n[e]), rounding after the multiply and after the add, and
-//! increments forwards[0]; a later call of the same forward (a further chunk or repeat) adds n[e] to ema[e]. One block
-//! counts the ids.
+//! Otherwise every call adds n[e], the number of ids equal to e (ids outside [0, numExperts) are not counted), to
+//! rows[e], which stays an exact integer below 2^24; the first call of a forward (not a further chunk or repeat)
+//! also increments forwards[0]. One block counts the ids.
 template <typename IdT>
-void adaptiveEplbRecord(IdT const* ids, int64_t count, int numExperts, float* ema, int64_t* forwards,
-    int const* enabled, float decay, bool first, cudaStream_t stream);
+void adaptiveEplbRecord(IdT const* ids, int64_t count, int numExperts, float* rows, int64_t* forwards,
+    int const* enabled, bool first, cudaStream_t stream);
 
 } // namespace kernels
 

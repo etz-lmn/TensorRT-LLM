@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 
 from ..moe_load_balancer import BaseMoeLoadBalancer
-from .policy import EMA_DECAY, ExpertGeometry, TimeModel
+from .policy import ExpertGeometry, TimeModel
 from .runtime import AdaptiveRuntime, DecisionConfig, DecisionProcess, build_route_tables
 from .transport import PeerSlotTransport, migrate_model_weights
 
@@ -26,9 +26,10 @@ if TYPE_CHECKING:
 
 
 def statistics_buffers(layers: int, num_experts: int, device: torch.device | str) -> dict:
-    """Every layer's statistics in contiguous buffers: ``ema`` ``[L, E]`` and ``forwards`` ``[L, 1]``."""
+    """Every layer's statistics in contiguous buffers: ``rows`` ``[L, E]`` (the rows routed to every
+    expert, exact in float32 below 2^24) and ``forwards`` ``[L, 1]``."""
     return dict(
-        ema=torch.zeros(layers, num_experts, dtype=torch.float32, device=device),
+        rows=torch.zeros(layers, num_experts, dtype=torch.float32, device=device),
         forwards=torch.zeros(layers, 1, dtype=torch.int64, device=device),
     )
 
@@ -37,19 +38,19 @@ class ExpertStatistics(NamedTuple):
     """One layer's statistics in the ops' argument order, and the ``[1]`` flag that the ops read at
     every launch, so that a captured CUDA graph records statistics only while the flag is set."""
 
-    ema: torch.Tensor
+    rows: torch.Tensor
     forwards: torch.Tensor
     enabled: torch.Tensor
 
     @classmethod
     def of(cls, buffers: dict, layer: int, enabled: torch.Tensor) -> ExpertStatistics:
         """The statistics of layer ``layer`` in buffers made by :func:`statistics_buffers`."""
-        return cls(buffers["ema"][layer], buffers["forwards"][layer], enabled)
+        return cls(buffers["rows"][layer], buffers["forwards"][layer], enabled)
 
     def record(self, token_selected_experts: torch.Tensor, first_call: bool = True) -> None:
-        """Add ``[tokens, top_k]`` expert ids to the statistics; the later calls of a forward add to
-        its first call's counts."""
-        torch.ops.trtllm.adaptive_eplb_record(token_selected_experts, *self, EMA_DECAY, first_call)
+        """Add ``[tokens, top_k]`` expert ids to the statistics; only a forward's first call counts
+        the forward."""
+        torch.ops.trtllm.adaptive_eplb_record(token_selected_experts, *self, first_call)
 
 
 class AdaptiveMoeLayerLoadBalancer:
@@ -158,7 +159,7 @@ class AdaptiveMoeLayerLoadBalancer:
         if pending is not None:
             statistics.record(*pending)
         if self.manager.recording or (
-            statistics.ema.is_cuda and torch.cuda.is_current_stream_capturing()
+            statistics.rows.is_cuda and torch.cuda.is_current_stream_capturing()
         ):
             self._pending = (local_raw_expert_ids, is_first_stage)
 
@@ -201,9 +202,9 @@ class AdaptiveMoeLayerLoadBalancer:
             out = staging.topk_idx
             weights = (token_final_scales, staging.topk_weights)
         if pending is None:
-            statistics_args = (None, None, None, 0.0, True)
+            statistics_args = (None, None, None, True)
         else:
-            statistics_args = (*self.statistics, EMA_DECAY, pending[1])
+            statistics_args = (*self.statistics, pending[1])
         self._route_into(ids, *self._tables, self.manager.ep_rank, out, *weights, *statistics_args)
         if overlap_fn is not None:
             overlap_fn()

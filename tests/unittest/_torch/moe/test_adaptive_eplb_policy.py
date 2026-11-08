@@ -19,7 +19,6 @@ from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
     choose_layers_to_install,
     copy_ms_per_layer,
     evaluate_gains,
-    even_shares,
     fixed_install_ms,
     plan_layout,
     slot_rows,
@@ -42,16 +41,18 @@ MODEL = TimeModel(
 SMALL = ExpertGeometry(num_experts=8, num_slots=16, ep_size=4)
 
 
+def even_shares(layout: np.ndarray) -> np.ndarray:
+    """``[L, num_slots]`` shares that split every expert's rows evenly over its copies."""
+    shares = np.zeros(layout.shape)
+    for row, out in zip(layout, shares):
+        active = row >= 0
+        out[active] = 1.0 / np.bincount(row[active])[row[active]]
+    return shares
+
+
 # ------------------------------------------------------------------------------------------------
 # Time model
 # ------------------------------------------------------------------------------------------------
-
-
-def _random_layout(rng: np.random.Generator, replicas: int) -> np.ndarray:
-    layout = GEOMETRY.home_layout()
-    free = np.flatnonzero(layout < 0)
-    layout[free[:replicas]] = rng.choice(GEOMETRY.num_experts, size=replicas, replace=False)
-    return layout
 
 
 def test_geometry_home_layout():
@@ -60,16 +61,12 @@ def test_geometry_home_layout():
     assert MODEL.slope_us == MODEL.scale * (MODEL.per_extra_tile_us / 256 + MODEL.per_row_us)
 
 
-def test_even_shares_and_slot_rows():
+def test_slot_rows():
     layout = np.array(
         [[0, 1, 2, 3, 0, -1, 4, 5, 6, 7, 0, 4, 8, 9, 10, 11, -1, -1, 12, 13, 14, 15, -1, -1]]
     )
-    shares = even_shares(layout)
-    assert shares[0, 0] == shares[0, 4] == shares[0, 10] == pytest.approx(1 / 3)
-    assert shares[0, 6] == shares[0, 11] == 0.5
-    assert shares[0, 5] == 0.0 and shares[0, 1] == 1.0
     load = np.arange(16, dtype=np.float64)[None, :] * 30.0
-    rows = slot_rows(load, layout, shares)
+    rows = slot_rows(load, layout, even_shares(layout))
     assert rows[0, 5] == 0.0
     assert rows[0, 6] == pytest.approx(4 * 30.0 * 0.5)
     assert rows.sum() == pytest.approx(load.sum())
@@ -188,11 +185,10 @@ def test_first_plan_fills_the_budget_from_the_homes():
 def test_one_replica_goes_to_the_hottest_expert_and_ties_to_the_larger_id():
     plan = _plan([1.0, 2.0, 1.0, 9.0, 1.0, 1.0, 9.0, 1.0], total=SMALL.num_experts + 1)
     assert [len(row) for row in plan.expert_slots] == [1, 1, 1, 1, 1, 1, 2, 1]
-
-
-def test_rows_tie_in_float32():
+    # Rows that one float32 cannot tell apart are no tie: the planner ranks the float64 rows that
+    # the share solver and the gains use.
     plan = _plan([1.0, 1.0, 1.0, 10.0000001, 1.0, 1.0, 10.0, 1.0], total=SMALL.num_experts + 1)
-    assert len(plan.expert_slots[6]) == 2 and len(plan.expert_slots[3]) == 1
+    assert len(plan.expert_slots[3]) == 2 and len(plan.expert_slots[6]) == 1
 
 
 def test_replica_goes_to_the_least_loaded_gpu_and_ties_to_the_lower_gpu():
@@ -358,11 +354,10 @@ def test_shares_refuse_invalid_inputs():
 # ------------------------------------------------------------------------------------------------
 
 
-def _gains(load, current, new, new_shares=None, steps_left=100.0):
+def _gains(load, current, new, new_shares=None):
     current, new, load = np.atleast_2d(current), np.atleast_2d(new), np.atleast_2d(load)
     shares = even_shares(new) if new_shares is None else np.atleast_2d(new_shares)
-    args = (load, current, even_shares(current), new, shares, MODEL, GEOMETRY)
-    return evaluate_gains(*args, steps_left)
+    return evaluate_gains(load, current, even_shares(current), new, shares, MODEL, GEOMETRY)
 
 
 def _times(load, layout, shares) -> float:
@@ -382,39 +377,28 @@ def test_evaluate_gains_replica_of_hot_expert_pays():
     assert gains[0] == pytest.approx(
         (t_cur - _times(load, replicated, even_shares(replicated[None])[0])) / 1e3
     )
+    # The new layout is priced at its own shares: an install applies them together.
+    solved = even_shares(replicated[None])[0]
+    solved[[0, 4, 10]] = [0.3, 0.2, 0.5]
+    t_solved = _times(load, replicated, solved)
+    assert _gains(load, home, replicated, solved)[0] == pytest.approx((t_cur - t_solved) / 1e3)
     empty = np.zeros((0, GEOMETRY.num_slots), dtype=np.int64)
     assert _gains(np.zeros((0, 16)), empty, empty).shape == (0,)
 
 
-def test_evaluate_gains_blends_even_and_solved_shares():
-    home = GEOMETRY.home_layout()
-    load = np.full(16, 100.0)
-    load[0] = 2000.0
-    replicated = home.copy()
-    replicated[10] = 0  # a copy of expert 0 on GPU 1
-    solved = even_shares(replicated[None])[0]
-    solved[[0, 10]] = [0.55, 0.45]  # a split between GPUs 0 and 1 that beats the even one
-    t_cur = _times(load, home, even_shares(home[None])[0])
-    g_even = (t_cur - _times(load, replicated, even_shares(replicated[None])[0])) / 1e3
-    g_sol = (t_cur - _times(load, replicated, solved)) / 1e3
-    assert g_sol > g_even > 0
-    assert _gains(load, home, replicated, solved, None)[0] == g_even
-    assert _gains(load, home, replicated, solved, 10.0)[0] == pytest.approx(
-        (g_even * 1 + g_sol * 9) / 10
-    )
-    # Five layers that gain: the first five calls are priced at the even split.
-    stack = [np.stack([x] * 5) for x in (load, home, replicated, solved)]
-    five = _gains(*stack, 10.0)
-    assert five[0] == pytest.approx((g_even * 5 + g_sol * 5) / 10)
-
-
 def test_choose_layers_to_install():
     gains = {1: 0.05, 2: 0.02, 3: 0.001, 4: 0.03}
-    assert choose_layers_to_install(gains, 100.0, 0.5) == [1, 4, 2]
-    assert choose_layers_to_install(gains, None, 0.5) == []
-    assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, 4.9) == [1, 2]
-    assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, 5.0) == []
-    assert choose_layers_to_install({1: 0.06, 2: 0.05}, 100.0, 5.5) == [1]
+    assert choose_layers_to_install(gains, 100.0, 0.5, None) == [1, 4, 2]
+    assert choose_layers_to_install(gains, None, 0.5, None) == []
+    assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, 4.9, None) == [1, 2]
+    assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, 5.0, None) == []
+    assert choose_layers_to_install({1: 0.06, 2: 0.05}, 100.0, 5.5, None) == [1]
+    # 0.05 ms per step over 100 steps is worth 5 ms; eroding by 1e-4 ms per step per call it is
+    # worth 5 - 1e-4 * 100^2 / 2 = 4.5 ms, so it repays a 4.6 ms copy only without erosion;
+    # eroding by 1e-3 it is gone after 50 steps, worth 0.05 * 50 / 2 = 1.25 ms.
+    for erosion, worth in ((None, 5.0), (0.0, 5.0), (1e-4, 4.5), (1e-3, 1.25)):
+        assert choose_layers_to_install({7: 0.05}, 100.0, worth - 0.1, erosion) == [7]
+        assert choose_layers_to_install({7: 0.05}, 100.0, worth + 0.1, erosion) == []
 
 
 def test_group_readings_copy_and_apply():
@@ -471,14 +455,15 @@ def test_rate_floor_follows_the_reading_interval():
     per_call = 3 * MODEL.slope_us / 1e3
     assert tracker.min_resolvable_rate(3, 1) == per_call
     assert tracker.min_resolvable_rate(3, 20) == per_call / 20
-    # Between the floor of one call and that of the reading's 20 calls: resolved.
+    # Between the floor of one call and that of the reading's 20 calls: resolved, and its growth
+    # per layer is the erosion of a layer's gain.
     resolved = tracker.plan(10, 10, 2, [1.0], [], CostGrowth(per_call / 2, 3, 20), None)
     assert resolved.interval == math.ceil(math.sqrt(2 * 1.0 / (per_call / 2)))
-    # Below the floor of the reading's interval: the last resolved rate stays.
+    assert tracker.erosion == per_call / 2 / 3
+    # Below the floor of the reading's interval: the last resolved rate and erosion stay.
     kept = tracker.plan(20, 20, 2, [1.0], [], CostGrowth(per_call / 40, 3, 20), None)
-    assert kept.interval == resolved.interval
+    assert kept.interval == resolved.interval and tracker.erosion == per_call / 2 / 3
     # A negative rate reading is no rate at all (a tracker that has learnt nothing yet).
-    plan = EvaluationScheduler(MODEL, GEOMETRY).plan(
-        5, 5, 2, [1.0], [], CostGrowth(-0.5, 1, 1), None
-    )
-    assert plan.interval == 3
+    fresh = EvaluationScheduler(MODEL, GEOMETRY)
+    assert fresh.plan(5, 5, 2, [1.0], [], CostGrowth(-0.5, 1, 1), None).interval == 3
+    assert fresh.erosion is None

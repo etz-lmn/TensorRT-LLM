@@ -17,12 +17,7 @@ from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.balancer import (
     ExpertStatistics,
     statistics_buffers,
 )
-from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
-    EMA_DECAY,
-    ExpertGeometry,
-    TimeModel,
-    even_shares,
-)
+from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import ExpertGeometry, TimeModel
 from tensorrt_llm.llmapi.llm_args import MoeAdaptiveLoadBalancerConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -32,6 +27,7 @@ GEOMETRY = ExpertGeometry(E, R * LOCAL, R)
 MODEL = TimeModel(1.0, 1.0, 1.0, 0.5, 1.0, 128)
 HOME = GEOMETRY.home_layout()
 TABLE = 2 * (E + R * LOCAL)
+FORWARDS = 8  # forwards of the windows after the first: the scripted decisions' and the spy's
 
 
 def fake_event(enable_timing: bool = False, blocking: bool = False) -> SimpleNamespace:
@@ -132,7 +128,7 @@ class FakeDecision:
             reply = ("update", self.script(message[1]))
         else:
             apply_call = int(message[2][:, rt.ROW.index("copied_call")].max()) + 1
-            reply = ("schedule", message[1] + 1, apply_call + 4, apply_call, None)
+            reply = ("schedule", message[1] + 1, apply_call + 4, apply_call, None, FORWARDS)
         self.queue.append(reply)
 
     def recv(self):
@@ -173,9 +169,8 @@ class Events:
             row = data["rows"][self.rank]
             self.by_window[data["window"]]["copied_call"] = int(row[rt.ROW.index("copied_call")])
         elif event == "scheduled":
-            self.records[-1].update(
-                apply_call=data["apply_call"], plan=data["plan"], next_open=data["next_open"]
-            )
+            keys = ("apply_call", "plan", "next_open", "forwards")
+            self.records[-1].update({key: data[key] for key in keys})
         elif event == "applied":
             self.by_window[data["window"]]["effect"].update(
                 dict.fromkeys(data["layers"], data["call"])
@@ -232,14 +227,16 @@ def run(ranks, clock, calls: int) -> None:
         clock[0] += 1
 
 
-def set_statistics(runtime, ema: np.ndarray, forwards: int) -> None:
-    for layer, rows in zip(runtime.layers, ema):
-        layer.statistics.ema.copy_(torch.from_numpy(rows))
+def set_statistics(runtime, rows: np.ndarray, forwards: int) -> None:
+    for layer, counts in zip(runtime.layers, rows):
+        layer.statistics.rows.copy_(torch.from_numpy(counts))
         layer.statistics.forwards.fill_(forwards)
 
 
 def even_split(rows, layout, geometry) -> np.ndarray:
-    return even_shares(np.asarray(layout)[None])[0]
+    """Shares that split every expert's rows evenly over its copies."""
+    copies = np.bincount(layout[layout >= 0], minlength=geometry.num_experts)
+    return np.where(layout >= 0, 1.0 / copies[np.maximum(layout, 0)], 0.0)
 
 
 # The runtime's own functions: a test that spies twice must not spy on its first spy.
@@ -247,7 +244,8 @@ REAL_PLAN, REAL_CHOOSE = rt.plan_layout, rt.choose_layers_to_install
 
 
 def spy(monkeypatch, seen: dict) -> None:
-    """Record what the planner, the share solver and the layer choice are given."""
+    """Record what the planner, the share solver, the layer choice and the window length are
+    given; every window after the first lasts ``FORWARDS`` forwards."""
 
     def plan(load, *args):
         seen.setdefault("load", []).append(np.array(load))
@@ -257,19 +255,24 @@ def spy(monkeypatch, seen: dict) -> None:
         seen.setdefault("rows", []).append(rows)
         return even_split(rows, layout, geometry)
 
-    def choose(gains, steps_left, copy_cost):
+    def choose(gains, steps_left, copy_cost, erosion):
         seen.setdefault("gains", []).append(dict(gains))
         seen.setdefault("steps_left", []).append(steps_left)
-        return REAL_CHOOSE(gains, steps_left, copy_cost)
+        return REAL_CHOOSE(gains, steps_left, copy_cost, erosion)
+
+    def window_forwards(rows_per_forward, experts):
+        seen.setdefault("per_forward", []).append((rows_per_forward, experts))
+        return FORWARDS
 
     monkeypatch.setattr(rt, "plan_layout", plan)
     monkeypatch.setattr(rt, "solve_shares", solve)
     monkeypatch.setattr(rt, "choose_layers_to_install", choose)
+    monkeypatch.setattr(rt, "window_forwards", window_forwards)
 
 
-def spied_ranks(monkeypatch, timed: bool = False):
-    """Both ranks with in-process deciders after their first call, and ``seen``: what the planner
-    and the share solver were given; ``timed``: a copy group was timed, every layer may install."""
+def spied_ranks(monkeypatch, timed: bool = False, first=None):
+    """Both ranks with in-process deciders once their first window (counting ``first``: every
+    rank's rows and forwards) has passed, and ``seen``; ``timed``: a copy group was timed."""
     seen = {}
     clock = [0]
     spy(monkeypatch, seen)
@@ -278,6 +281,12 @@ def spied_ranks(monkeypatch, timed: bool = False):
         decision.decider.copy_timings[0] = (1, 0.5)
     ranks = make_ranks(decisions, clock)
     run(ranks, clock, 1)
+    rows, forwards = first or (np.ones((R, L, E), dtype=np.float32), (1,) * R)
+    for runtime, counts, count in zip(ranks, rows, forwards):
+        set_statistics(runtime, counts, count)
+    while not all(runtime.window == 1 and runtime.close_at is not None for runtime in ranks):
+        assert clock[0] < 32, "the second window did not open"
+        run(ranks, clock, 1)
     return seen, clock, decisions, ranks
 
 
@@ -297,84 +306,80 @@ def request(max_new_tokens, decoding_iter, accepted_draft_tokens, dummy=False):
     )
 
 
-def window_inputs(monkeypatch, forwards: int):
+def window_inputs(monkeypatch, forwards=(FORWARDS,) * R):
+    """The second window's decision on every rank's random rows over its ``forwards``."""
     seen, clock, decisions, ranks = spied_ranks(monkeypatch)
-    ema = np.random.default_rng(7).random((R, L, E), dtype=np.float32) * 64
+    rows = np.random.default_rng(7).integers(0, 64, (R, L, E)).astype(np.float32)
     progress = ([(120, 10, 1), (70, 10, 1), (1, 1, 0, True)], [(75, 15, 2)])
-    for runtime, values in zip(ranks, ema):
-        set_statistics(runtime, values, forwards)
-    run(ranks, clock, rt.WINDOW_FORWARDS)
+    for runtime, counts, count in zip(ranks, rows, forwards):
+        set_statistics(runtime, counts, count)
+    run(ranks, clock, FORWARDS)
     # The window closed: the gather waits for the requests' progress, read in slices.
     assert all(runtime.wants_request_progress for runtime in ranks)
     for runtime, items in zip(ranks, progress):
         runtime.add_request_progress([request(*item) for item in items])
     run(ranks, clock, 2)
-    return seen, ema, decisions, ranks
+    return seen, rows, decisions, ranks
 
 
-def test_full_window_gathers_the_rank_sum_and_scales_it(host_cuda, monkeypatch):
-    seen, ema, decisions, ranks = window_inputs(monkeypatch, rt.WINDOW_FORWARDS)
-    assert decisions[0].sent[0] == ("window", 0) and decisions[1].sent[0] == ("window", 0)
-    total = np.zeros((L, E))
-    for rank in ema:
-        total += rank
-    scale = (1 - EMA_DECAY) / (1 - EMA_DECAY**rt.WINDOW_FORWARDS)
-    assert rt.window_scale(rt.WINDOW_FORWARDS) == scale
-    assert len(seen["load"]) == R * L
-    for i, (load, rows) in enumerate(zip(seen["load"], seen["rows"])):
-        assert np.array_equal(load, total[i % L])
-        assert np.array_equal(rows, total[i % L] * scale)
-    first = [records(runtime)[0] for runtime in ranks]
-    assert first[0]["open_call"] == first[1]["open_call"] == 0
-    # 100 + 50 + 30 tokens remain over 3 requests (the dummy does not count) at 7 / 3 per step.
-    assert seen["steps_left"] == [180 / (7 / 3) / 3] * R
-
-
-def test_missing_boundary_moves_only_the_device_forward_count(host_cuda, monkeypatch):
-    base, _, _, base_ranks = window_inputs(monkeypatch, rt.WINDOW_FORWARDS)
-    late, ema, _, late_ranks = window_inputs(monkeypatch, rt.WINDOW_FORWARDS + 1)
-    for key in ("open_call", "solved_call"):
-        assert records(base_ranks[0])[0][key] == records(late_ranks[0])[0][key]
-    assert base["steps_left"] == late["steps_left"]
-    scale = rt.window_scale(rt.WINDOW_FORWARDS + 1)
-    assert np.array_equal(late["rows"][0], (ema[0][0].astype(np.float64) + ema[1][0]) * scale)
-
-
-def test_ranks_counting_different_forwards_are_scaled_each_by_its_own(host_cuda, monkeypatch):
-    """A rank that recorded one forward more (the others ran a step it did not record) counts
-    with its own window scale; the decision is made, not skipped."""
-    seen, clock, _, ranks = spied_ranks(monkeypatch)
-    ema = np.random.default_rng(3).random((R, L, E), dtype=np.float32) * 64
-    for runtime, values, forwards in zip(ranks, ema, (8, 9)):
-        set_statistics(runtime, values, forwards)
-    run(ranks, clock, rt.WINDOW_FORWARDS + 4)
+def test_a_window_counts_every_ranks_rows_over_its_own_forwards(host_cuda, monkeypatch):
+    """The planner and the share solver get every rank's rows over its own forwards, summed. A
+    rank whose device counted one forward more (a step without a boundary) moves only that count:
+    not the window's calls, the steps left or the decision."""
+    base, _, _, base_ranks = window_inputs(monkeypatch)
+    seen, rows, _, ranks = window_inputs(monkeypatch, (FORWARDS, FORWARDS + 1))
+    expected = rows[0].astype(np.float64) / FORWARDS + rows[1].astype(np.float64) / (FORWARDS + 1)
     assert len(seen["load"]) == R * L  # every layer planned on both ranks: not skipped
-    ratio = rt.window_scale(9) / rt.window_scale(8)
-    expected = ema[0][0].astype(np.float64) + ema[1][0].astype(np.float64) * ratio
-    assert np.array_equal(seen["load"][0], expected)
+    for i, (load, solved) in enumerate(zip(seen["load"], seen["rows"])):
+        assert np.array_equal(load, expected[i % L]) and np.array_equal(solved, expected[i % L])
+    last = [records(runtime)[-1] for runtime in (*ranks, base_ranks[0])]
+    for key in ("window", "open_call", "solved_call"):
+        assert last[0][key] == last[1][key] == last[2][key]
+    # 100 + 50 + 30 tokens remain over 3 requests (the dummy does not count) at 7 / 3 per step.
+    assert seen["steps_left"] == base["steps_left"] == [180 / (7 / 3) / 3] * R
+
+
+def test_the_first_window_lasts_one_call_and_sizes_the_next(host_cuda, monkeypatch):
+    """The first window lasts one call and sets the length of the next ones from its rows per
+    forward, which the schedule hands to every rank's runtime; it is decided only when it holds
+    the rows of a window, ``ROWS_PER_EXPERT`` per expert."""
+    for per_rank, planned in ((rt.ROWS_PER_EXPERT // R - 1, 0), (rt.ROWS_PER_EXPERT // R, R * L)):
+        rows = np.full((R, L, E), per_rank, dtype=np.float32)
+        seen, _, _, ranks = spied_ranks(monkeypatch, first=(rows, (1,) * R))
+        assert len(seen.get("load", [])) == planned
+        assert seen["per_forward"] == [(R * per_rank * E, E)] * R
+        for runtime in ranks:
+            (first,) = records(runtime)
+            # It closed at call 1, was gathered at call 2 and decided at call 3.
+            assert (first["open_call"], first["solved_call"], first["tables"]) == (0, 3, [])
+            assert first["forwards"] == FORWARDS
+            assert runtime.close_at - runtime.window_opened_call == FORWARDS
 
 
 def test_a_rank_without_a_forward_skips_the_window(host_cuda, monkeypatch):
     seen, clock, _, ranks = spied_ranks(monkeypatch)
-    for runtime, forwards in zip(ranks, (8, 0)):
+    for runtime, forwards in zip(ranks, (FORWARDS, 0)):
         set_statistics(runtime, np.ones((L, E), dtype=np.float32), forwards)
-    run(ranks, clock, rt.WINDOW_FORWARDS + 4)
+    run(ranks, clock, FORWARDS + 4)
     assert "load" not in seen
-    assert all(records(runtime)[0]["tables"] == [] for runtime in ranks)
-    assert records(ranks[0])[0]["next_open"] == records(ranks[1])[0]["next_open"] == 12
+    last = [records(runtime)[-1] for runtime in ranks]
+    assert all(record["window"] == 1 and record["tables"] == [] for record in last)
+    # Nothing was learnt: the next window opens the call after the skipped one's apply call.
+    assert [record["next_open"] - record["apply_call"] for record in last] == [1, 1]
 
 
 def test_layers_not_live_on_every_rank_are_not_planned(monkeypatch):
     seen = {}
     spy(monkeypatch, seen)
     decision = FakeDecision(0)
+    decision.decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
     stats = decision.stats.numpy()
     stats[:, : L * E] = 1.0
     stats[:, L * E : L * (E + 1)] = 8
     stats[:, L * (E + 1) : L * (E + 2)] = [[0, -1], [-1, -1]]
     decision.decider.committed[:] = [0, -1]
     decision.decider.decide(0)
-    assert len(seen["load"]) == 1 and np.array_equal(seen["load"][0], stats[:, E : 2 * E].sum(0))
+    assert len(seen["load"]) == 1 and np.array_equal(seen["load"][0], np.full(E, 2 / 8))
 
 
 def test_copy_items_take_free_slots_from_the_node_first():
@@ -404,7 +409,8 @@ def script(rank, table_of_layer_1=2):
 
 def test_tables_apply_from_the_call_after_every_rank_copied(host_cuda):
     """Rank 1's copies finish four calls later than rank 0's: both apply the new tables at the
-    same call, the one after the latest completion, before the next window is scheduled."""
+    same call, the one after the latest completion, before the next window is scheduled. The
+    window event hands over the gathered statistics."""
     clock = [0]
     decisions = [FakeDecision(0, script=script(0)), FakeDecision(1, script=script(1))]
     ranks = make_ranks(decisions, clock, copy_delays=(1, 5))
@@ -416,28 +422,14 @@ def test_tables_apply_from_the_call_after_every_rank_copied(host_cuda):
     apply = copied[1] + 1
     assert [r["apply_call"] for r in first] == [apply, apply]
     assert [r["effect"] for r in first] == [{0: apply, 1: apply}] * 2
-    for runtime in ranks:
+    for runtime, decision in zip(ranks, decisions):
         assert runtime.tables.tolist() == [[1] * TABLE, [2] * TABLE]
-        assert runtime.debug_listener.kinds == [
-            "window",
-            "decision",
-            "copied",
-            "applied",
-            "scheduled",
-        ]
+        assert runtime.debug_listener.kinds == "window decision copied applied scheduled".split()
+        (stats,) = runtime.debug_listener.stats
+        assert np.array_equal(stats, decision.stats.numpy())
         assert records(runtime)[0]["next_open"] == apply + 4
         assert runtime.applied_window.tolist() == [0, 0]
     assert ranks[0].transport.batches == [[]] and ranks[1].transport.batches == [[(0, 4, 0, 0)]]
-
-
-def test_the_window_event_hands_over_the_gathered_statistics(host_cuda):
-    clock = [0]
-    decisions = [FakeDecision(0, script=script(0)), FakeDecision(1, script=script(1))]
-    ranks = make_ranks(decisions, clock)
-    run(ranks, clock, rt.WINDOW_FORWARDS + 2)
-    for runtime, decision in zip(ranks, decisions):
-        (stats,) = runtime.debug_listener.stats
-        assert np.array_equal(stats, decision.stats.numpy())
 
 
 def test_ranks_that_decided_differently_stop_before_applying(host_cuda):
@@ -454,9 +446,9 @@ def test_windows_keep_their_numbers_across_installs(host_cuda, monkeypatch):
     decision process under its own number."""
     _, clock, decisions, ranks = spied_ranks(monkeypatch, timed=True)
     hot = np.tile([400.0, 400.0] + [1.0] * (E - 2), (L, 1)).astype(np.float32)
-    for _ in range(3):  # three windows: the second and third gather after an install
+    for _ in range(3):  # three more windows: the later ones gather after an install
         for runtime in ranks:
-            set_statistics(runtime, hot, rt.WINDOW_FORWARDS)
+            set_statistics(runtime, hot, FORWARDS)
         run(ranks, clock, 22)
     sent = [m[1] for m in decisions[0].sent if m[0] == "window"]
     assert sent == list(range(len(sent))) and len(sent) >= 3
@@ -480,23 +472,23 @@ def test_two_ranks_move_an_expert_and_apply(host_cuda, monkeypatch):
     _, clock, _, ranks = spied_ranks(monkeypatch, timed=True)
     hot = np.tile([400.0, 400.0] + [1.0] * (E - 2), (L, 1)).astype(np.float32)
     for runtime in ranks:
-        set_statistics(runtime, hot, rt.WINDOW_FORWARDS)
-    run(ranks, clock, rt.WINDOW_FORWARDS)
+        set_statistics(runtime, hot, FORWARDS)
+    run(ranks, clock, FORWARDS)
     for runtime in ranks:
         runtime.add_request_progress([request(1000, 10, 0) for _ in range(4)])
     run(ranks, clock, 12)
-    first = [records(runtime)[0] for runtime in ranks]
-    assert all(record["moved"] == [0, 1] for record in first)
-    assert first[0]["apply_call"] == first[1]["apply_call"]
+    decided = [runtime.debug_listener.by_window[1] for runtime in ranks]
+    assert all(record["moved"] == [0, 1] for record in decided)
+    assert decided[0]["apply_call"] == decided[1]["apply_call"]
     # Experts 0 and 1 are rank 0's homes: rank 1 copies them in one batch, rank 0 copies nothing.
     assert ranks[0].transport.batches == [[]]
     (batch,) = ranks[1].transport.batches
     assert sorted(batch) == [
         (layer, slot, 0, expert) for layer in range(L) for slot, expert in ((4, 0), (5, 1))
     ]
-    for runtime in ranks:
-        assert sorted(records(runtime)[0]["effect"]) == [0, 1] and runtime.tables.any()
-        assert runtime.applied_window.tolist() == [0, 0]
+    for record, runtime in zip(decided, ranks):
+        assert sorted(record["effect"]) == [0, 1] and runtime.tables.any()
+        assert runtime.applied_window.tolist() == [1, 1]
 
 
 def test_no_boundary_runs_while_a_graph_is_captured(monkeypatch):
@@ -527,10 +519,15 @@ def test_an_update_moves_in_one_copy_group(monkeypatch):
     monkeypatch.setattr(rt, "solve_shares", even_split)
     decision = FakeDecision(0)
     window_stats(decision.stats.numpy())
-    decision.decider.copy_timings[0] = (1, 0.5)  # one copy group timed: both layers may install
-    update = decision.decider.decide(0)
+    decider = decision.decider
+    decider.copy_timings[0] = (1, 0.5)  # one copy group timed: both layers may install
+    decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
+    decider.evaluations.erosion = 1.0  # a gain gone within a step repays no copy
+    assert decider.decide(0).tables == {}
+    decider.evaluations.erosion = None
+    update = decider.decide(1)
     assert update.moved == [0, 1] and update.groups == [(0, [0, 1])]
-    assert decision.decider.decide(1).groups == []  # nothing new to move: no group
+    assert decider.decide(2).groups == []  # nothing new to move: no group
 
 
 def test_a_candidate_must_gain_on_the_previous_window_too(monkeypatch):
@@ -540,6 +537,7 @@ def test_a_candidate_must_gain_on_the_previous_window_too(monkeypatch):
     monkeypatch.setattr(rt, "plan_layout", lambda *args: SimpleNamespace(layout=candidate))
     decision = FakeDecision(0)
     decision.decider.copy_timings[0] = (1, 0.5)
+    decision.decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
 
     def window(number, hot):
         window_stats(decision.stats.numpy(), (hot,))
@@ -555,16 +553,21 @@ def test_decision_process_answers_and_reports_its_failure():
     process = rt.DecisionProcess(rt.DecisionConfig(GEOMETRY, MODEL, np.tile(HOME, (L, 1)), 1, 1))
     try:
         window_stats(process.stats.numpy())
+        # The first window holds fewer rows than a window collects: it only sizes the next ones,
+        # to collect them at its 2 x (2 x 400 + 6) / 8 rows per forward.
         process.submit(("window", 0))
+        assert process.recv() == ("update", rt.LayoutUpdate(0))
+        rows = np.array([[10, 0, 0.0, 0], [12, 0, 0.0, 0]])  # ROW of both ranks
+        process.submit(("copied", 0, rows))
+        kind, window, open_call, apply_call, plan, forwards = process.recv()
+        assert (kind, window, apply_call, open_call) == ("schedule", 1, 13, 13 + plan.open_after)
+        assert forwards == np.ceil(rt.ROWS_PER_EXPERT * E / (2 * (2 * 400 + 6) / 8))
+        process.submit(("window", 1))
         kind, update = process.recv()
-        assert kind == "update" and update.window == 0
+        assert kind == "update" and update.window == 1
         # No copy was timed yet: the best layer alone is installed, to time one.
         assert update.moved == [0] and set(update.tables) == {0}
         assert all(t.dtype == np.int32 and t.size == TABLE for t in update.tables.values())
-        rows = np.array([[10, 2, 0.5, 1], [12, 2, 0.7, 1]])  # ROW of both ranks
-        process.submit(("copied", 0, rows))
-        kind, window, open_call, apply_call, plan = process.recv()
-        assert (kind, window, apply_call, open_call) == ("schedule", 1, 13, 13 + plan.open_after)
         process.submit(("copied", 5, rows))
         with pytest.raises(RuntimeError, match="KeyError"):
             process.recv()

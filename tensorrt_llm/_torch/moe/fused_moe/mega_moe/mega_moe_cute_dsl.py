@@ -881,33 +881,17 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     # The MNNVL memory the slot parameters point into once adaptive EPLB moved them.
     adaptive_eplb_block: Optional[object] = None
 
-    _DECODE_TIME_MODELS = {
-        "GB300": dict(
-            per_active_slot_us=4.645,
-            measured_expert_bytes=37158924,
-            per_extra_tile_us=2.0588531830700743,
-            per_row_us=0.008615490581896095,
-            hot_slot_extra_tile_us=1.019131452343683,
-            scale=0.901323556551518,
-            tile_rows=256,
-        ),
-    }
-    """The time model of the NVFP4 decode kernels per GPU (``adaptive_eplb.policy.TimeModel``).
-
-    Adaptive EPLB on MegaMoE runs on GB300 only: no other GPU has a measured model, and
-    :meth:`has_decode_time_model` refuses it when the model is built. ``per_active_slot_us`` is the
-    weight-streaming time of one expert of ``measured_expert_bytes`` bytes (DeepSeek-V4-Pro),
-    scaled linearly to other expert sizes. ``per_extra_tile_us``, ``per_row_us`` and
-    ``hot_slot_extra_tile_us`` are a least-squares fit of the MoE kernel's time per launch, read
-    with Nsight Systems, over local batches of 8 to 64 tokens per GPU at EP32; ``scale`` fits the
-    model to the step times of one decode run. The values are kept as fitted: the decisions depend
-    on them.
+    _DECODE_DEVICES = {"GB300": (8.0e12, 15.0e15, 0.94)}
+    """Per GPU: the HBM bandwidth (bytes/s) and the dense NVFP4 peak (FLOP/s) of the datasheet, and
+    ``scale``, the one measured number of the decode time model
+    (``tests/microbenchmarks/measure_adaptive_eplb_time_model.py``). Adaptive EPLB on MegaMoE runs
+    only where :meth:`has_decode_time_model` finds an entry; the model is refused at build otherwise.
     """
 
     @classmethod
     def has_decode_time_model(cls, device_name: str) -> bool:
-        """Whether :meth:`decode_time_model` has a measured model for ``device_name``."""
-        return any(key in device_name for key in cls._DECODE_TIME_MODELS)
+        """Whether :meth:`decode_time_model` has an entry for ``device_name``."""
+        return any(key in device_name for key in cls._DECODE_DEVICES)
 
     @property
     def slot_id_dtype(self) -> torch.dtype:
@@ -947,18 +931,28 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             )
 
     def decode_time_model(self, expert_bytes: int, device_name: str) -> Dict[str, float]:
-        """Parameters of the decode kernels' time model on ``device_name``.
+        """Parameters of the decode kernels' time model on ``device_name`` (``policy.TimeModel``).
 
-        ``expert_bytes`` is the size of one expert's weights. Raises ``ValueError`` when no time
-        model was measured on the device.
+        A slot that receives rows streams its expert's ``expert_bytes`` from HBM once; a row costs
+        its FC1 and FC2 FLOPs at the dense FP4 peak; every 256-row tile of a slot beyond its first
+        costs a tile of rows, and every such tile of the GPU's busiest slot half a tile more, the
+        serial tail of that slot. Raises ``ValueError`` when the device has no entry.
         """
-        for key, params in self._DECODE_TIME_MODELS.items():
+        for key, (bandwidth, peak, scale) in self._DECODE_DEVICES.items():
             if key in device_name:
-                model = dict(params)
-                measured_bytes = model.pop("measured_expert_bytes")
-                model["per_active_slot_us"] *= expert_bytes / measured_bytes
-                return model
-        raise ValueError(f"no decode time model of MegaMoE was measured on {device_name!r}")
+                inner = int(self.expand_intermediate_size_per_partition) + int(
+                    self.intermediate_size_per_partition
+                )
+                row_us = 2.0 * self.hidden_size * inner / peak * 1e6
+                return dict(
+                    per_active_slot_us=expert_bytes / bandwidth * 1e6,
+                    per_extra_tile_us=256 * row_us,
+                    per_row_us=row_us,
+                    hot_slot_extra_tile_us=128 * row_us,
+                    scale=scale,
+                    tile_rows=256,
+                )
+        raise ValueError(f"no decode time model of MegaMoE for {device_name!r}")
 
     def _supports_load_balancer(self) -> bool:
         # Both static and dynamic EPLB are supported: the four MegaMoE-

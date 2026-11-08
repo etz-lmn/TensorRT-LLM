@@ -894,10 +894,9 @@ def _register_fake():
         out: torch.Tensor,
         weights: Optional[torch.Tensor] = None,
         weights_out: Optional[torch.Tensor] = None,
-        ema: Optional[torch.Tensor] = None,
+        rows: Optional[torch.Tensor] = None,
         forwards: Optional[torch.Tensor] = None,
         enabled: Optional[torch.Tensor] = None,
-        decay: float = 0.0,
         first: bool = True,
     ) -> None:
         return None
@@ -905,10 +904,9 @@ def _register_fake():
     @torch.library.register_fake("trtllm::adaptive_eplb_record")
     def _(
         ids: torch.Tensor,
-        ema: torch.Tensor,
+        rows: torch.Tensor,
         forwards: torch.Tensor,
         enabled: torch.Tensor,
-        decay: float,
         first: bool = True,
     ) -> None:
         return None

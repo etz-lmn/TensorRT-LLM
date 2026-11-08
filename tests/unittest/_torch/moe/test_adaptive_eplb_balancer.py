@@ -14,7 +14,7 @@ from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.balancer import (
     ExpertStatistics,
     statistics_buffers,
 )
-from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import EMA_DECAY, TimeModel
+from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import TimeModel
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.runtime import build_route_tables
 from tensorrt_llm.llmapi.llm_args import MoeAdaptiveLoadBalancerConfig
 
@@ -88,7 +88,7 @@ def test_statistics_record_nothing_while_the_flag_is_clear():
     off = torch.zeros(1, dtype=torch.int32)
     stats = ExpertStatistics.of(statistics_buffers(1, 4, "cpu"), 0, off)
     stats.record(torch.tensor([[0, 1], [1, 3]], dtype=torch.int32))
-    assert not stats.ema.any() and stats.forwards.item() == 0
+    assert not stats.rows.any() and stats.forwards.item() == 0
 
 
 def test_layer_home_layout_and_load_expert_ids():
@@ -154,7 +154,7 @@ def test_layer_route_stages_into_the_backend_and_records_the_statistics():
     assert (bucket.topk_weights[2:, :TOP_K] == 0).all()
     assert (bucket.topk_weights[:, TOP_K] == 9).all()
     first = _counts(2, 0, 0, 0, 0, 1, 0, 1)
-    assert torch.equal(layer.statistics.ema, first) and layer.statistics.forwards.item() == 1
+    assert torch.equal(layer.statistics.rows, first) and layer.statistics.forwards.item() == 1
     assert asked == [(2, TOP_K)]
     # When the backend declines (a forward it does not stage), the route returns its own tensor;
     # without the weights the backend is not asked.
@@ -166,7 +166,7 @@ def test_layer_route_stages_into_the_backend_and_records_the_statistics():
     # The statistics of ids other than the routed ones are added before the route.
     layer.update_local_statistic(four, True, True)
     layer.route(experts)
-    assert torch.equal(layer.statistics.ema, first * EMA_DECAY + _counts(0, 4, 4, 0, 0, 0, 0, 0))
+    assert torch.equal(layer.statistics.rows, first + _counts(0, 4, 4, 0, 0, 0, 0, 0))
     assert layer.statistics.forwards.item() == 2
 
 
@@ -306,5 +306,5 @@ def test_a_moe_layer_runs_a_forward_through_the_load_balancer_hooks():
         module._load_balancer_start_set_cpu_stage(last)
         module._load_balancer_done_set_cpu_stage(last)
     assert slots.tolist() == [[0, 7], [10, 10]]
-    assert torch.equal(layer.statistics.ema, _counts(2, 0, 0, 0, 0, 2, 0, 4))
+    assert torch.equal(layer.statistics.rows, _counts(2, 0, 0, 0, 0, 2, 0, 4))
     assert layer.statistics.forwards.item() == 1

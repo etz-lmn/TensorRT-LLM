@@ -15,9 +15,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-EMA_DECAY = 0.95
-"""float: Per-forward decay of the per-expert row average kept by the statistics op."""
-
 _ExpertSlots = list[tuple[int, ...]]
 
 
@@ -96,25 +93,15 @@ def slot_rows(load: np.ndarray, layout: np.ndarray, shares: np.ndarray) -> np.nd
     return rows
 
 
-def even_shares(layout: np.ndarray) -> np.ndarray:
-    """``[L, num_slots]`` shares that split every expert's rows evenly over its copies."""
-    active = layout >= 0
-    num_experts = int(layout.max()) + 1 if layout.size else 0
-    shares = np.zeros(layout.shape)
-    for i in range(layout.shape[0]):
-        counts = np.bincount(layout[i][active[i]], minlength=num_experts).astype(np.float64)
-        np.divide(1.0, counts[np.maximum(layout[i], 0)], out=shares[i], where=active[i])
-    return shares
-
-
 # ------------------------------------------------------------------------------------------------
 # Layout planner
 # ------------------------------------------------------------------------------------------------
 
 
 def active_slots(geometry: ExpertGeometry) -> int:
-    """Slots a planned layout may occupy: half of every GPU's non-home slots stays free, so an
-    install always has free slots to copy new replicas into."""
+    """Slots a planned layout may occupy: every GPU keeps as many non-home slots free as it holds
+    replicas, so one install can replace all of a GPU's replicas (new replicas are copied into free
+    slots while the old ones still serve routes)."""
     spare = geometry.local_slots - geometry.local_experts
     return geometry.num_slots - geometry.ep_size * (spare // 2)
 
@@ -167,27 +154,23 @@ def _expert_slots_of(layout: list[int], num_experts: int) -> _ExpertSlots:
     return [tuple(slots) for slots in slots_of]
 
 
-def _float32_rows(rows: list[float]) -> list[float]:
-    return np.asarray(rows, dtype=np.float64).astype(np.float32).astype(np.float64).tolist()
-
-
-def _copies(rows32: list[float], total: int) -> list[int]:
+def _copies(rows: list[float], total: int) -> list[int]:
     """Copies of every expert; without rows the extra slots go to the lowest ids."""
-    num_experts = len(rows32)
+    num_experts = len(rows)
     if total == num_experts:
         return [1] * num_experts
-    if not any(rows32):
+    if not any(rows):
         base, rest = divmod(total, num_experts)
         return [base + (expert < rest) for expert in range(num_experts)]
     copies = [1] * num_experts
     # Max-heap on (rows per copy, expert id): a tie pops the larger id first.
-    heap = [(-rows32[expert], -expert) for expert in range(num_experts)]
+    heap = [(-rows[expert], -expert) for expert in range(num_experts)]
     heapq.heapify(heap)
     for _ in range(total - num_experts):
         _, neg_expert = heapq.heappop(heap)
         expert = -neg_expert
         copies[expert] += 1
-        heapq.heappush(heap, (-(rows32[expert] / float(copies[expert])), neg_expert))
+        heapq.heappush(heap, (-(rows[expert] / float(copies[expert])), neg_expert))
     return copies
 
 
@@ -198,19 +181,17 @@ def _place_replicas(
     num_experts = geometry.num_experts
     ep_size = geometry.ep_size
     local = geometry.local_slots
-    rows32 = _float32_rows(rows)
-    copies = _copies(rows32, total)
+    copies = _copies(rows, total)
     free = [[s for s in range(r * local, (r + 1) * local) if homes[s] < 0] for r in range(ep_size)]
     limit = [min(local - geometry.local_experts, len(free[r])) for r in range(ep_size)]
     experts_on_gpu = [
         {e for e in homes[r * local : (r + 1) * local] if e >= 0} for r in range(ep_size)
     ]
     gpu_rows = [
-        math.fsum([rows32[e] / copies[e] for e in sorted(experts_on_gpu[r])])
-        for r in range(ep_size)
+        math.fsum([rows[e] / copies[e] for e in sorted(experts_on_gpu[r])]) for r in range(ep_size)
     ]
     replicas = sorted(
-        ((rows32[e] / copies[e], e) for e in range(num_experts) for _ in range(copies[e] - 1)),
+        ((rows[e] / copies[e], e) for e in range(num_experts) for _ in range(copies[e] - 1)),
         key=lambda item: (-item[0], item[1]),
     )
     taken = [0] * ep_size
@@ -391,40 +372,38 @@ def evaluate_gains(
     new_shares: np.ndarray,
     model: TimeModel,
     geometry: ExpertGeometry,
-    steps_left: float | None,
 ) -> np.ndarray:
-    """The gain of ``new_layout`` over ``layout`` of each layer, in ms per decode step, for ``load``.
-
-    The first calls, one for each layer that gains at ``new_shares``, are priced at the even split
-    of ``new_layout`` and the rest of ``steps_left`` at ``new_shares``; without ``steps_left``, the
-    whole gain is priced at the even split.
-    """
+    """The gain of ``new_layout`` at ``new_shares`` over ``layout`` at ``shares`` of each layer, in
+    ms per decode step, for ``load``; an install applies a layout and its shares together."""
     if not len(load):
         return np.zeros(0)
     ep = geometry.ep_size
     t_cur = model.layer_time_us(slot_rows(load, layout, shares), ep)
-    t_even = model.layer_time_us(slot_rows(load, new_layout, even_shares(new_layout)), ep)
-    t_sol = model.layer_time_us(slot_rows(load, new_layout, new_shares), ep)
-    gain_even = (t_cur - t_even) / 1e3
-    gain_solved = (t_cur - t_sol) / 1e3
-    if steps_left is None or steps_left <= 0:
-        return gain_even
-    even_calls = max(1, int((gain_solved > 0).sum()))
-    even_steps = min(float(even_calls), float(steps_left))
-    return (gain_even * even_steps + gain_solved * (float(steps_left) - even_steps)) / float(
-        steps_left
-    )
+    t_new = model.layer_time_us(slot_rows(load, new_layout, new_shares), ep)
+    return (t_cur - t_new) / 1e3
 
 
 def choose_layers_to_install(
-    gains: dict[int, float], steps_left: float | None, copy_cost_ms_per_layer: float
+    gains: dict[int, float],
+    steps_left: float | None,
+    copy_cost_ms_per_layer: float,
+    erosion: float | None,
 ) -> list[int]:
-    """Layers to install, largest gain first, while ``gain * steps_left`` repays one layer's copy."""
+    """Layers to install, largest gain first, while an install's worth repays one layer's copy.
+
+    A layer's gain ``g`` (ms per step) shrinks by ``erosion`` (ms per step per call, the measured
+    growth of a layout's cost) as its rows drift, so the install is worth ``g T - erosion T^2 / 2``
+    over its ``T = min(steps_left, g / erosion)`` steps; without an erosion reading, ``g`` lasts
+    ``steps_left`` steps.
+    """
     if steps_left is None:
         return []
     chosen = []
     for layer, gain in sorted(gains.items(), key=lambda kv: (-kv[1], kv[0])):
-        if not gain * steps_left > copy_cost_ms_per_layer:
+        steps = float(steps_left)
+        if erosion:
+            steps = min(steps, max(gain, 0.0) / erosion)
+        if not gain * steps - (erosion or 0.0) * steps * steps / 2.0 > copy_cost_ms_per_layer:
             break
         chosen.append(layer)
     return chosen
@@ -495,7 +474,8 @@ class EvaluationScheduler:
     little worse every call; an interval of ``sqrt(2 * fixed cost / growth per call)`` calls
     minimizes their sum per call. The growth is read from two windows of the same layers: their
     time above the same rows spread evenly, under the current layouts. Growth below
-    :meth:`min_resolvable_rate` is not counted.
+    :meth:`min_resolvable_rate` is not counted. ``erosion`` is the last counted growth per layer:
+    how fast a layer's gain from an install shrinks, in ms per step per call.
     """
 
     def __init__(self, model: TimeModel, geometry: ExpertGeometry) -> None:
@@ -504,6 +484,7 @@ class EvaluationScheduler:
         self._previous_load: dict[int, np.ndarray] = {}
         self._previous_open: int | None = None
         self._last_positive_rate: float | None = None
+        self.erosion: float | None = None
 
     def read_cost(
         self,
@@ -583,6 +564,7 @@ class EvaluationScheduler:
                 growth.layers, growth.interval
             ):
                 self._last_positive_rate = growth.rate
+                self.erosion = growth.rate / growth.layers
             rate = self._last_positive_rate
         best = None
         if fixed is not None and rate is not None:
