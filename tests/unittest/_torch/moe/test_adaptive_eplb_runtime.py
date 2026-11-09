@@ -583,6 +583,23 @@ def test_a_candidate_must_gain_on_the_previous_window_too(monkeypatch):
     assert sorted(window(2, 2).tables) == [0, 1]  # gains on both windows: installed
 
 
+def test_layers_that_install_nothing_take_shares_that_repay_applying_tables(monkeypatch):
+    monkeypatch.setattr(rt, "solve_shares", even_split)
+    decision = FakeDecision(0, copy_ms=0.5)
+    decider, stats = decision.decider, window_stats(decision.stats.numpy())
+    decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
+    assert decider.decide(0).moved == [0, 1]  # GPU 0's hot experts 0 and 1 copied to GPU 1
+    layouts, home_only = decider.layout.copy(), (HOME >= 0).astype(np.float64)
+    monkeypatch.setattr(rt, "solve_shares", lambda *args: home_only)
+    decider.copy_timings = {0: (2, 1e9)}  # no copy repays: only shares may change
+    window_stats(stats, (0, 6))[:, L * (E + 1) : L * (E + 2)] = 0  # GPU 1 the busiest now
+    stats[:, L * (E + 2) + rt.FIELDS.index("applied")] = -1  # no route tables timed meanwhile
+    for window, fixed, tables in ((1, 1e9, []), (2, 0.0, [0, 1])):  # a table copy's fixed time
+        decider.install_timings = {0: (1, fixed), 1: (2, fixed)}
+        assert sorted(decider.decide(window).tables) == tables
+    assert (decider.layout == layouts).all() and (decider.shares == home_only).all()
+
+
 def test_decision_process_answers_and_reports_its_failure():
     process = rt.DecisionProcess(rt.DecisionConfig(GEOMETRY, MODEL, np.tile(HOME, (L, 1)), 1, 1))
     try:

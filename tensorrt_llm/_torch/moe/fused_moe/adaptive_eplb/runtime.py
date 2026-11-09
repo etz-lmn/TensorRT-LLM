@@ -42,6 +42,7 @@ from .policy import (
     choose_layers_to_install,
     copy_ms_per_layer,
     evaluate_gains,
+    fixed_install_ms,
     plan_layout,
 )
 
@@ -339,6 +340,7 @@ class _Decider:
         if copy_ms is None:
             # No copy has been timed yet: install the best layer alone to time one.
             chosen = chosen[:1]
+        reshared = self._reshare(rows, planned.tolist(), chosen, previous_load, steps_left)
         growth = self.evaluations.read_cost(
             range(layers), rows, self.layout, self.shares, self.open_call
         )
@@ -346,7 +348,9 @@ class _Decider:
         self.awaiting_copy[window] = (close, growth, steps_left)
         moved = []
         for i, layer in enumerate(planned.tolist()):
-            if layer not in chosen:
+            if layer in reshared:
+                new_layout[i], new_shares[i] = self.layout[layer], reshared[layer]
+            elif layer not in chosen:
                 continue
             tables = build_route_tables(new_layout[i], new_shares[i], experts, slots).packed()
             update.tables[layer] = np.array(tables, dtype=np.int32)
@@ -365,6 +369,41 @@ class _Decider:
             update.groups.append((self.next_group, update.moved))
             self.next_group += 1
         return update
+
+    def _reshare(
+        self,
+        rows: np.ndarray,
+        planned: list[int],
+        chosen: list[int],
+        previous_load: np.ndarray | None,
+        steps_left: float | None,
+    ) -> dict[int, np.ndarray]:
+        """New shares of the current layouts of the planned layers that install nothing.
+
+        A layer takes them when their gain, the smaller of this window's and the held-out window's
+        as for an install, is positive; they move no weights. A window that installs nothing
+        applies them only when their gains over the steps left repay the measured fixed time of
+        applying route tables.
+        """
+        cfg = self.config
+        fixed = fixed_install_ms(_timings(self.install_timings))
+        layers = [layer for layer in planned if layer not in chosen]
+        if not layers or steps_left is None or fixed is None:
+            return {}
+        layout, shares = self.layout[layers], self.shares[layers]
+        new = np.stack(
+            [solve_shares(rows[layer], layout[i], cfg.geometry) for i, layer in enumerate(layers)]
+        )
+        gains = evaluate_gains(rows[layers], layout, shares, layout, new, cfg.model, cfg.geometry)
+        if previous_load is not None:
+            held = previous_load[[planned.index(layer) for layer in layers]]
+            gains = np.minimum(
+                gains, evaluate_gains(held, layout, shares, layout, new, cfg.model, cfg.geometry)
+            )
+        keep = np.flatnonzero(gains > 0.0)
+        if not chosen and float(gains[keep].sum()) * float(steps_left) <= fixed:
+            return {}
+        return {layers[i]: new[i] for i in keep.tolist()}
 
 
 def serve(conn: Connection) -> None:
