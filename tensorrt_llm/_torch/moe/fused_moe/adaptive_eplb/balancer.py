@@ -15,8 +15,10 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from tensorrt_llm.logger import logger
+
 from ..moe_load_balancer import BaseMoeLoadBalancer
-from .policy import ExpertGeometry, TimeModel
+from .policy import ExpertGeometry, TimeModel, active_slots
 from .runtime import AdaptiveRuntime, DecisionConfig, DecisionProcess, build_route_tables
 from .transport import PeerSlotTransport, migrate_model_weights
 
@@ -37,6 +39,31 @@ def statistics_buffers(layers: int, num_experts: int, device: torch.device | str
         forwards=storage[forwards_at:].view(torch.int64).view(layers, 1),
         storage=storage,
     )
+
+
+def time_layer_copy(
+    transport: PeerSlotTransport, layer: int, geometry: ExpertGeometry, stream: torch.cuda.Stream
+) -> float:
+    """Milliseconds of the copies of one layer's install, at the slowest rank; collective over EP.
+
+    Every rank copies into its free slots of ``layer`` as many experts as an install places on a
+    GPU, each from the home slots of a rank half the EP group away. The ranks copy at the same
+    time, once every rank's blocks hold their weights, and the same copies run once untimed
+    first. No route table points at a free slot, so the copies change no result.
+    """
+    rank, size, homes = transport.ep_rank, geometry.ep_size, geometry.local_experts
+    replicas = active_slots(geometry) // size - homes
+    experts = [
+        (layer, homes + j, (rank + size // 2 + j) % size, j % homes) for j in range(replicas)
+    ]
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    transport.allgather(None)
+    for _ in range(2):
+        transport.copy(experts, stream, start, end)
+        end.synchronize()
+    return max(transport.allgather(start.elapsed_time(end)))
 
 
 class ExpertStatistics(NamedTuple):
@@ -281,8 +308,9 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
     set_warm_up_iter_count = _nothing_before_runtime
 
     def prepare_runtime(self, model: torch.nn.Module) -> None:
-        """Move the slot weights into MNNVL memory and start the runtime under the backend's time
-        model. Collective over EP; runs before the KV cache is sized."""
+        """Move the slot weights into MNNVL memory, time one layer's install copy
+        (:func:`time_layer_copy`) and start the runtime under the backend's time model. Collective
+        over EP; runs before the KV cache is sized."""
         self.transport, self.copy_stream, backends = migrate_model_weights(
             model, self.layers, self.mapping
         )
@@ -290,10 +318,16 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         time_model = backends[first].decode_time_model(
             self.transport.expert_bytes(first), torch.cuda.get_device_name()
         )
-        self.start_runtime(TimeModel(**time_model), self.mapping.gpus_per_node)
+        geometry = ExpertGeometry(self.layers[0].expert_count, self.num_slots, self.ep_size)
+        copy_ms = time_layer_copy(self.transport, first, geometry, self.copy_stream)
+        logger.info(f"adaptive EPLB: one layer's install copy takes {copy_ms:.3f} ms at start-up")
+        self.start_runtime(TimeModel(**time_model), self.mapping.gpus_per_node, copy_ms)
 
-    def start_runtime(self, model: TimeModel, ranks_per_node: int) -> None:
-        """Start the windows, the decision process and the installs. Collective over EP."""
+    def start_runtime(
+        self, model: TimeModel, ranks_per_node: int, copy_ms: float | None = None
+    ) -> None:
+        """Start the windows, the decision process and the installs, the decisions taking
+        ``copy_ms`` as one layer's copy time until an install is timed. Collective over EP."""
         if not dist.is_initialized():
             raise RuntimeError(
                 "adaptive EPLB needs torch.distributed: its statistics gathers run on a gloo group "
@@ -302,7 +336,7 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         geometry = ExpertGeometry(self.layers[0].expert_count, self.num_slots, self.ep_size)
         homes = np.array([layer.home_layout() for layer in self.layers], dtype=np.int64)
         decision = DecisionProcess(
-            DecisionConfig(geometry, model, homes, self.ep_rank, ranks_per_node)
+            DecisionConfig(geometry, model, homes, self.ep_rank, ranks_per_node, copy_ms=copy_ms)
         )
         # The runtime's worker thread gathers on a group of its own: a group the main thread also
         # uses would interleave their collectives differently on different ranks. Its window and
