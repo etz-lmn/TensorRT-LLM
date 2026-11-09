@@ -116,6 +116,21 @@ def _copy_batch(
         raise RuntimeError(f"cudaMemcpyBatchAsync of {len(dst)} copies failed: {error}")
 
 
+def dedicated_copy_stream(device: torch.device) -> torch.cuda.Stream:
+    """A non-blocking stream of the copies' own on ``device``, kept for the life of the process.
+
+    ``torch.cuda.Stream()`` hands out the streams of a small per-device pool in turn, and other
+    components take theirs from the same pool: a pooled copy stream can be a stream that also runs
+    kernels, and the copies would then wait behind them instead of overlapping them.
+    """
+    cudart, _ = _batch_attributes()
+    with torch.cuda.device(device):
+        error, stream = cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking)
+    if error != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"cudaStreamCreateWithFlags failed: {error}")
+    return torch.cuda.ExternalStream(int(stream), device=device)
+
+
 class PeerSlotTransport:
     """Copies experts from a peer rank's layer block into this rank's slots.
 
@@ -338,8 +353,8 @@ def migrate_model_weights(
 ) -> tuple[PeerSlotTransport, torch.cuda.Stream, dict[int, AdaptiveEplbBackend]]:
     """Move the slot planes of every balanced layer into MNNVL blocks and prepare the layer handles.
 
-    Every EP rank must call it. Returns the transport, its copy stream and the backends that
-    :func:`find_backends` finds.
+    Every EP rank must call it. Returns the transport, its copy stream
+    (:func:`dedicated_copy_stream`) and the backends that :func:`find_backends` finds.
     """
     _batch_attributes()
     backends = find_backends(model, layers)
@@ -358,4 +373,4 @@ def migrate_model_weights(
         f"into MNNVL blocks in {time.perf_counter() - start:.2f} s; free device memory "
         f"{free / gib:.2f} -> {torch.cuda.mem_get_info(device)[0] / gib:.2f} GiB"
     )
-    return transport, torch.cuda.Stream(device), backends
+    return transport, dedicated_copy_stream(device), backends

@@ -21,6 +21,7 @@ from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.transport import (
     LayerBlockLayout,
     PeerSlotTransport,
     SlotPlane,
+    dedicated_copy_stream,
 )
 
 
@@ -116,7 +117,9 @@ def make_rig(args, rank, world, per_node, device) -> Rig:
             rows[:half].copy_(pattern(rank, layer, plane, args, half, rows.shape[1], device))
     torch.cuda.synchronize()
     dist.barrier()
-    return Rig(transport, layout, torch.cuda.Stream(device), half, found, max(add_ms))
+    stream = dedicated_copy_stream(device)
+    assert stream.cuda_stream != torch.cuda.current_stream(device).cuda_stream
+    return Rig(transport, layout, stream, half, found, max(add_ms))
 
 
 def copy_on_a_thread(rig: Rig, copies: list, events: tuple) -> None:
