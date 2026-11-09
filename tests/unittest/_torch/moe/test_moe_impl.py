@@ -454,6 +454,23 @@ def test_per_layer_dynamic_eplb_filters_backends_by_declared_capability():
     assert [item.reason for item in rejected.rejected] == [MoERejectReason.EPLB_UNSUPPORTED]
 
 
+def test_adaptive_eplb_filters_backends_by_declared_capability():
+    assert not DeepgemmCudaW4a8Mxfp4Mxfp8Impl.capabilities.supports_adaptive_eplb
+    deployment = dataclasses.replace(
+        _megamoe_cutedsl_deployment(),
+        eplb_enabled=True,
+        eplb_mode="adaptive",
+    )
+    rejected = resolve_moe_impl(
+        _deepgemm_model_config(QuantAlgo.W4A8_MXFP4_MXFP8),
+        problem=_megamoe_cutedsl_problem(QuantAlgo.W4A8_MXFP4_MXFP8),
+        deployment=deployment,
+        impl_id="deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8",
+    )
+    assert rejected.winner is None
+    assert [item.reason for item in rejected.rejected] == [MoERejectReason.EPLB_UNSUPPORTED]
+
+
 def test_pinned_megamoe_cutedsl_identity_fails_hard_on_another_format():
     """A pin that cannot run must fail, not widen to the sibling that can.
 
