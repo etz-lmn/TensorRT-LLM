@@ -1198,18 +1198,17 @@ def maybe_create_moe_load_balancer(
                                               | None] = nullcontext()
     config = model_config.moe_load_balancer
     mode = getattr(config, "mode", "standard")
-    if config is not None and mode == "per_layer_dynamic":
+    if config is not None and mode in ("per_layer_dynamic", "adaptive"):
+        name = "per-layer dynamic" if mode == "per_layer_dynamic" else "adaptive"
         if not in_supported_model_arch:
-            raise ValueError(
-                "per-layer dynamic EPLB does not support model architecture "
-                f"{model_arch!r}")
+            raise ValueError(f"{name} EPLB does not support model architecture "
+                             f"{model_arch!r}")
         if not using_ep:
-            raise ValueError("per-layer dynamic EPLB requires expert "
+            raise ValueError(f"{name} EPLB requires expert "
                              "parallelism (moe_ep_size > 1)")
         if using_smart_router:
-            raise ValueError(
-                "per-layer dynamic EPLB is incompatible with smart routing "
-                "(moe_cluster_size > 1)")
+            raise ValueError(f"{name} EPLB is incompatible with smart routing "
+                             "(moe_cluster_size > 1)")
 
     if (in_supported_model_arch and using_ep and not using_smart_router
             and config is not None):
@@ -1229,6 +1228,15 @@ def maybe_create_moe_load_balancer(
                 config.num_slots,
                 getattr(config, "auxiliary_sms", 4),
             )
+        elif mode == "adaptive":
+            from .adaptive_eplb import AdaptiveMoeLoadBalancer
+
+            moe_load_balancer = AdaptiveMoeLoadBalancer(ep_rank=ep_rank,
+                                                        ep_size=ep_size,
+                                                        config=config,
+                                                        mapping=mapping)
+            logger.info("Created adaptive MoE LoadBalancer, num_slots=%s...",
+                        config.num_slots)
         elif mode == "standard":
             if config.layer_updates_per_iter > 0:
                 # TODO: remove this when supported.
