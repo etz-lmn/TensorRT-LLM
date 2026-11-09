@@ -238,6 +238,8 @@ class _Decider:
         self.open_call = 0
         self.next_group = 0
         self.awaiting_copy: dict[int, tuple] = {}
+        # (window, rows per forward [L, E]) of the last two deciding windows.
+        self.window_rows: deque[tuple[int, np.ndarray]] = deque(maxlen=2)
 
     def handle(self, message: tuple) -> tuple:
         if message[0] == "window":
@@ -312,9 +314,19 @@ class _Decider:
             new_shares[i] = solve_shares(rows[layer], new_layout[i], geometry)
         current = (rows[planned], self.layout[planned], self.shares[planned])
         gains = evaluate_gains(*current, new_layout, new_shares, cfg.model, geometry)
-        previous_load = self.evaluations.previous_load(planned.tolist(), current[0])
+        previous_load = None
+        for i, layer in enumerate(planned.tolist()):
+            # The latest kept window that neither the installed layout (planned on the window the
+            # layer was committed in) nor the new one (planned on this window) was planned on; a
+            # layer without one keeps only this window's gain.
+            seen = next(
+                (r for w, r in reversed(self.window_rows) if w != self.committed[layer]), None
+            )
+            if seen is not None:
+                previous_load = current[0].copy() if previous_load is None else previous_load
+                previous_load[i] = seen[layer]
         if previous_load is not None:
-            # A candidate must also gain on its layer's previous window.
+            # A candidate must also gain on that window.
             previous_gains = evaluate_gains(
                 previous_load, *current[1:], new_layout, new_shares, cfg.model, geometry
             )
@@ -332,6 +344,7 @@ class _Decider:
         growth = self.evaluations.read_cost(
             range(layers), rows, self.layout, self.shares, self.open_call
         )
+        self.window_rows.append((window, rows))
         self.awaiting_copy[window] = (close, growth, steps_left)
         moved = []
         for i, layer in enumerate(planned.tolist()):

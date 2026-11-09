@@ -535,9 +535,8 @@ def window_stats(stats: np.ndarray, hot=(0, 1)) -> np.ndarray:
 
 def test_an_update_moves_in_one_copy_group(monkeypatch):
     monkeypatch.setattr(rt, "solve_shares", even_split)
-    decision = FakeDecision(0, copy_ms=0.5)  # a copy time known: both layers may install
-    window_stats(decision.stats.numpy())
-    decider = decision.decider
+    decider = FakeDecision(0, copy_ms=0.5).decider  # a copy time known: both layers may install
+    window_stats(decider.stats)
     decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
     decider.evaluations.erosion = 1.0  # a gain gone within a step repays no copy
     assert decider.decide(0).tables == {}
@@ -547,12 +546,15 @@ def test_an_update_moves_in_one_copy_group(monkeypatch):
     assert decider.decide(2).groups == []  # nothing new to move: no group
 
 
-def test_with_a_copy_timed_at_start_up_the_first_update_moves_every_paying_layer(monkeypatch):
+def test_first_update_moves_all_paying_layers_and_corrections_are_judged_out_of_sample(monkeypatch):
     monkeypatch.setattr(rt, "solve_shares", even_split)
     decision = FakeDecision(0, copy_ms=0.5)  # untimed, the first update moves one layer to time one
-    window_stats(decision.stats.numpy())
+    window_stats(decision.stats.numpy())  # GPU 0's experts 0 and 1 are hot
     decision.decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
     assert decision.decider.decide(0).moved == [0, 1]
+    window_stats(decision.stats.numpy(), (4, 5))[:, L * (E + 1) : L * (E + 2)] = 0  # installs live
+    # GPU 1's experts hot: on window 0, the installed layouts' own, the correction would be held.
+    assert decision.decider.decide(1).moved == [0, 1]
 
 
 def test_a_candidate_must_gain_on_the_previous_window_too(monkeypatch):
@@ -568,8 +570,7 @@ def test_a_candidate_must_gain_on_the_previous_window_too(monkeypatch):
         return decision.decider.decide(number)
 
     assert window(0, 6).tables == {}  # GPU 1 is the busiest: the copy would load it further
-    held = window(1, 2)  # gains on this window, loses on the previous one: held out
-    assert held.tables == {} and max(seen["gains"][-1].values()) < 0
+    assert window(1, 2).tables == {} and max(seen["gains"][-1].values()) < 0  # loses on window 0
     assert sorted(window(2, 2).tables) == [0, 1]  # gains on both windows: installed
 
 

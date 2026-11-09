@@ -192,8 +192,7 @@ def test_prepare_runtime_times_a_layer_copy_and_takes_the_time_model_from_the_ba
 
     backend = SimpleNamespace(decode_time_model=decode_time_model)
     transport = SimpleNamespace(expert_bytes=lambda index: 1000 + index, ep_rank=0)
-    # Every rank copies, and the time agreed is the slowest rank's (the others' here: 2.0, 1.0, 1.5).
-    transport.allgather = lambda ms: [ms, 2.0, 1.0, 1.5]
+    transport.allgather = lambda ms: [ms, 2.0, 1.0, 1.5]  # the slowest rank's 2.0 is agreed
     transport.copy = lambda experts, *args: seen.setdefault("copies", []).append(experts)
     event = SimpleNamespace(record=None, synchronize=lambda: None, elapsed_time=lambda end: 0.5)
     monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: event)
