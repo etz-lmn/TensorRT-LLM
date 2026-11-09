@@ -261,9 +261,13 @@ def _make_supplied_topk_apply(
     materialized_ids: torch.Tensor,
     materialized_scales: torch.Tensor,
 ):
-    """Return a ``routing_method.apply`` wrapper returning the plan directly."""
+    """Return a ``routing_method.apply`` replacement returning the plan directly.
 
-    def supplied_apply(router_logits):
+    It takes the routing method's call, ``apply(router_logits, input_ids)``; the plan
+    replaces the routing, so the token ids are not read.
+    """
+
+    def supplied_apply(router_logits, input_ids=None):
         local = materialized_ids
         scales = materialized_scales
         if router_logits is not None:
@@ -298,13 +302,19 @@ def _maybe_install_routing_control_patch(
 
     routing_target = moe
     apply_method_orig = routing_target.routing_method.apply
+    apply_with_aux_orig = routing_target.routing_method.apply_with_aux
     inner_backend = getattr(moe, "backend", moe)
     run_moe_orig = None
     forward_impl_orig = moe.forward_impl
 
     try:
-        routing_target.routing_method.apply = _make_supplied_topk_apply(
+        supplied_apply = _make_supplied_topk_apply(
             routing_target, materialized_ids, materialized_scales
+        )
+        routing_target.routing_method.apply = supplied_apply
+        # The scheduler routes with auxiliary data through apply_with_aux: the same plan.
+        routing_target.routing_method.apply_with_aux = (
+            lambda router_logits, input_ids, routing_aux: supplied_apply(router_logits, input_ids)
         )
 
         if isinstance(inner_backend, TRTLLMGenFusedMoE):
@@ -317,6 +327,7 @@ def _maybe_install_routing_control_patch(
         yield
     finally:
         routing_target.routing_method.apply = apply_method_orig
+        routing_target.routing_method.apply_with_aux = apply_with_aux_orig
         if run_moe_orig is not None:
             inner_backend.run_moe = run_moe_orig
         moe.forward_impl = forward_impl_orig
