@@ -383,27 +383,32 @@ def evaluate_gains(
     return (t_cur - t_new) / 1e3
 
 
+def install_worth(gain: float, steps_left: float, erosion: float | None) -> float:
+    """What a layer's gain ``g`` (ms per step) is worth, in ms, over the steps it lasts.
+
+    The gain shrinks by ``erosion`` (ms per step per call, the measured growth of a layout's cost)
+    as its rows drift, so it is worth ``g T - erosion T^2 / 2`` over ``T = min(steps_left, g /
+    erosion)`` steps; without an erosion reading, ``g`` lasts ``steps_left`` steps.
+    """
+    steps = float(steps_left)
+    if erosion:
+        steps = min(steps, max(gain, 0.0) / erosion)
+    return gain * steps - (erosion or 0.0) * steps * steps / 2.0
+
+
 def choose_layers_to_install(
     gains: dict[int, float],
     steps_left: float | None,
     copy_cost_ms_per_layer: float,
     erosion: float | None,
 ) -> list[int]:
-    """Layers to install, largest gain first, while an install's worth repays one layer's copy.
-
-    A layer's gain ``g`` (ms per step) shrinks by ``erosion`` (ms per step per call, the measured
-    growth of a layout's cost) as its rows drift, so the install is worth ``g T - erosion T^2 / 2``
-    over its ``T = min(steps_left, g / erosion)`` steps; without an erosion reading, ``g`` lasts
-    ``steps_left`` steps.
-    """
+    """Layers to install, largest gain first, while an install's :func:`install_worth` repays one
+    layer's copy."""
     if steps_left is None:
         return []
     chosen = []
     for layer, gain in sorted(gains.items(), key=lambda kv: (-kv[1], kv[0])):
-        steps = float(steps_left)
-        if erosion:
-            steps = min(steps, max(gain, 0.0) / erosion)
-        if not gain * steps - (erosion or 0.0) * steps * steps / 2.0 > copy_cost_ms_per_layer:
+        if not install_worth(gain, steps_left, erosion) > copy_cost_ms_per_layer:
             break
         chosen.append(layer)
     return chosen
