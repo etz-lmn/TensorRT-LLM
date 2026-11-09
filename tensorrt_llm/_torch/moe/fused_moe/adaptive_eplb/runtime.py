@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime of adaptive EPLB: the route tables that map every expert to its slots."""
+"""Runtime of adaptive EPLB: the route tables that map every expert to its slots, and the shares
+that split an expert's rows over its copies."""
 
 from __future__ import annotations
 
@@ -8,7 +9,23 @@ import itertools
 from collections.abc import Sequence
 from typing import NamedTuple
 
+import numpy as np
+import torch
+
+from .policy import ExpertGeometry
+
 _UINT32_MAX = (1 << 32) - 1
+
+
+def solve_shares(load_rows: np.ndarray, layout: np.ndarray, geometry: ExpertGeometry) -> np.ndarray:
+    """``[num_slots]`` shares of ``layout`` that minimize the busiest GPU's ``load_rows``."""
+    load = np.ascontiguousarray(load_rows, dtype=np.float64)
+    slots = np.asarray(layout)
+    if not np.issubdtype(slots.dtype, np.integer):
+        raise ValueError("layout must hold integers")
+    slots = torch.from_numpy(np.ascontiguousarray(slots, dtype=np.int64))
+    solve = torch.ops.trtllm.adaptive_eplb_solve_shares
+    return solve(torch.from_numpy(load), slots, geometry.ep_size).numpy()
 
 
 class RouteTables(NamedTuple):
