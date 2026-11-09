@@ -122,6 +122,7 @@ def generate_serve_schema() -> dict:
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
     from tensorrt_llm.llmapi.llm_args import (
         SERVE_CONFIG_ALIASES,
+        MoeAdaptiveLoadBalancerConfig,
         MoeLoadBalancerConfig,
         MoePerLayerDynamicLoadBalancerConfig,
         TorchLlmArgs,
@@ -143,14 +144,19 @@ def generate_serve_schema() -> dict:
     # Serving treats null as unset before constructing the non-optional telemetry model.
     properties["telemetry_config"] = _nullable(properties["telemetry_config"])
     # Keep accepted forms aligned with TorchLlmArgs.validate_load_balancer(): a mapping
-    # without mode is standard EPLB, so only the per-layer dynamic form requires it.
-    standard, per_layer_dynamic = (
+    # without mode is standard EPLB, so only the other forms require it.
+    standard, per_layer_dynamic, adaptive = (
         {"$ref": f"#/$defs/{model.__name__}"}
-        for model in (MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig)
+        for model in (
+            MoeLoadBalancerConfig,
+            MoePerLayerDynamicLoadBalancerConfig,
+            MoeAdaptiveLoadBalancerConfig,
+        )
     )
     schema["$defs"]["MoeConfig"]["properties"]["load_balancer"]["anyOf"] = [
         standard,
         {**per_layer_dynamic, "required": ["mode"]},
+        {**adaptive, "required": ["mode"]},
         {"type": ["string", "null"]},
     ]
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
