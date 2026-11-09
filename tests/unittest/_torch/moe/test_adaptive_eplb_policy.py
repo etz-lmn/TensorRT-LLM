@@ -20,6 +20,7 @@ from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
     copy_ms_per_layer,
     evaluate_gains,
     fixed_install_ms,
+    install_worth,
     plan_layout,
     slot_rows,
 )
@@ -50,9 +51,7 @@ def even_shares(layout: np.ndarray) -> np.ndarray:
     return shares
 
 
-# ------------------------------------------------------------------------------------------------
 # Time model
-# ------------------------------------------------------------------------------------------------
 
 
 def test_geometry_home_layout():
@@ -93,9 +92,7 @@ def test_balanced_time_is_the_floor():
     assert one.layer_time_us(two, 2)[0] == pytest.approx(max(gpu0, gpu1), rel=1e-12)
 
 
-# ------------------------------------------------------------------------------------------------
 # Layout planner
-# ------------------------------------------------------------------------------------------------
 
 
 def _layout(geometry: ExpertGeometry, replicas: dict[int, int] | list) -> np.ndarray:
@@ -237,9 +234,7 @@ def test_random_installed_layouts_are_reached_in_one_install():
         assert again.expert_slots == plan.expert_slots
 
 
-# ------------------------------------------------------------------------------------------------
 # Share solver
-# ------------------------------------------------------------------------------------------------
 
 
 def _random_case(rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
@@ -323,24 +318,14 @@ def test_shares_refuse_invalid_inputs():
     rows[0] = 5.0
     solve_shares(rows, layout, GEOMETRY)
 
-    nan = rows.copy()
-    nan[3] = math.nan
-    inf = rows.copy()
-    inf[3] = math.inf
-    low = layout.copy()
-    low[5] = -2
-    high = layout.copy()
-    high[5] = GEOMETRY.num_experts
-    homeless = layout.copy()
-    homeless[layout == 0] = -1  # expert 0 has rows but no slot
     invalid = [
         (rows[:-1], layout),
         (rows, layout.astype(np.float64)),
-        (nan, layout),
-        (inf, layout),
-        (rows, low),
-        (rows, high),
-        (rows, homeless),
+        (np.where(np.arange(rows.size) == 3, math.nan, rows), layout),
+        (np.where(np.arange(rows.size) == 3, math.inf, rows), layout),
+        (rows, np.where(np.arange(layout.size) == 5, -2, layout)),
+        (rows, np.where(np.arange(layout.size) == 5, GEOMETRY.num_experts, layout)),
+        (rows, np.where(layout == 0, -1, layout)),  # expert 0 has rows but no slot
     ]
     for bad_rows, bad_layout in invalid:
         with pytest.raises(ValueError):
@@ -349,9 +334,7 @@ def test_shares_refuse_invalid_inputs():
         solve_shares(rows, layout[:-1], GEOMETRY)
 
 
-# ------------------------------------------------------------------------------------------------
 # Install decisions
-# ------------------------------------------------------------------------------------------------
 
 
 def _gains(load, current, new, new_shares=None):
@@ -393,10 +376,8 @@ def test_choose_layers_to_install():
     assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, 4.9, None) == [1, 2]
     assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, 5.0, None) == []
     assert choose_layers_to_install({1: 0.06, 2: 0.05}, 100.0, 5.5, None) == [1]
-    # 0.05 ms per step over 100 steps is worth 5 ms; eroding by 1e-4 ms per step per call it is
-    # worth 5 - 1e-4 * 100^2 / 2 = 4.5 ms, so it repays a 4.6 ms copy only without erosion;
-    # eroding by 1e-3 it is gone after 50 steps, worth 0.05 * 50 / 2 = 1.25 ms.
     for erosion, worth in ((None, 5.0), (0.0, 5.0), (1e-4, 4.5), (1e-3, 1.25)):
+        assert install_worth(0.05, 100.0, erosion) == pytest.approx(worth)
         assert choose_layers_to_install({7: 0.05}, 100.0, worth - 0.1, erosion) == [7]
         assert choose_layers_to_install({7: 0.05}, 100.0, worth + 0.1, erosion) == []
 
