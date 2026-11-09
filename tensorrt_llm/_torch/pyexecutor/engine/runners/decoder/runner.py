@@ -73,7 +73,7 @@ from tensorrt_llm.mapping import Mapping
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
 from ...model_call import ModelCaller
 from ...multimodal import MultimodalItemScheduler
-from ..common import make_scheduled_inputs
+from ..common import get_all_rank_ctx_requests, make_scheduled_inputs
 from ..interface import ScheduledInputs, ScheduledModelRunner
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
@@ -809,6 +809,18 @@ class DecoderRunner(ScheduledModelRunner):
             # Experiment hook: the CUDA graph this forward runs (None: eager), reported with the
             # other per-iteration states in the iteration log.
             self._iter_states["cuda_graph_key"] = graph_key
+            # Experiment hook: a load balancer held until decoding starts at the first forward
+            # with no context request on any rank. Every rank exchanges its count in the same
+            # forwards and decides from the same counts.
+            if moe_load_balancer is not None and moe_load_balancer.holds_until_decode():
+                contexts = get_all_rank_ctx_requests(
+                    semantic_requests.num_context_requests,
+                    enable_attention_dp=self._config.enable_attention_dp,
+                    dist=self._dist,
+                )
+                moe_load_balancer.release_hold_if_decode(
+                    contexts or [semantic_requests.num_context_requests]
+                )
             captures_model_body = self._graphs.captures_model_body(graph_key)
             outputs = self._graphs.run(
                 graph_key,

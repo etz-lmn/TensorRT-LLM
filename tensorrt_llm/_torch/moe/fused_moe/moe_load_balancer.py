@@ -843,6 +843,12 @@ class BaseMoeLoadBalancer(ABC):
         if enable_update_weights is not None:
             self.enable_update_weights = enable_update_weights
 
+    def holds_until_decode(self) -> bool:
+        """Whether the next forward's context requests decide if statistics
+        and weight updates start (``release_hold_if_decode``). Only a balancer
+        held until decoding returns True."""
+        return False
+
     def __enter__(self):
         """
         Enter the context manager.
@@ -919,6 +925,12 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         self.iter_id = 0
         self.in_iter = False
 
+        # Experiment hook: with TRTLLM_EPLB_HOLD_UNTIL_DECODE=1, statistics and
+        # weight updates start at the first forward in which no rank runs a
+        # context request, as on a generation-only server. Until then the
+        # flags the engine asks for wait in _held_iter_info.
+        self._held_iter_info = ((False, False) if os.getenv(
+            'TRTLLM_EPLB_HOLD_UNTIL_DECODE') == '1' else None)
         self.enable_statistic = False
         self.enable_update_weights = False
 
@@ -1039,6 +1051,34 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
             raise RuntimeError(
                 "Cannot reconfigure EPLB mask while an iteration is active")
         self.load_balancer_impl.reconfigure_mask_only(list(dead_ranks))
+
+    def set_iter_info(self, enable_statistic: Optional[bool],
+                      enable_update_weights: Optional[bool]):
+        if self._held_iter_info is None:
+            super().set_iter_info(enable_statistic, enable_update_weights)
+            return
+        statistic, updates = self._held_iter_info
+        self._held_iter_info = (
+            statistic if enable_statistic is None else enable_statistic,
+            updates if enable_update_weights is None else enable_update_weights)
+
+    def holds_until_decode(self) -> bool:
+        """The hold is on and the engine asks for statistics or updates, which
+        warmup never does, so only a forward after warmup can release it."""
+        return self._held_iter_info is not None and any(self._held_iter_info)
+
+    def release_hold_if_decode(self, context_requests: List[int]) -> bool:
+        """Apply the flags the engine asked for when no rank runs a context
+        request in this forward (``context_requests``: the count of every
+        rank, so every rank decides alike). Returns whether it released."""
+        if not self.holds_until_decode() or any(context_requests):
+            return False
+        self.enable_statistic, self.enable_update_weights = self._held_iter_info
+        self._held_iter_info = None
+        logger.info(
+            "MoE load balancer hold released at iteration %d, the first "
+            "forward with no context request on any rank", self.iter_id)
+        return True
 
     def start_iter(self):
         """
