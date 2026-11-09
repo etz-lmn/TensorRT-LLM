@@ -111,10 +111,10 @@ class FakeGroup:
 class FakeDecision:
     """The decision process in this process, or the updates ``script(window)`` prepares."""
 
-    def __init__(self, rank: int, script=None) -> None:
+    def __init__(self, rank: int, script=None, copy_ms=None) -> None:
         self.stats = torch.zeros(R, rt.window_stats_size(L, E))
         homes = np.tile(HOME, (L, 1))
-        config = rt.DecisionConfig(GEOMETRY, MODEL, homes, rank, 1)
+        config = rt.DecisionConfig(GEOMETRY, MODEL, homes, rank, 1, copy_ms=copy_ms)
         self.decider = rt._Decider(config, self.stats.numpy())
         self.script = script
         self.open_after = 4  # calls from a scripted apply call to the next window's open
@@ -278,9 +278,7 @@ def spied_ranks(monkeypatch, timed: bool = False, first=None):
     seen = {}
     clock = [0]
     spy(monkeypatch, seen)
-    decisions = [FakeDecision(rank) for rank in range(R)]
-    for decision in decisions if timed else ():
-        decision.decider.copy_timings[0] = (1, 0.5)
+    decisions = [FakeDecision(rank, copy_ms=0.5 if timed else None) for rank in range(R)]
     ranks = make_ranks(decisions, clock)
     run(ranks, clock, 1)
     rows, forwards = first or (np.ones((R, L, E), dtype=np.float32), (1,) * R)
@@ -537,10 +535,9 @@ def window_stats(stats: np.ndarray, hot=(0, 1)) -> np.ndarray:
 
 def test_an_update_moves_in_one_copy_group(monkeypatch):
     monkeypatch.setattr(rt, "solve_shares", even_split)
-    decision = FakeDecision(0)
+    decision = FakeDecision(0, copy_ms=0.5)  # a copy time known: both layers may install
     window_stats(decision.stats.numpy())
     decider = decision.decider
-    decider.copy_timings[0] = (1, 0.5)  # one copy group timed: both layers may install
     decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
     decider.evaluations.erosion = 1.0  # a gain gone within a step repays no copy
     assert decider.decide(0).tables == {}
@@ -550,13 +547,20 @@ def test_an_update_moves_in_one_copy_group(monkeypatch):
     assert decider.decide(2).groups == []  # nothing new to move: no group
 
 
+def test_with_a_copy_timed_at_start_up_the_first_update_moves_every_paying_layer(monkeypatch):
+    monkeypatch.setattr(rt, "solve_shares", even_split)
+    decision = FakeDecision(0, copy_ms=0.5)  # untimed, the first update moves one layer to time one
+    window_stats(decision.stats.numpy())
+    decision.decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
+    assert decision.decider.decide(0).moved == [0, 1]
+
+
 def test_a_candidate_must_gain_on_the_previous_window_too(monkeypatch):
     seen = {}
     spy(monkeypatch, seen)
     candidate = np.where(np.arange(R * LOCAL) == LOCAL + 4, 2, HOME)  # expert 2 copied to GPU 1
     monkeypatch.setattr(rt, "plan_layout", lambda *args: SimpleNamespace(layout=candidate))
-    decision = FakeDecision(0)
-    decision.decider.copy_timings[0] = (1, 0.5)
+    decision = FakeDecision(0, copy_ms=0.5)
     decision.decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
 
     def window(number, hot):

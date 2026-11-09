@@ -156,7 +156,9 @@ def window_stats_size(layers: int, experts: int) -> int:
 
 @dataclass(frozen=True)
 class DecisionConfig:
-    """Inputs of the decision process; ``home_layouts`` is ``[L, num_slots]`` int64."""
+    """Inputs of the decision process; ``home_layouts`` is ``[L, num_slots]`` int64 and
+    ``copy_ms`` the copy time of one layer's install measured at start-up, which the decisions
+    take until an install is timed."""
 
     geometry: ExpertGeometry
     model: TimeModel
@@ -164,6 +166,7 @@ class DecisionConfig:
     ep_rank: int
     ranks_per_node: int
     stats_fd: int = -1
+    copy_ms: float | None = None
 
 
 @dataclass
@@ -318,6 +321,8 @@ class _Decider:
             gains = np.minimum(gains, previous_gains)
         gain = dict(zip(planned.tolist(), gains.tolist()))
         copy_ms = copy_ms_per_layer(_timings(self.copy_timings))
+        if copy_ms is None:
+            copy_ms = cfg.copy_ms
         chosen = choose_layers_to_install(
             gain, steps_left, copy_ms or 0.0, self.evaluations.erosion
         )

@@ -170,7 +170,7 @@ def test_layer_route_stages_into_the_backend_and_records_the_statistics():
     assert layer.statistics.forwards.item() == 2
 
 
-def test_prepare_runtime_takes_the_time_model_from_the_backend(monkeypatch):
+def test_prepare_runtime_times_a_layer_copy_and_takes_the_time_model_from_the_backend(monkeypatch):
     from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import balancer as module
 
     balancer = _balancer(ep_rank=0)
@@ -191,18 +191,22 @@ def test_prepare_runtime_takes_the_time_model_from_the_backend(monkeypatch):
         return fields
 
     backend = SimpleNamespace(decode_time_model=decode_time_model)
-    transport = SimpleNamespace(expert_bytes=lambda index: 1000 + index)
+    transport = SimpleNamespace(expert_bytes=lambda index: 1000 + index, ep_rank=0)
+    # Every rank copies, and the time agreed is the slowest rank's (the others' here: 2.0, 1.0, 1.5).
+    transport.allgather = lambda ms: [ms, 2.0, 1.0, 1.5]
+    transport.copy = lambda experts, *args: seen.setdefault("copies", []).append(experts)
+    event = SimpleNamespace(record=None, synchronize=lambda: None, elapsed_time=lambda end: 0.5)
+    monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: event)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     backends = {layer.layer_idx: backend}
     monkeypatch.setattr(module, "migrate_model_weights", lambda *a: (transport, "stream", backends))
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "NVIDIA GB300")
-    monkeypatch.setattr(
-        module.AdaptiveMoeLoadBalancer,
-        "start_runtime",
-        lambda self, model, ranks_per_node: seen.setdefault("start", (model, ranks_per_node)),
-    )
+    monkeypatch.setattr(balancer, "start_runtime", lambda *args: seen.update(start=args))
     balancer.prepare_runtime("model")
     assert seen["args"] == (1000, "NVIDIA GB300")
-    assert seen["start"] == (TimeModel(**fields), 4)
+    # Rank 0's free slot 2 of layer 0 takes the home expert of rank 2, untimed and then timed.
+    assert seen["copies"] == [[(0, 2, 2, 0)]] * 2
+    assert seen["start"] == (TimeModel(**fields), 4, 2.0)
     assert (balancer.transport, balancer.copy_stream) == (transport, "stream")
 
 
