@@ -17,6 +17,7 @@ import hashlib
 import itertools
 import math
 import mmap
+import operator
 import os
 import queue
 import socket
@@ -123,6 +124,14 @@ lasts as many forwards as the previous window's rows per forward need to reach i
 lasts one forward; with fewer rows than that it only measures the rows per forward."""
 REQUESTS_PER_CALL = 64
 """int: Generation requests whose progress one call reads (about 20 us of main-thread time)."""
+_PROGRESS = operator.attrgetter(
+    "is_attention_dp_dummy",
+    "is_cuda_graph_dummy",
+    "py_num_accepted_draft_tokens",
+    "py_max_new_tokens",
+    "py_decoding_iter",
+)
+"""The request fields one progress read takes, fetched together."""
 FIELDS = (
     "remaining",
     "requests",
@@ -524,8 +533,10 @@ class AdaptiveRuntime:
         self.tables = tables
         self._host_tables = torch.empty_like(tables, device="cpu", pin_memory=pin)
         self._host_tables_np = self._host_tables.numpy()  # the host mirror, written row by row
-        self._stats_copy_begin = torch.cuda.Event(enable_timing=True)
-        self._stats_copy_end = torch.cuda.Event(enable_timing=True)
+        # Blocking: the worker thread sleeps in its wait for the statistics copy instead of spinning
+        # in the driver while the main thread records events.
+        self._stats_copy_begin = torch.cuda.Event(enable_timing=True, blocking=True)
+        self._stats_copy_end = torch.cuda.Event(enable_timing=True, blocking=True)
         self._pending_stats_copy: torch.cuda.Event | None = None
         self._copy_begin = torch.cuda.Event(enable_timing=True, blocking=True)
         self._copy_end = torch.cuda.Event(enable_timing=True, blocking=True)
@@ -542,11 +553,15 @@ class AdaptiveRuntime:
         remaining = 0
         accepted_tokens = 0
         n = 0
-        for request in requests[start : start + REQUESTS_PER_CALL]:
-            if request.is_attention_dp_dummy or request.is_cuda_graph_dummy:
+        for dp_dummy, graph_dummy, drafts, max_new, decoding_iter in map(
+            _PROGRESS, requests[start : start + REQUESTS_PER_CALL]
+        ):
+            if dp_dummy or graph_dummy:
                 continue
-            accepted = 1 + request.py_num_accepted_draft_tokens
-            remaining += max(0, request.py_max_new_tokens - request.py_decoding_iter * accepted)
+            accepted = 1 + drafts
+            left = max_new - decoding_iter * accepted
+            if left > 0:
+                remaining += left
             accepted_tokens += accepted
             n += 1
         self.request_totals += (remaining, n, accepted_tokens)
