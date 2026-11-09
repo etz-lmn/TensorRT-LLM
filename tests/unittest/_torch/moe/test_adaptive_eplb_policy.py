@@ -388,17 +388,11 @@ def test_evaluate_gains_replica_of_hot_expert_pays():
 
 def test_choose_layers_to_install():
     gains = {1: 0.05, 2: 0.02, 3: 0.001, 4: 0.03}
-    assert choose_layers_to_install(gains, 100.0, 0.5, None) == [1, 4, 2]
-    assert choose_layers_to_install(gains, None, 0.5, None) == []
-    assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, 4.9, None) == [1, 2]
-    assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, 5.0, None) == []
-    assert choose_layers_to_install({1: 0.06, 2: 0.05}, 100.0, 5.5, None) == [1]
-    # 0.05 ms per step over 100 steps is worth 5 ms; eroding by 1e-4 ms per step per call it is
-    # worth 5 - 1e-4 * 100^2 / 2 = 4.5 ms, so it repays a 4.6 ms copy only without erosion;
-    # eroding by 1e-3 it is gone after 50 steps, worth 0.05 * 50 / 2 = 1.25 ms.
-    for erosion, worth in ((None, 5.0), (0.0, 5.0), (1e-4, 4.5), (1e-3, 1.25)):
-        assert choose_layers_to_install({7: 0.05}, 100.0, worth - 0.1, erosion) == [7]
-        assert choose_layers_to_install({7: 0.05}, 100.0, worth + 0.1, erosion) == []
+    assert choose_layers_to_install(gains, 100.0, 0.5) == [1, 4, 2]
+    assert choose_layers_to_install(gains, None, 0.5) == []
+    assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, 4.9) == [1, 2]
+    assert choose_layers_to_install({1: 0.05, 2: 0.05}, 100.0, 5.0) == []
+    assert choose_layers_to_install({1: 0.06, 2: 0.05}, 100.0, 5.5) == [1]
 
 
 def test_group_readings_copy_and_apply():
@@ -455,15 +449,12 @@ def test_rate_floor_follows_the_reading_interval():
     per_call = 3 * MODEL.slope_us / 1e3
     assert tracker.min_resolvable_rate(3, 1) == per_call
     assert tracker.min_resolvable_rate(3, 20) == per_call / 20
-    # Between the floor of one call and that of the reading's 20 calls: resolved, and its growth
-    # per layer is the erosion of a layer's gain.
+    # Between the floor of one call and that of the reading's 20 calls: resolved.
     resolved = tracker.plan(10, 10, 2, [1.0], [], CostGrowth(per_call / 2, 3, 20), None)
     assert resolved.interval == math.ceil(math.sqrt(2 * 1.0 / (per_call / 2)))
-    assert tracker.erosion == per_call / 2 / 3
-    # Below the floor of the reading's interval: the last resolved rate and erosion stay.
+    # Below the floor of the reading's interval: the last resolved rate stays.
     kept = tracker.plan(20, 20, 2, [1.0], [], CostGrowth(per_call / 40, 3, 20), None)
-    assert kept.interval == resolved.interval and tracker.erosion == per_call / 2 / 3
+    assert kept.interval == resolved.interval
     # A negative rate reading is no rate at all (a tracker that has learnt nothing yet).
     fresh = EvaluationScheduler(MODEL, GEOMETRY)
     assert fresh.plan(5, 5, 2, [1.0], [], CostGrowth(-0.5, 1, 1), None).interval == 3
-    assert fresh.erosion is None
