@@ -508,16 +508,6 @@ class EvaluationScheduler:
         self._previous_open = int(open_call)
         return growth
 
-    def previous_load(self, layers: Sequence[int], load: np.ndarray) -> np.ndarray | None:
-        """``load`` with each layer's rows replaced by its rows of the previous window when it has
-        them, or ``None`` when no layer has."""
-        rows = [self._previous_load.get(layer) for layer in layers]
-        if not any(row is not None and row.any() for row in rows):
-            return None
-        return np.stack(
-            [now if row is None or not row.any() else row for now, row in zip(load, rows)]
-        )
-
     def min_resolvable_rate(self, layers: int, interval: int) -> float:
         """The smallest growth per call that a reading of ``layers`` layers over ``interval`` calls
         can show: one more row per layer over the interval, at the time of one row."""
