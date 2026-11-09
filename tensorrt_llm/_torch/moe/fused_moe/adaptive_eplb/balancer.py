@@ -26,11 +26,16 @@ if TYPE_CHECKING:
 
 
 def statistics_buffers(layers: int, num_experts: int, device: torch.device | str) -> dict:
-    """Every layer's statistics in contiguous buffers: ``rows`` ``[L, E]`` (the rows routed to every
-    expert, exact in float32 below 2^24) and ``forwards`` ``[L, 1]``."""
+    """Every layer's statistics in one contiguous ``storage`` of bytes, so that a window opens with
+    one zeroing and closes with one copy: ``rows`` ``[L, E]`` float32 (the rows routed to every
+    expert, exact below 2^24), then ``forwards`` ``[L, 1]`` int64 from the next 8-byte boundary."""
+    rows_bytes = layers * num_experts * 4
+    forwards_at = -(-rows_bytes // 8) * 8
+    storage = torch.zeros(forwards_at + layers * 8, dtype=torch.uint8, device=device)
     return dict(
-        rows=torch.zeros(layers, num_experts, dtype=torch.float32, device=device),
-        forwards=torch.zeros(layers, 1, dtype=torch.int64, device=device),
+        rows=storage[:rows_bytes].view(torch.float32).view(layers, num_experts),
+        forwards=storage[forwards_at:].view(torch.int64).view(layers, 1),
+        storage=storage,
     )
 
 

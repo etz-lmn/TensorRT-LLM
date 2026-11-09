@@ -506,18 +506,26 @@ class AdaptiveRuntime:
         self.last_applied = (-1.0, 0.0, 0.0)
         self.pending_updates: deque[tuple[int, LayoutUpdate]] = deque()
         self._apply_events: deque = deque()
+        # Timing event pairs of the publishes: one comes back here once the worker read its time
+        # (creating two CUDA events costs the main thread more than the rest of a publish).
+        self._apply_event_pairs: deque = deque()
         self._started = False
-        self._rows = statistics["rows"]
-        self._forwards = statistics["forwards"]
+        self._storage = statistics["storage"]
         pin = torch.device(device).type == "cuda" and prefer_pinned()
         self._own_stats = torch.zeros(decision.stats.shape[1], pin_memory=pin)
-        self._own_forwards = torch.zeros(len(layers), 1, dtype=torch.int64, pin_memory=pin)
+        # The window's statistics as copied, read on the worker thread through the same views.
+        self._own_raw = torch.zeros_like(self._storage, device="cpu", pin_memory=pin)
+        rows, forwards = statistics["rows"], statistics["forwards"]
+        rows_bytes = rows.numel() * rows.element_size()
+        self._raw_rows = self._own_raw[:rows_bytes].view(rows.dtype).numpy()
+        at = forwards.storage_offset() * forwards.element_size() - self._storage.storage_offset()
+        self._raw_forwards = self._own_raw[at:].view(forwards.dtype).numpy()
         self._gathered = list(decision.stats.unbind(0))
         self.tables = tables
         self._host_tables = torch.empty_like(tables, device="cpu", pin_memory=pin)
+        self._host_tables_np = self._host_tables.numpy()  # the host mirror, written row by row
         self._stats_copy_begin = torch.cuda.Event(enable_timing=True)
         self._stats_copy_end = torch.cuda.Event(enable_timing=True)
-        self._stats_copied = torch.cuda.Event()
         self._pending_stats_copy: torch.cuda.Event | None = None
         self._copy_begin = torch.cuda.Event(enable_timing=True, blocking=True)
         self._copy_end = torch.cuda.Event(enable_timing=True, blocking=True)
@@ -606,17 +614,14 @@ class AdaptiveRuntime:
         if not self._started:
             self._started = True
             self._host_tables.copy_(self.tables)
-        self._rows.zero_()
-        self._forwards.zero_()
+        self._storage.zero_()
 
     def _close_window(self) -> None:
         """Copy the statistics into this rank's window statistics, timing the copies."""
         self._stats_copy_begin.record()
-        self._own_stats[: self._rows.numel()].copy_(self._rows.view(-1), non_blocking=True)
-        self._own_forwards.copy_(self._forwards, non_blocking=True)
+        self._own_raw.copy_(self._storage, non_blocking=True)
         self._stats_copy_end.record()
-        self._stats_copied.record()
-        self._pending_stats_copy = self._stats_copied
+        self._pending_stats_copy = self._stats_copy_end
         self.close_at = None
         self.wants_request_progress = True
         self._requests_read = 0
@@ -629,10 +634,12 @@ class AdaptiveRuntime:
         while self._apply_events and self._apply_events[0][3].query():
             applied, layers, begin, end = self._apply_events.popleft()
             self.last_applied = (float(applied), float(layers), begin.elapsed_time(end))
+            self._apply_event_pairs.append((begin, end))
         n = len(self.layers)
         experts = self.layers[0].expert_count
         own = self._own_stats.numpy()
-        own[n * experts : n * (experts + 1)] = self._own_forwards.numpy()[:, 0]
+        own[: n * experts] = self._raw_rows
+        own[n * experts : n * (experts + 1)] = self._raw_forwards
         own[n * (experts + 1) : n * (experts + 2)] = self.applied_window
         stats_copy_ms = self._stats_copy_begin.elapsed_time(self._stats_copy_end)
         own[n * (experts + 2) :] = (*totals, stats_copy_ms, *self.last_applied)
@@ -682,15 +689,24 @@ class AdaptiveRuntime:
         return ("copied", update, rows.numpy())
 
     def _apply_tables(self, call: int, update: LayoutUpdate) -> None:
-        """Install the update's route tables with one timed copy; later forwards route by them."""
-        host_tables = self._host_tables.numpy()
+        """Install the update's route tables with one timed copy of the span of layers it changes
+        (the other layers in it hold the same tables already; none for an update without tables);
+        later forwards route by them."""
+        host_tables = self._host_tables_np
         for layer, tables in update.tables.items():
             host_tables[layer] = tables
             self.applied_window[layer] = update.window
-        begin = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        if self._apply_event_pairs:
+            begin, end = self._apply_event_pairs.popleft()
+        else:
+            begin = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
         begin.record()
-        self.tables.copy_(self._host_tables, non_blocking=True)
+        if update.tables:
+            first, end_layer = min(update.tables), max(update.tables) + 1
+            self.tables[first:end_layer].copy_(
+                self._host_tables[first:end_layer], non_blocking=True
+            )
         end.record()
         self._apply_events.append((update.window, len(update.tables), begin, end))
         if self.debug_listener is not None:

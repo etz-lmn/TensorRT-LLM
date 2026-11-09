@@ -434,6 +434,14 @@ def test_tables_apply_from_the_call_after_every_rank_copied(host_cuda):
     assert ranks[0].transport.batches == [[]] and ranks[1].transport.batches == [[(0, 4, 0, 0)]]
 
 
+def test_a_publish_copies_only_the_layers_it_changes(host_cuda):
+    """A device row the host mirror does not hold survives the publish of another layer."""
+    runtime = make_ranks([FakeDecision(rank) for rank in range(R)], [0])[0]
+    runtime.debug_listener, runtime.tables[0] = None, 7
+    runtime._apply_tables(0, rt.LayoutUpdate(0, tables={1: np.full(TABLE, 3, np.int32)}))
+    assert runtime.tables.tolist() == [[7] * TABLE, [3] * TABLE]
+
+
 def test_a_window_opens_at_the_call_it_is_scheduled_for(host_cuda):
     """The schedule is read before windows open: a window scheduled for the call after its apply
     call opens at that call, which is when its schedule arrives, not a call later."""
