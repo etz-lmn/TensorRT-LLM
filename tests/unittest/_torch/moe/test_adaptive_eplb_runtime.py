@@ -461,6 +461,23 @@ def test_a_publish_copies_only_the_layers_it_changes(host_cuda):
     assert runtime.tables.tolist() == [[7] * TABLE, [3] * TABLE]
 
 
+def test_an_update_applies_before_a_window_that_opens_at_the_same_call(host_cuda):
+    """The copies' completion and the next window's schedule are read at one call, after both the
+    apply call and the open call: the tables apply first, so the window counts under them."""
+    runtime = make_ranks([FakeDecision(rank) for rank in range(R)], [0])[0]
+    kinds, opened, open_window = [], [], runtime._open_window
+    runtime._event = lambda event, **data: kinds.append(event)
+    runtime._open_window = lambda: opened.append(runtime.tables.tolist()) or open_window()
+    runtime.worker.post = lambda job: None  # the decision process's answers are scripted here
+    update = script(0)(0)
+    rows = np.array([[8, 1, 0.25, update.digest]] * R)  # every rank copied at call 8: apply at 9
+    runtime.worker.inbox.extend([("copied", update, rows), ("schedule", 1, 9, 9, None, FORWARDS)])
+    runtime.call, runtime.open_at = 9, None
+    runtime.boundary()  # call 10
+    assert kinds == ["copied", "scheduled", "applied"] and runtime.window_opened_call == 10
+    assert opened == [[[1] * TABLE, [2] * TABLE]] and not runtime.pending_updates
+
+
 def test_ranks_that_decided_differently_stop_before_applying(host_cuda):
     """The digest covers the tables and the moves, not a rank's own copies."""
     update = script(1)(0)
