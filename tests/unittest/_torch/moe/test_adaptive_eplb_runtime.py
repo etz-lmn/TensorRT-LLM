@@ -257,10 +257,10 @@ def spy(monkeypatch, seen: dict) -> None:
         seen.setdefault("rows", []).append(rows)
         return even_split(rows, layout, geometry)
 
-    def choose(gains, steps_left, copy_cost, erosion):
+    def choose(gains, steps_left, copy_cost):
         seen.setdefault("gains", []).append(dict(gains))
         seen.setdefault("steps_left", []).append(steps_left)
-        return REAL_CHOOSE(gains, steps_left, copy_cost, erosion)
+        return REAL_CHOOSE(gains, steps_left, copy_cost)
 
     def window_forwards(rows_per_forward, experts):
         seen.setdefault("per_forward", []).append((rows_per_forward, experts))
@@ -538,12 +538,21 @@ def test_an_update_moves_in_one_copy_group(monkeypatch):
     decider = FakeDecision(0, copy_ms=0.5).decider  # a copy time known: both layers may install
     window_stats(decider.stats)
     decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
-    decider.evaluations.erosion = 1.0  # a gain gone within a step repays no copy
-    assert decider.decide(0).tables == {}
-    decider.evaluations.erosion = None
-    update = decider.decide(1)
+    update = decider.decide(0)
     assert update.moved == [0, 1] and update.groups == [(0, [0, 1])]
-    assert decider.decide(2).groups == []  # nothing new to move: no group
+    assert decider.decide(1).groups == []  # nothing new to move: no group
+
+
+def test_a_cost_jump_after_a_load_change_does_not_hold_back_the_correction(monkeypatch):
+    monkeypatch.setattr(rt, "solve_shares", even_split)
+    decider = FakeDecision(0, copy_ms=5.0).decider  # copies of 5 ms per layer, all timed so
+    decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
+    # Window 1: GPU 1's experts turn hot before the install is live and the cost jumps; read as a
+    # steady drift, the correction's gain would be gone within a dozen steps and repay no copy.
+    for w, (h, live, moved) in enumerate(((0, -1, [0, 1]), (4, -1, []), (4, 0, [0, 1]))):
+        window_stats(decider.stats, (h, h + 1))[:, L * (E + 1) : L * (E + 2)] = live
+        assert decider.decide(w).moved == moved
+        decider.schedule(w, np.array([[10 + 20 * w, len(moved), 5.0 * len(moved), 0]] * R))
 
 
 def test_first_update_moves_all_paying_layers_and_corrections_are_judged_out_of_sample(monkeypatch):

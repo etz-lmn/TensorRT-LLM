@@ -384,26 +384,16 @@ def evaluate_gains(
 
 
 def choose_layers_to_install(
-    gains: dict[int, float],
-    steps_left: float | None,
-    copy_cost_ms_per_layer: float,
-    erosion: float | None,
+    gains: dict[int, float], steps_left: float | None, copy_cost_ms_per_layer: float
 ) -> list[int]:
-    """Layers to install, largest gain first, while an install's worth repays one layer's copy.
-
-    A layer's gain ``g`` (ms per step) shrinks by ``erosion`` (ms per step per call, the measured
-    growth of a layout's cost) as its rows drift, so the install is worth ``g T - erosion T^2 / 2``
-    over its ``T = min(steps_left, g / erosion)`` steps; without an erosion reading, ``g`` lasts
-    ``steps_left`` steps.
-    """
+    """Layers to install, largest gain first, while a layer's gain (ms per step) over the steps
+    left repays one layer's copy. The drift of the rows sets the interval between evaluations
+    (:class:`EvaluationScheduler`), not the worth of an install."""
     if steps_left is None:
         return []
     chosen = []
     for layer, gain in sorted(gains.items(), key=lambda kv: (-kv[1], kv[0])):
-        steps = float(steps_left)
-        if erosion:
-            steps = min(steps, max(gain, 0.0) / erosion)
-        if not gain * steps - (erosion or 0.0) * steps * steps / 2.0 > copy_cost_ms_per_layer:
+        if not gain * float(steps_left) > copy_cost_ms_per_layer:
             break
         chosen.append(layer)
     return chosen
@@ -474,8 +464,7 @@ class EvaluationScheduler:
     little worse every call; an interval of ``sqrt(2 * fixed cost / growth per call)`` calls
     minimizes their sum per call. The growth is read from two windows of the same layers: their
     time above the same rows spread evenly, under the current layouts. Growth below
-    :meth:`min_resolvable_rate` is not counted. ``erosion`` is the last counted growth per layer:
-    how fast a layer's gain from an install shrinks, in ms per step per call.
+    :meth:`min_resolvable_rate` is not counted.
     """
 
     def __init__(self, model: TimeModel, geometry: ExpertGeometry) -> None:
@@ -484,7 +473,6 @@ class EvaluationScheduler:
         self._previous_load: dict[int, np.ndarray] = {}
         self._previous_open: int | None = None
         self._last_positive_rate: float | None = None
-        self.erosion: float | None = None
 
     def read_cost(
         self,
@@ -564,7 +552,6 @@ class EvaluationScheduler:
                 growth.layers, growth.interval
             ):
                 self._last_positive_rate = growth.rate
-                self.erosion = growth.rate / growth.layers
             rate = self._last_positive_rate
         best = None
         if fixed is not None and rate is not None:

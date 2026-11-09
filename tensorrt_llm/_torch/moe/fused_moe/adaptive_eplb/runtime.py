@@ -335,9 +335,7 @@ class _Decider:
         copy_ms = copy_ms_per_layer(_timings(self.copy_timings))
         if copy_ms is None:
             copy_ms = cfg.copy_ms
-        chosen = choose_layers_to_install(
-            gain, steps_left, copy_ms or 0.0, self.evaluations.erosion
-        )
+        chosen = choose_layers_to_install(gain, steps_left, copy_ms or 0.0)
         if copy_ms is None:
             # No copy has been timed yet: install the best layer alone to time one.
             chosen = chosen[:1]
