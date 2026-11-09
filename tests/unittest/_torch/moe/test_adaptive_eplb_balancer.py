@@ -21,6 +21,7 @@ from tensorrt_llm.llmapi.llm_args import MoeAdaptiveLoadBalancerConfig
 pytestmark = pytest.mark.cpu_only
 
 NUM_EXPERTS, NUM_SLOTS, EP_SIZE, TOP_K = 8, 12, 4, 2
+ASSIGNMENTS = [(2 * r + j) % 8 for r in range(4) for j in range(3)]  # rank r, slot j < 3
 
 
 @pytest.fixture(autouse=True)
@@ -36,15 +37,6 @@ def _balancer(ep_rank: int = 1) -> AdaptiveMoeLoadBalancer:
     config = MoeAdaptiveLoadBalancerConfig(num_slots=NUM_SLOTS)
     config.setup(ep_rank=ep_rank, ep_size=EP_SIZE)
     return AdaptiveMoeLoadBalancer(ep_rank=ep_rank, ep_size=EP_SIZE, config=config, mapping=None)
-
-
-def _standard_initial_assignments() -> list[int]:
-    local = NUM_SLOTS // EP_SIZE
-    return [
-        (rank * NUM_EXPERTS // EP_SIZE + slot) % NUM_EXPERTS
-        for rank in range(EP_SIZE)
-        for slot in range(local)
-    ]
 
 
 def _observe(balancer, generation: int, context: int = 0, warmup: bool = False) -> None:
@@ -89,14 +81,6 @@ def test_statistics_record_nothing_while_the_flag_is_clear():
     stats = ExpertStatistics.of(statistics_buffers(1, 4, "cpu"), 0, off)
     stats.record(torch.tensor([[0, 1], [1, 3]], dtype=torch.int32))
     assert not stats.rows.any() and stats.forwards.item() == 0
-
-
-def test_layer_home_layout_and_load_expert_ids():
-    layer = _balancer().add_layer(NUM_EXPERTS, TOP_K, NUM_SLOTS // EP_SIZE)
-    assert layer.get_load_expert_ids() == [2, 3]
-    # Rank r loads experts (2r + j) % 8 into its slots j < 3; its first two slots are its homes.
-    assert layer.home_layout() == [0, 1, -1, 2, 3, -1, 4, 5, -1, 6, 7, -1]
-    layer.set_initial_weight_assignments(_standard_initial_assignments())
 
 
 def test_layer_routes_by_the_installed_tables():
@@ -216,7 +200,7 @@ def test_forwards_count_on_the_device_without_iter_context():
     balancer = _balancer(ep_rank=0)
     layers = [balancer.add_layer(NUM_EXPERTS, TOP_K, NUM_SLOTS // EP_SIZE) for _ in range(2)]
     for layer in layers:
-        layer.set_initial_weight_assignments(_standard_initial_assignments())
+        layer.set_initial_weight_assignments(ASSIGNMENTS)
         layer.prepare_device_state(torch.int32, "cpu")
     balancer.finalize_model()
     experts = torch.tensor([[1, 2]], dtype=torch.int32)
@@ -252,6 +236,10 @@ def test_forwards_count_on_the_device_without_iter_context():
 
 def test_the_layer_handle_is_a_moe_layer_load_balancer():
     layer = _balancer().add_layer(NUM_EXPERTS, TOP_K, NUM_SLOTS // EP_SIZE)
+    assert layer.get_load_expert_ids() == [2, 3]
+    # Rank r loads experts (2r + j) % 8 into its slots j < 3; its first two slots are its homes.
+    assert layer.home_layout() == [0, 1, -1, 2, 3, -1, 4, 5, -1, 6, 7, -1]
+    layer.set_initial_weight_assignments(ASSIGNMENTS)
     assert isinstance(layer, base.MoeLayerLoadBalancer)
     assert not layer.is_dynamic_routing() and layer.records_statistics()
     assert layer.stages_routes and not layer.produces_replica_plan
@@ -282,13 +270,12 @@ def test_a_moe_layer_runs_a_forward_through_the_load_balancer_hooks():
     balancer = _balancer(ep_rank=0)
     layer = balancer.add_layer(NUM_EXPERTS, TOP_K, NUM_SLOTS // EP_SIZE)
     module = Module(layer)
-    assignments = [(r * 2 + j) % 8 for r in range(4) for j in range(3)]
     # Construction, then a backend's weight load, then its post-load.
     assert layer.get_repeat_count() == 1
-    layer.set_initial_weight_assignments(assignments)
+    layer.set_initial_weight_assignments(ASSIGNMENTS)
     assert not FusedMoEMethodBase.need_load_shared_weights(module)
     module._add_raw_shared_weights_for_unmap([torch.zeros(4)])
-    layer.set_initial_weight_assignments(assignments)
+    layer.set_initial_weight_assignments(ASSIGNMENTS)
     balancer.register_weight_slots_after_to_cuda()
     balancer.finalize_model()
     layer.prepare_device_state(torch.int32, "cpu")

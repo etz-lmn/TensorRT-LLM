@@ -63,14 +63,16 @@ class FakeLayer:
 
 
 class FakeTransport:
-    """A 0.25 ms batch completing ``delay`` calls on; ``waiting()`` jobs still wait for the clock."""
+    """A 0.25 ms batch completing ``delay`` calls after the runtime's call that issued it;
+    ``waiting()`` jobs still wait for the clock."""
 
     def __init__(self, clock: list[int], delay: int = 1) -> None:
         self.clock, self.delay, self.batches, self.due = clock, delay, [], []
         self.waiting = lambda: sum(due > self.clock[0] for due in self.due)
+        self.runtime = None  # the runtime it serves (make_ranks)
 
     def copy(self, experts, stream, start, end) -> None:
-        due = self.clock[0] + self.delay
+        due = self.runtime.call + self.delay
         self.batches.append(list(experts))
 
         def synchronize() -> None:  # the test's settle guards the wait with its own deadline
@@ -203,6 +205,7 @@ def make_ranks(decisions, clock, copy_delays=(1, 1)):
             layers, transport, STREAM, decision, gather, "cpu", tables, buffers
         )
         runtime._event = Events(rank)
+        transport.runtime = runtime
 
         def waiting(t=transport, r=rank) -> int:
             waiting = group.waiting.get(r)
@@ -226,14 +229,15 @@ def settle(ranks) -> None:
 
 
 def run(ranks, clock, calls: int) -> None:
-    """Calls as the executor makes them, each seeing its batch first (no requests here)."""
+    """Calls as the executor makes them, each seeing its batch first (no requests here). The
+    clock reaches a call once every boundary ran it: a copy completes at its due call."""
     for _ in range(calls):
         for runtime in ranks:
             if runtime.wants_request_progress:
                 runtime.add_request_progress(*executor_progress([]))
             runtime.boundary()
+        clock[0] = ranks[0].call
         settle(ranks)
-        clock[0] += 1
 
 
 def set_statistics(runtime, rows: np.ndarray, forwards: int) -> None:
@@ -414,18 +418,27 @@ def script(rank, table_of_layer_1=2):
     return update
 
 
-def test_tables_apply_from_the_call_after_every_rank_copied(host_cuda):
-    """Rank 1's copies finish four calls later than rank 0's: both apply the new tables at the
-    same call, the one after the latest completion, before the next window is scheduled. The
-    window event hands over the gathered statistics."""
+@pytest.mark.parametrize("delays,open_after", [((1, 5), 4), ((1, 1), 1)])
+def test_tables_apply_after_every_rank_copied_and_the_window_opens_as_scheduled(
+    host_cuda, delays, open_after
+):
+    """Rank 1's copies finish ``delays[1]`` calls after the decision: both ranks apply the new
+    tables at the same call, the one after the latest completion, before the next window is
+    scheduled. The window event hands over the gathered statistics. The schedule is read before
+    windows open: the next window opens at its call, also when that is the call its schedule
+    arrives (``open_after`` 1), not a call later."""
     clock = [0]
-    decisions = [FakeDecision(0, script=script(0)), FakeDecision(1, script=script(1))]
-    ranks = make_ranks(decisions, clock, copy_delays=(1, 5))
-    run(ranks, clock, 22)
+    decisions = [FakeDecision(rank, script=script(rank)) for rank in range(R)]
+    for decision in decisions:
+        decision.open_after = open_after
+    ranks = make_ranks(decisions, clock, copy_delays=delays)
+    while not all(runtime.window == 1 and runtime.close_at for runtime in ranks):
+        assert clock[0] < 32, "the second window did not open"
+        run(ranks, clock, 1)
     first = [records(runtime)[0] for runtime in ranks]
     solved = first[0]["solved_call"]
     copied = [r["copied_call"] for r in first]
-    assert first[1]["solved_call"] == solved and copied == [solved + 1, solved + 5]
+    assert first[1]["solved_call"] == solved and copied == [solved + d for d in delays]
     apply = copied[1] + 1
     assert [r["apply_call"] for r in first] == [apply, apply]
     assert [r["effect"] for r in first] == [{0: apply, 1: apply}] * 2
@@ -434,7 +447,7 @@ def test_tables_apply_from_the_call_after_every_rank_copied(host_cuda):
         assert runtime._event.kinds == "window decision copied applied scheduled".split()
         (stats,) = runtime._event.stats
         assert np.array_equal(stats, decision.stats.numpy())
-        assert records(runtime)[0]["next_open"] == apply + 4
+        assert runtime.window_opened_call == records(runtime)[0]["next_open"] == apply + open_after
         assert runtime.applied_window.tolist() == [0, 0]
     assert ranks[0].transport.batches == [[]] and ranks[1].transport.batches == [[(0, 4, 0, 0)]]
 
@@ -448,25 +461,16 @@ def test_a_publish_copies_only_the_layers_it_changes(host_cuda):
     assert runtime.tables.tolist() == [[7] * TABLE, [3] * TABLE]
 
 
-def test_a_window_opens_at_the_call_it_is_scheduled_for(host_cuda):
-    """The schedule is read before windows open: a window scheduled for the call after its apply
-    call opens at that call, which is when its schedule arrives, not a call later."""
-    clock = [0]
-    decisions = [FakeDecision(rank, script=script(rank)) for rank in range(R)]
-    for decision in decisions:
-        decision.open_after = 1
-    ranks = make_ranks(decisions, clock)
-    opened = {}
-    while len(opened) < R:
-        assert clock[0] < 32, "the second window did not open"
-        run(ranks, clock, 1)
-        opened.update(
-            (r, x.window_opened_call) for r, x in enumerate(ranks) if x.window == 1 and x.close_at
-        )
-    assert [opened[r] for r in range(R)] == [records(x)[0]["next_open"] for x in ranks]
-
-
 def test_ranks_that_decided_differently_stop_before_applying(host_cuda):
+    """The digest covers the tables and the moves, not a rank's own copies."""
+    update = script(1)(0)
+    same_decision_other_rank = script(0)(0)
+    other_table = script(1, 3)(0)
+    other_moves = script(1)(0)
+    other_moves.moved = []
+    assert update.fingerprint() == same_decision_other_rank.fingerprint()
+    assert update.fingerprint() not in (other_table.fingerprint(), other_moves.fingerprint())
+    assert float(update.fingerprint()) == update.fingerprint()  # exact in the float64 row
     clock = [0]
     decisions = [FakeDecision(0, script=script(0)), FakeDecision(1, script=script(1, 3))]
     ranks = make_ranks(decisions, clock)
@@ -487,17 +491,6 @@ def test_windows_keep_their_numbers_across_installs(host_cuda, monkeypatch):
     sent = [m[1] for m in decisions[0].sent if m[0] == "window"]
     assert sent == list(range(len(sent))) and len(sent) >= 3
     assert [r["window"] for r in records(ranks[0])] == sent
-
-
-def test_the_fingerprint_covers_tables_and_moves_but_not_this_ranks_copies():
-    update = script(1)(0)
-    same_decision_other_rank = script(0)(0)
-    other_table = script(1, 3)(0)
-    other_moves = script(1)(0)
-    other_moves.moved = []
-    assert update.fingerprint() == same_decision_other_rank.fingerprint()
-    assert update.fingerprint() not in (other_table.fingerprint(), other_moves.fingerprint())
-    assert float(update.fingerprint()) == update.fingerprint()  # exact in the float64 row
 
 
 def test_two_ranks_move_an_expert_and_apply(host_cuda, monkeypatch):
@@ -552,25 +545,17 @@ def window_stats(stats: np.ndarray, hot=(0, 1)) -> np.ndarray:
     return stats
 
 
-def test_an_update_moves_in_one_copy_group(monkeypatch):
-    monkeypatch.setattr(rt, "solve_shares", even_split)
-    decider = FakeDecision(0, copy_ms=0.5).decider  # a copy time known: both layers may install
-    window_stats(decider.stats)
-    decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
-    update = decider.decide(0)
-    assert update.moved == [0, 1] and sorted(update.copy_items) == [0, 1]
-    assert decider.decide(1).moved == []  # nothing new to move: no copy
-
-
-def test_a_cost_jump_after_a_load_change_does_not_hold_back_the_correction(monkeypatch):
+def test_updates_copy_once_and_a_cost_jump_does_not_hold_back_the_correction(monkeypatch):
     monkeypatch.setattr(rt, "solve_shares", even_split)
     decider = FakeDecision(0, copy_ms=5.0).decider  # copies of 5 ms per layer, all timed so
     decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
+    # Window 0 moves both layers in one copy; window 1 plans no layer whose install is not live.
     # Window 1: GPU 1's experts turn hot before the install is live and the cost jumps; read as a
     # steady drift, the correction's gain would be gone within a dozen steps and repay no copy.
     for w, (h, live, moved) in enumerate(((0, -1, [0, 1]), (4, -1, []), (4, 0, [0, 1]))):
         window_stats(decider.stats, (h, h + 1))[:, L * (E + 1) : L * (E + 2)] = live
-        assert decider.decide(w).moved == moved
+        update = decider.decide(w)
+        assert update.moved == moved and sorted(update.copy_items) == moved
         decider.schedule(w, np.array([[10 + 20 * w, len(moved), 5.0 * len(moved), 0]] * R))
 
 
