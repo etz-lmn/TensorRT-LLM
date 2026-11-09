@@ -617,5 +617,70 @@ def test_statistic_allreduce_is_joined_before_an_eager_moe_launch(
     assert trace == expected + ([] if capturing else ["join:aux"])
 
 
+def _held_balancer(hold: bool) -> tuple[MoeLoadBalancer, list]:
+    """A MoeLoadBalancer without its C++ side: start_iter records the flags
+    the C++ balancer would receive."""
+    calls = []
+    balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
+    balancer.iter_id, balancer.in_iter = 0, False
+    balancer.layer_updates_per_iter = 1
+    balancer.enable_statistic = balancer.enable_update_weights = False
+    balancer._held_iter_info = (False, False) if hold else None
+    balancer.load_balancer_impl = SimpleNamespace(
+        start_iter=lambda iter_id, statistic, updates: calls.append(
+            (iter_id, statistic, updates)))
+    return balancer, calls
+
+
+def _forward(balancer: MoeLoadBalancer, context_requests: list) -> None:
+    """One engine forward as the decoder runner drives it."""
+    if balancer.holds_until_decode():
+        balancer.release_hold_if_decode(context_requests)
+    with MoeLoadBalancerIterContext(balancer):
+        pass
+
+
+@pytest.mark.cpu_only
+def test_hold_until_decode_is_off_unless_set(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the switch the engine's flags apply from the first forward
+    after warmup, context requests or not."""
+    monkeypatch.setattr(
+        MoeLoadBalancer, "end_iter",
+        lambda self: setattr(self, "iter_id", self.iter_id + 1) or setattr(
+            self, "in_iter", False))
+    balancer, calls = _held_balancer(hold=False)
+    balancer.set_iter_info(True, True)
+    assert not balancer.holds_until_decode()
+    _forward(balancer, [3, 0])
+    assert calls == [(0, True, True)]
+
+
+@pytest.mark.cpu_only
+def test_hold_until_decode_starts_at_the_first_forward_without_contexts(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Warmup never releases the hold; after it, forwards in which any rank
+    runs a context request keep statistics and updates off, and the first
+    forward with none on every rank starts both, for good."""
+    monkeypatch.setattr(
+        MoeLoadBalancer, "end_iter",
+        lambda self: setattr(self, "iter_id", self.iter_id + 1) or setattr(
+            self, "in_iter", False))
+    balancer, calls = _held_balancer(hold=True)
+    balancer.set_iter_info(False, False)  # warmup
+    _forward(balancer, [0, 0])
+    balancer.set_iter_info(True, True)  # warmup ends
+    assert (balancer.enable_statistic,
+            balancer.enable_update_weights) == (False, False)
+    for contexts in ([8, 8], [0, 2], [0, 0], [5, 0]):
+        _forward(balancer, contexts)
+    assert calls == [(0, False, False), (1, False, False), (2, False, False),
+                     (3, True, True), (4, True, True)]
+    assert not balancer.holds_until_decode()
+    balancer.set_iter_info(False, None)
+    assert (balancer.enable_statistic,
+            balancer.enable_update_weights) == (False, True)
+
+
 if __name__ == '__main__':
     unittest.main()
