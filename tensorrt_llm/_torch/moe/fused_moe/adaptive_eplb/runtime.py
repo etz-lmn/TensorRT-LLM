@@ -533,10 +533,8 @@ class AdaptiveRuntime:
         self.tables = tables
         self._host_tables = torch.empty_like(tables, device="cpu", pin_memory=pin)
         self._host_tables_np = self._host_tables.numpy()  # the host mirror, written row by row
-        # Blocking: the worker thread sleeps in its wait for the statistics copy instead of spinning
-        # in the driver while the main thread records events.
-        self._stats_copy_begin = torch.cuda.Event(enable_timing=True, blocking=True)
-        self._stats_copy_end = torch.cuda.Event(enable_timing=True, blocking=True)
+        self._stats_copy_begin = torch.cuda.Event(enable_timing=True)
+        self._stats_copy_end = torch.cuda.Event(enable_timing=True)
         self._pending_stats_copy: torch.cuda.Event | None = None
         self._copy_begin = torch.cuda.Event(enable_timing=True, blocking=True)
         self._copy_end = torch.cuda.Event(enable_timing=True, blocking=True)
