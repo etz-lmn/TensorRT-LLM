@@ -69,6 +69,7 @@ non-1 scales compute correctly.
 from __future__ import annotations
 
 import functools
+import math
 import os
 import weakref
 from dataclasses import dataclass
@@ -84,6 +85,7 @@ import torch.distributed as dist
 # that gate and therefore stay lazy at the call site.
 from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     megamoe_activation_sf_bytes_per_row,
+    megamoe_kernel_classes,
 )
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
@@ -429,6 +431,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         capabilities=MoEStaticCapability(
             supports_eplb=True,
             supports_per_layer_dynamic_eplb=True,
+            supports_adaptive_eplb=True,
         ),
         doc="MegaMoE CuteDSL fused NVFP4 kernels: NVFP4 weights and activations, SM100/103/107.",
     )
@@ -562,6 +565,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 MoERejectReason.DEP_MISSING,
                 "MegaMoECuteDsl requires the trtllm::cute_dsl_megamoe_nvfp4_* custom ops",
             )
+        # Adaptive EPLB prices its installs with the decode time model of the GPU it runs on.
+        if d.eplb_mode == "adaptive" and torch.cuda.is_available():
+            device = torch.cuda.get_device_name()
+            if not cls.has_decode_time_model(device):
+                return _reject(
+                    MoERejectReason.EPLB_UNSUPPORTED,
+                    f"MegaMoECuteDsl has no adaptive EPLB decode time model for {device!r}.",
+                )
         return MoEEligibility.ok()
 
     # ------------------------------------------------------------------
@@ -605,6 +616,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             activation=activation,
             init_load_balancer=init_load_balancer,
         )
+        if self.layer_load_balancer is not None:
+            # The balancer's statistics skip the rows of padding requests only if every kernel
+            # this layer can launch skips them too.
+            self.layer_load_balancer.counts_live_rows = all(
+                getattr(kernel, "reads_live_row_word", False)
+                for kernel in megamoe_kernel_classes(get_sm_version())
+            )
 
         # Topology / activation eligibility is owned by ``can_implement``.
         # Keep construction-only invariants that are not part of (p, d).
@@ -873,6 +891,85 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             launch_max_T=bucket,
         )
         return bufs, bucket
+
+    # ------------------------------------------------------------------
+    # Adaptive EPLB backend methods (``supports_adaptive_eplb``)
+    # ------------------------------------------------------------------
+    # The MNNVL memory the slot parameters point into once adaptive EPLB moved them.
+    adaptive_eplb_block: Optional[object] = None
+
+    _DECODE_DEVICES = {"GB300": (8.0e12, 15.0e15, 0.852)}
+    """Per GPU: the HBM bandwidth (bytes/s) and the dense NVFP4 peak (FLOP/s) of the datasheet, and
+    ``scale``, the one measured number of the decode time model
+    (``tests/microbenchmarks/measure_adaptive_eplb_time_model.py``). Adaptive EPLB on MegaMoE runs
+    only where :meth:`has_decode_time_model` finds an entry; the model is refused at build otherwise.
+    """
+
+    @classmethod
+    def has_decode_time_model(cls, device_name: str) -> bool:
+        """Whether :meth:`decode_time_model` has an entry for ``device_name``."""
+        return any(key in device_name for key in cls._DECODE_DEVICES)
+
+    @property
+    def slot_id_dtype(self) -> torch.dtype:
+        """The integer dtype the kernel reads slot ids in."""
+        return self._topk_idx_dtype
+
+    def slot_weight_planes(self) -> List[Tuple[str, int]]:
+        """Names and byte alignments of the live weight planes, whose leading axis is the slot.
+
+        A load balancer that moves expert weights between ranks relocates these parameters whole;
+        each must start at a multiple of its alignment. Raises ``ValueError`` when a parameter is
+        not the plane the quant method declares.
+        """
+        spec = self.quant_method.live_weight_plane_spec(self)
+        slots = int(self.compute_slot_count)
+        planes = []
+        for plane in spec.planes:
+            shape, stride, dtype_name, _, storage_alignment = plane.storage_metadata(slots)
+            param = self.get_parameter(plane.name)
+            declared = (getattr(torch, dtype_name), tuple(shape), tuple(stride))
+            if (param.dtype, tuple(param.shape), tuple(param.stride())) != declared:
+                raise ValueError(
+                    f"MoE layer {self.layer_idx}, plane {plane.name!r}: the parameter is not the "
+                    "plane the quant method declares"
+                )
+            kernel_alignment = plane.kernel_metadata(slots)[-1]
+            alignment = math.lcm(int(plane.alignment), storage_alignment, kernel_alignment)
+            planes.append((plane.name, alignment))
+        return planes
+
+    def check_weights_movable(self) -> None:
+        """Raise once the kernel holds views of the weight planes (after its first launch)."""
+        if self._cute_weight_cache:
+            raise RuntimeError(
+                f"MoE layer {self.layer_idx} has launched its kernel: its cute weight views "
+                "hold the current plane addresses, so its planes can no longer move"
+            )
+
+    def decode_time_model(self, expert_bytes: int, device_name: str) -> Dict[str, float]:
+        """Parameters of the decode kernels' time model on ``device_name`` (``policy.TimeModel``).
+
+        A slot that receives rows streams its expert's ``expert_bytes`` from HBM once; a row costs
+        its FC1 and FC2 FLOPs at the dense FP4 peak; every 256-row tile of a slot beyond its first
+        costs a tile of rows, and every such tile of the GPU's busiest slot half a tile more, the
+        serial tail of that slot. Raises ``ValueError`` when the device has no entry.
+        """
+        for key, (bandwidth, peak, scale) in self._DECODE_DEVICES.items():
+            if key in device_name:
+                inner = int(self.expand_intermediate_size_per_partition) + int(
+                    self.intermediate_size_per_partition
+                )
+                row_us = 2.0 * self.hidden_size * inner / peak * 1e6
+                return dict(
+                    per_active_slot_us=expert_bytes / bandwidth * 1e6,
+                    per_extra_tile_us=256 * row_us,
+                    per_row_us=row_us,
+                    hot_slot_extra_tile_us=128 * row_us,
+                    scale=scale,
+                    tile_rows=256,
+                )
+        raise ValueError(f"no decode time model of MegaMoE for {device_name!r}")
 
     def _supports_load_balancer(self) -> bool:
         # Both static and dynamic EPLB are supported: the four MegaMoE-
