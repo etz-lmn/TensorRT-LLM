@@ -4446,6 +4446,283 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     assert megamoe_op._unpack_tactic(v4) == megamoe_op.default_megamoe_tactic(64)
 
 
+# Tokens of a small helper-bearing launch; the GPU test below also runs 8192 tokens, the per-rank
+# prefill size of a DeepSeek-V4-Pro layer the helper-bearing tactics were measured at.
+_MEGAMOE_HELPER_TOKENS = 256
+
+
+@pytest.mark.parametrize("sm_version", [100, 103])
+def test_megamoe_helper_bearing_candidates_take_tiles_by_atomic_counter(sm_version: int) -> None:
+    """Every tactic a load-balanced launch on SM100 / SM103 may pick takes its tiles by atomic counter.
+
+    A helper-bearing launch runs on the full grid while the helper-copy kernel can still hold some
+    SMs, so no CTA may own a static grid-stride share of the tiles.
+    """
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    tactics = megamoe_op.enumerate_megamoe_candidate_tactics(
+        _MEGAMOE_HELPER_TOKENS, sm_version=sm_version, load_balance=True
+    )
+    assert tactics
+    work_id_mode = megamoe_op._TACTIC_FIELDS.index("work_id_mode")
+    assert {megamoe_op._unpack_tactic(tactic)[work_id_mode] for tactic in tactics} == {
+        "atomic_counter"
+    }
+
+
+def test_megamoe_helper_bearing_work_ids_change_only_where_measured() -> None:
+    """The rewrite sets the work-id field by name, validates the result, and keeps the tactics of
+    an SM it was not measured on (SM107) as they are."""
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    # A legacy 8-tuple: its fifth element is the token-back mode, not the work-id mode.
+    legacy = ([256, 128, 256], [2, 1, 1], 512, "static", "epi_warps", True, 1, (1, 1))
+    (converted,) = megamoe_op._with_atomic_counter_work_ids([legacy], 103)
+    fields = dict(zip(megamoe_op._TACTIC_FIELDS, megamoe_op._unpack_tactic(converted)))
+    assert fields["work_id_mode"] == "atomic_counter"
+    assert fields["token_back_mode"] == "epi_warps"
+    sm107 = megamoe_op.enumerate_megamoe_candidate_tactics(_MEGAMOE_HELPER_TOKENS, sm_version=107)
+    assert megamoe_op._with_atomic_counter_work_ids(sm107, 107) == list(sm107)
+
+
+def _with_slot_copies(tensor: torch.Tensor, slots: int, sources: Tuple[int, ...]) -> torch.Tensor:
+    """``tensor`` (expert-major over ``slots`` slots) with byte copies of slots ``sources`` appended."""
+    if tensor.dim() == 0:
+        return tensor
+    raw = tensor.view(torch.uint8) if tensor.element_size() == 1 else tensor
+    per_slot = raw.reshape(slots, -1) if raw.shape[0] != slots else raw
+    assert per_slot.shape[0] == slots, f"not expert-major over {slots} slots: {tuple(tensor.shape)}"
+    out = torch.cat([per_slot, per_slot[list(sources)]], dim=0)
+    if raw.shape[0] != slots:
+        out = out.reshape(-1)
+    return out.view(tensor.dtype) if out.dtype != tensor.dtype else out
+
+
+def _clone_launch_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """A copy of a launch input; packed FP4 / FP8 payloads are copied as bytes."""
+    if tensor.element_size() == 1:
+        return tensor.view(torch.uint8).clone().view(tensor.dtype)
+    return tensor.clone()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("num_tokens", [_MEGAMOE_HELPER_TOKENS, 8192])
+def test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int
+) -> None:
+    """A helper-bearing launch computes what the helper-free launch computes.
+
+    The layer runs once through the backend without helper slots; that launch's inputs and output are
+    the reference. The same launch is then repeated with two helper slots that hold byte copies of
+    experts 0 and 1 and take every other row routed to them, with the READY flag already at the
+    launch's generation. A copy computes its rows exactly as its original, so the output must equal
+    the reference bit for bit: under the default selection, and under the default tactic with
+    grid-stride and with atomic-counter work ids.
+    """
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
+    sm_version = get_sm_version()
+    if sm_version not in (100, 103):
+        pytest.skip(
+            f"token-tile READY of the swap-AB kernel is an SM100 / SM103 path, not SM{sm_version}"
+        )
+    backend_type = MoeBackendType.MEGAMOE_CUTEDSL
+    dtype = torch.bfloat16
+    num_experts, top_k = 16, 6
+    hidden_size, intermediate_size = 7168, 3072
+    sources = (0, 1)
+    verdict = MegaMoECuteDsl.can_implement(
+        MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=dtype,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+        ),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=num_experts,
+            env=collect_moe_environment(),
+        ),
+    )
+    if not verdict.eligible:
+        pytest.skip(verdict.detail)
+
+    launches = []
+    real_launch = megamoe_op.run_cute_dsl_megamoe_nvfp4_blackwell
+    copied = ("activation", "activation_sf", "topk_idx", "topk_weights", "combine_output")
+
+    def recording_launch(**kwargs):
+        real_launch(**kwargs)
+        launches.append(
+            {
+                key: _clone_launch_tensor(value) if key in copied else value
+                for key, value in kwargs.items()
+            }
+        )
+
+    monkeypatch.setattr(megamoe_op, "run_cute_dsl_megamoe_nvfp4_blackwell", recording_launch)
+    mapping = Mapping(rank=mpi_rank())
+    _ensure_single_proc_dist_for_megamoe(backend_type, mapping.rank)
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x, backend_type
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        quant_kwargs.pop("ref_cls")
+        weights = quantize_util.create_weights(**quant_kwargs)
+        token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+        )
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+        with torch.inference_mode():
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            run_backend_moe(
+                backend,
+                backend_type,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits,
+            )
+        torch.cuda.synchronize()
+
+        launch = next(
+            launch for launch in reversed(launches) if launch["num_tokens"] in (num_tokens, -1)
+        )
+        assert launch.get("helper_expert_count", 0) == 0
+        slots = launch["num_experts_per_rank"]
+        reference = launch["combine_output"][:num_tokens]
+
+        # Two helper slots after the resident ones hold copies of experts 0 and 1 and take every
+        # other row routed to them.
+        expert_tensors = {
+            name: _with_slot_copies(launch[name], slots, sources)
+            for name in (
+                "fc1_weight",
+                "fc1_weight_sf",
+                "fc2_weight",
+                "fc2_weight_sf",
+                "fc1_alpha",
+                "fc2_alpha",
+                "fc1_norm_const",
+            )
+        }
+        topk_idx = launch["topk_idx"].clone()
+        rows = topk_idx[:num_tokens]
+        for helper, source in enumerate(sources):
+            hits = (rows == source).nonzero()
+            assert len(hits) >= 2, f"expert {source} got {len(hits)} rows"
+            moved = hits[::2]
+            rows[moved[:, 0], moved[:, 1]] = slots + helper
+        ready_flags = torch.ones(1, dtype=torch.int64, device="cuda")  # generation 1, published
+
+        runner = megamoe_op.Sm100MegaMoENvfp4Runner(
+            world_size=1,
+            local_rank=0,
+            num_topk=top_k,
+            num_experts_per_rank=slots + len(sources),
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=launch["intermediate_size_per_partition"],
+            expand_intermediate_size_per_partition=launch["expand_intermediate_size_per_partition"],
+            max_tokens_per_rank=launch["max_tokens_per_rank"],
+            output_dtype=dtype,
+            apply_topk_in_fc1=launch["apply_topk_in_fc1"],
+            swiglu_alpha=launch["swiglu_alpha"],
+            swiglu_beta=launch["swiglu_beta"],
+            gate_up_clamp=launch["gate_up_clamp"],
+            situ_beta=launch["act_alpha"],
+            situ_linear_beta=launch["act_beta"],
+            in_kernel_fc2_reduce=launch["in_kernel_fc2_reduce"],
+            combine_format=launch["combine_format"],
+            helper_expert_count=len(sources),
+        )
+
+        def inputs(output: torch.Tensor) -> List[torch.Tensor]:
+            return [
+                launch["activation"],
+                launch["activation_sf"],
+                topk_idx,
+                launch["topk_weights"],
+                expert_tensors["fc1_weight"],
+                expert_tensors["fc1_weight_sf"],
+                expert_tensors["fc2_weight"],
+                expert_tensors["fc2_weight_sf"],
+                expert_tensors["fc1_alpha"],
+                expert_tensors["fc2_alpha"],
+                expert_tensors["fc1_norm_const"],
+                output,
+            ]
+
+        def run(tactic) -> torch.Tensor:
+            output = torch.zeros_like(launch["combine_output"])[:num_tokens]
+            megamoe_op.set_active_megamoe_cute_weight_cache(None)
+            megamoe_op.set_active_megamoe_cute_buffer_cache(None)
+            runner._helper_ready_flags = ready_flags
+            runner._helper_ready_generation = 1
+            runner(
+                inputs(output),
+                tactic=tactic,
+                peer_offsets=launch["peer_offsets"],
+                shared_workspace=launch["shared_workspace"],
+            )
+            torch.cuda.synchronize()
+            return output
+
+        default = megamoe_op._default_megamoe_tactic_for_problem(
+            sm_version=sm_version,
+            max_tokens_per_rank=launch["max_tokens_per_rank"],
+            num_tokens=num_tokens,
+            apply_topk_in_fc1=launch["apply_topk_in_fc1"],
+            in_kernel_fc2_reduce=launch["in_kernel_fc2_reduce"],
+            combine_format=launch["combine_format"],
+        )
+        cases = {
+            "default selection": -1,
+            "default tactic, grid-stride work ids": default,
+            "default tactic, atomic-counter work ids": megamoe_op._with_atomic_counter_work_ids(
+                [default], sm_version
+            )[0],
+        }
+        mismatched = {}
+        with torch.inference_mode():
+            for name, tactic in cases.items():
+                output = run(tactic)
+                if not torch.equal(output, reference):
+                    mismatched[name] = float((output.float() - reference.float()).abs().max())
+        assert not mismatched, f"outputs differ from the helper-free launch (max abs): {mismatched}"
+
+
 @pytest.mark.gpu
 def test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants(
     monkeypatch: pytest.MonkeyPatch,
