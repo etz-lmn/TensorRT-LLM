@@ -16,6 +16,9 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
     get_moe_load_balancer, maybe_create_moe_load_balancer,
     moe_load_balancer_add_single_layer)
+from tensorrt_llm._torch.moe.live_rows import (MODEL_EXTRA_ATTR, LiveRowWord,
+                                               encode)
+from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -374,6 +377,41 @@ class TestMoeLoadBalancer(unittest.TestCase):
             self.fail(f"Statistic kernel test failed with exception: {e}")
         finally:
             # Clean up
+            balancer.shutdown()
+
+    def test_local_statistic_counts_only_live_rows(self):
+        """The local statistic counts the rows of the real requests only."""
+        torch.cuda.set_device(0)
+        expert_count, top_k = 4, 2
+        balancer = MoeLoadBalancer(0, 2, 1)
+        balancer.set_use_gpu_memcpy(True)
+        layer = balancer.add_layer(expert_count, top_k, 2)
+        # As a MoE module whose kernel skips the rows of padding requests marks it.
+        layer.counts_live_rows = True
+        layer.set_initial_weight_assignments([0, 1, 2, 3])
+        balancer.finalize_model()
+        balancer.set_iter_info(True, False)
+        # Four requests of two rows each; the last one pads the batch.
+        local_raw_expert_ids = torch.tensor(
+            [[0, 1], [1, 2], [2, 3], [0, 3], [1, 3], [0, 2], [3, 3], [3, 3]],
+            dtype=torch.int32,
+            device="cuda")
+        word = LiveRowWord(encode(3, 4))
+        try:
+            with MoeLoadBalancerIterContext(balancer), model_extra_attrs(
+                {MODEL_EXTRA_ATTR: word}):
+                layer.start_wait_gpu_stage()
+                layer.done_wait_gpu_stage()
+                layer.update_local_statistic(local_raw_expert_ids, True, True)
+                counts = layer.get_local_statistic_tensor().clone()
+                layer.start_set_cpu_stage()
+                layer.done_set_cpu_stage()
+            torch.cuda.synchronize()
+            # Three real requests of two rows each: the first six rows.
+            expected = torch.bincount(local_raw_expert_ids[:6].flatten().long(),
+                                      minlength=expert_count).to(torch.int32)
+            self.assertTrue(torch.equal(counts.cpu(), expected))
+        finally:
             balancer.shutdown()
 
     def test_real_routing_kernel(self):

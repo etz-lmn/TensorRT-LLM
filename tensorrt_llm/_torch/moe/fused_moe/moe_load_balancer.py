@@ -18,6 +18,7 @@ import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.mmap_utils import advise_tensor_pageout
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
+from tensorrt_llm._torch.moe.live_rows import current_word
 from tensorrt_llm._torch.utils import EventType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -306,6 +307,9 @@ class SingleLayerMoeLoadBalancer:
 
     # Standard EPLB routes to slot IDs and has no per-invocation replica plan.
     produces_replica_plan = False
+    # Set by the layer's MoE module when its kernel skips the rows past the engine's live-row
+    # word: the local statistic then skips them too, else it counts every row the kernel computes.
+    counts_live_rows = False
 
     def __init__(
             self,
@@ -600,6 +604,9 @@ class SingleLayerMoeLoadBalancer:
                     (self.expert_count, ),
                     dtype=torch.int32,
                     device=torch.device('cuda'))
+            # The rows of real requests only, where the kernel computes no others.
+            live_row_word = current_word(
+                local_raw_expert_ids.device) if self.counts_live_rows else None
             if do_multi_stream():
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
@@ -608,13 +615,13 @@ class SingleLayerMoeLoadBalancer:
                         local_raw_expert_ids, self.local_statistic_tensor,
                         self.statistic_flag_tensor,
                         self.single_layer_load_balancer_ptr, is_first_stage,
-                        is_last_stage)
+                        is_last_stage, live_row_word)
             else:
                 torch.ops.trtllm.moe_hierarchical_statistic_local_device(
                     local_raw_expert_ids, self.local_statistic_tensor,
                     self.statistic_flag_tensor,
                     self.single_layer_load_balancer_ptr, is_first_stage,
-                    is_last_stage)
+                    is_last_stage, live_row_word)
 
     def get_local_statistic_tensor(self) -> Optional[torch.Tensor]:
         """

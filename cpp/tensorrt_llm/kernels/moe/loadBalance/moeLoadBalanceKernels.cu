@@ -183,8 +183,21 @@ __global__ void shiftWindowKernel(MoeLoadBalanceMetaInfo metaInfo, int* const en
     typedExpertTokenCountPtr[threadIdx.x] = oldExpertTokenCount;
 }
 
+// The leading live rows of `rows` rows under a live-row word (tensorrt_llm/_torch/moe/live_rows.py): R real of P
+// requests; none when P is 0, all when R >= P or P does not divide the rows, else rows / P * R.
+__device__ __forceinline__ int liveRowCount(int word, int rows)
+{
+    int const real = word & 0xFFFF;
+    int const requests = (word >> 16) & 0xFFFF;
+    if (requests == 0)
+    {
+        return 0;
+    }
+    return real >= requests || rows % requests != 0 ? rows : rows / requests * real;
+}
+
 __global__ void statisticKernel(MoeLoadBalanceMetaInfo metaInfo, int* expertTokenCount, int totalEltCount,
-    int* const enabled, int* const gatheredRawExpertIds)
+    int* const enabled, int* const gatheredRawExpertIds, int const* liveRowWord)
 {
     extern __shared__ int sharedExpertCount[];
     if (*enabled == 0)
@@ -200,7 +213,11 @@ __global__ void statisticKernel(MoeLoadBalanceMetaInfo metaInfo, int* expertToke
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
-    for (int idx = threadIdx.x + blockIdx.x * blockDim.x; idx < totalEltCount; idx += gridDim.x * blockDim.x)
+    // The rows past the live ones belong to padding requests.
+    int const liveEltCount = liveRowWord == nullptr
+        ? totalEltCount
+        : liveRowCount(*liveRowWord, totalEltCount / metaInfo.topK) * metaInfo.topK;
+    for (int idx = threadIdx.x + blockIdx.x * blockDim.x; idx < liveEltCount; idx += gridDim.x * blockDim.x)
     {
         int expertId = gatheredRawExpertIds[idx];
         if (expertId >= 0 && expertId < metaInfo.expertCount)
@@ -273,8 +290,10 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
             blockCount = smCount;
         }
         int sharedMemorySize = metaInfo.expertCount * sizeof(int);
+        // A live-row word describes one rank's rows, not the gathered rows of every rank.
         launchWithPdlWhenEnabled("statisticKernel", statisticKernel, blockCount, threadCount, sharedMemorySize, stream,
-            metaInfo, statisticInfo.expertTokenCount, totalEltCount, enabled, gatheredRawExpertIds);
+            metaInfo, statisticInfo.expertTokenCount, totalEltCount, enabled, gatheredRawExpertIds,
+            static_cast<int const*>(nullptr));
     }
 
     if (isLastStage)
@@ -289,7 +308,7 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
 
 void moeHierarchicalStatisticLocalDevice(MoeLoadBalanceMetaInfo metaInfo, int numTotalTokens,
     int* localExpertTokenCount, int* const enabled, bool isFirstStage, bool isLastStage, int* const localRawExpertIds,
-    cudaStream_t stream)
+    int const* liveRowWord, cudaStream_t stream)
 {
     static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
     if (isFirstStage)
@@ -327,7 +346,7 @@ void moeHierarchicalStatisticLocalDevice(MoeLoadBalanceMetaInfo metaInfo, int nu
         }
         int sharedMemorySize = metaInfo.expertCount * sizeof(int);
         launchWithPdlWhenEnabled("statisticKernel", statisticKernel, blockCount, threadCount, sharedMemorySize, stream,
-            metaInfo, localExpertTokenCount, totalEltCount, enabled, localRawExpertIds);
+            metaInfo, localExpertTokenCount, totalEltCount, enabled, localRawExpertIds, liveRowWord);
     }
 }
 

@@ -84,6 +84,7 @@ import torch.distributed as dist
 # that gate and therefore stay lazy at the call site.
 from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     megamoe_activation_sf_bytes_per_row,
+    megamoe_kernel_classes,
 )
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
@@ -594,6 +595,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             activation=activation,
             init_load_balancer=init_load_balancer,
         )
+        if self.layer_load_balancer is not None:
+            # The balancer's statistics skip the rows of padding requests only if every kernel
+            # this layer can launch skips them too.
+            self.layer_load_balancer.counts_live_rows = all(
+                getattr(kernel, "reads_live_row_word", False)
+                for kernel in megamoe_kernel_classes(get_sm_version())
+            )
 
         # Topology / activation eligibility is owned by ``can_implement``.
         # Keep construction-only invariants that are not part of (p, d).

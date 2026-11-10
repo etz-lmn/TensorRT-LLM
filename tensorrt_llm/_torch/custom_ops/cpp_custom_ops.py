@@ -924,9 +924,12 @@ def _register_fake():
     @torch.library.register_fake(
         "trtllm::moe_hierarchical_statistic_local_device")
     def _(local_raw_expert_ids: torch.Tensor,
-          local_expert_token_count: torch.Tensor, enabled: torch.Tensor,
-          single_layer_load_balancer_ptr: int, is_first_stage: bool,
-          is_last_stage: bool):
+          local_expert_token_count: torch.Tensor,
+          enabled: torch.Tensor,
+          single_layer_load_balancer_ptr: int,
+          is_first_stage: bool,
+          is_last_stage: bool,
+          live_row_word: Optional[torch.Tensor] = None):
         pass
 
     @torch.library.register_fake("trtllm::moe_hierarchical_statistic_update")

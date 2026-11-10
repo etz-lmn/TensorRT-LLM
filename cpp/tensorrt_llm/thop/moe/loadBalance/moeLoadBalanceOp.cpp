@@ -23,6 +23,7 @@
 #include <c10/core/StorageImpl.h>   // for c10::StorageImpl and use_byte_size_t()
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/intrusive_ptr.h> // for c10::make_intrusive#include <torch/extension.h>
+#include <optional>
 #include <vector>
 
 #include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceKernels.h"
@@ -88,7 +89,8 @@ void moeLoadBalanceStatistic(torch::Tensor gatheredRawExpertIds, torch::Tensor e
 }
 
 void moeHierarchicalStatisticLocalDevice(torch::Tensor localRawExpertIds, torch::Tensor localExpertTokenCount,
-    torch::Tensor enabled, int64_t singleLayerLoadBalancerPtr, int64_t isFirstStage, int64_t isLastStage)
+    torch::Tensor enabled, int64_t singleLayerLoadBalancerPtr, int64_t isFirstStage, int64_t isLastStage,
+    std::optional<torch::Tensor> liveRowWord)
 {
     CHECK_INPUT(localRawExpertIds, torch::kInt32);
     CHECK_INPUT(localExpertTokenCount, torch::kInt32);
@@ -101,6 +103,13 @@ void moeHierarchicalStatisticLocalDevice(torch::Tensor localRawExpertIds, torch:
     TORCH_CHECK(isFirstStage == 0 || isFirstStage == 1, "isFirstStage must be 0 or 1");
     TORCH_CHECK(isLastStage == 0 || isLastStage == 1, "isLastStage must be 0 or 1");
     TORCH_CHECK(singleLayerLoadBalancerPtr != 0, "singleLayerLoadBalancerPtr must be non-null");
+    int const* liveRowWordPtr = nullptr;
+    if (liveRowWord.has_value())
+    {
+        CHECK_INPUT(liveRowWord.value(), torch::kInt32);
+        TORCH_CHECK(liveRowWord->numel() == 1, "liveRowWord must have 1 element");
+        liveRowWordPtr = liveRowWord->data_ptr<int>();
+    }
 
     auto* loadBalancer
         = reinterpret_cast<tensorrt_llm::runtime::SingleLayerMoeLoadBalancer*>(singleLayerLoadBalancerPtr);
@@ -116,7 +125,7 @@ void moeHierarchicalStatisticLocalDevice(torch::Tensor localRawExpertIds, torch:
 
     tensorrt_llm::kernels::moeHierarchicalStatisticLocalDevice(metaInfo, numTotalTokens,
         localExpertTokenCount.data_ptr<int>(), enabled.data_ptr<int>(), static_cast<bool>(isFirstStage),
-        static_cast<bool>(isLastStage), localRawExpertIds.data_ptr<int>(), stream);
+        static_cast<bool>(isLastStage), localRawExpertIds.data_ptr<int>(), liveRowWordPtr, stream);
 }
 
 void moeHierarchicalStatisticUpdate(
@@ -241,7 +250,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "moe_hierarchical_statistic_local_device(Tensor local_raw_expert_ids, Tensor local_expert_token_count, Tensor "
         "enabled, int "
-        "single_layer_load_balancer_ptr, int is_first_stage, int is_last_stage) -> ()");
+        "single_layer_load_balancer_ptr, int is_first_stage, int is_last_stage, Tensor? live_row_word=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

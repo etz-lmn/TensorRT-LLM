@@ -82,9 +82,11 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
 // @param isFirstStage: whether the current stage is the first stage (only first stage need shift window)
 // @param isLastStage: whether the current stage is the last stage (only last stage need update load factor)
 // @param localRawExpertIds: the gathered raw expert ids, should have shape [numTotalTokens, metaInfo.topK]
+// @param liveRowWord: the forward's live-row word (tensorrt_llm/_torch/moe/live_rows.py): only its live rows are
+//                     counted; nullptr counts every row
 void moeHierarchicalStatisticLocalDevice(MoeLoadBalanceMetaInfo metaInfo, int numTotalTokens,
     int* localExpertTokenCount, int* const enabled, bool isFirstStage, bool isLastStage, int* const localRawExpertIds,
-    cudaStream_t stream);
+    int const* liveRowWord, cudaStream_t stream);
 
 // @brief update the statistic info based on global info
 //
