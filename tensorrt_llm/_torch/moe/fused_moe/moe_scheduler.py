@@ -42,12 +42,14 @@ exchange runs:
 
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
+from tensorrt_llm._torch.moe import live_rows
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
@@ -260,18 +262,20 @@ class ExternalCommMoEScheduler(MoEScheduler):
             )
         else:
             input_ready_event = _wait_input_ready(input_ready_event)
-            outputs = self._forward_multiple_chunks(
-                x,
-                router_logits,
-                num_chunks,
-                output_dtype,
-                all_rank_num_tokens_padded,
-                use_dp_padding,
-                do_finalize,
-                input_ids,
-                lora_params=lora_params,
-                routing_aux=routing_aux,
-            )
+            # Each chunk's launches cover part of the forward's rows.
+            with live_rows.part_of_the_forward():
+                outputs = self._forward_multiple_chunks(
+                    x,
+                    router_logits,
+                    num_chunks,
+                    output_dtype,
+                    all_rank_num_tokens_padded,
+                    use_dp_padding,
+                    do_finalize,
+                    input_ids,
+                    lora_params=lora_params,
+                    routing_aux=routing_aux,
+                )
 
         # ========== Step 4: Truncate DP padding ==========
         if moe.use_dp and moe.parallel_size > 1:
@@ -1304,19 +1308,22 @@ class FusedCommMoEScheduler(MoEScheduler):
             routing_aux_chunks = _split_rows(
                 _leading_rows(routing_aux, x_real.shape[0]), all_rank_chunk_size_list[ep_rank]
             )
-        outputs = self._run_chunks(
-            x_chunks,
-            rl_chunks,
-            input_ids_chunks,
-            num_chunks=num_chunks,
-            x_real=x_real,
-            rl_real=rl_real,
-            all_rank_chunk_size_list=all_rank_chunk_size_list,
-            had_meta=had_meta,
-            output_dtype=output_dtype,
-            do_finalize=do_finalize,
-            routing_aux_chunks=routing_aux_chunks,
-        )
+        # With more than one chunk, each chunk's launches cover part of the forward's rows.
+        part = live_rows.part_of_the_forward() if num_chunks > 1 else contextlib.nullcontext()
+        with part:
+            outputs = self._run_chunks(
+                x_chunks,
+                rl_chunks,
+                input_ids_chunks,
+                num_chunks=num_chunks,
+                x_real=x_real,
+                rl_real=rl_real,
+                all_rank_chunk_size_list=all_rank_chunk_size_list,
+                had_meta=had_meta,
+                output_dtype=output_dtype,
+                do_finalize=do_finalize,
+                routing_aux_chunks=routing_aux_chunks,
+            )
         if not outputs:
             cast_dtype = output_dtype if output_dtype is not None else x.dtype
             return x.new_empty((0, x.shape[1]), dtype=cast_dtype)
