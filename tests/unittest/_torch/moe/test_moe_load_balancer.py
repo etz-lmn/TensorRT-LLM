@@ -782,5 +782,102 @@ def test_decode_passes_only_flag_is_set_before_start_iter(
     assert seen == [False, True, False, True, False]
 
 
+def _observed_layer(expert_count: int, updates_enabled: bool = True):
+    layer = SingleLayerMoeLoadBalancer.__new__(SingleLayerMoeLoadBalancer)
+    layer.func_called_count = collections.defaultdict(int)
+    layer.func_called_count["done_wait_gpu_stage"] = 1
+    layer.updates_enabled = updates_enabled
+    layer.expert_count = expert_count
+    layer.single_layer_load_balancer_ptr = "balancer"
+    return layer
+
+
+@pytest.mark.cpu_only
+def test_row_observation_is_off_unless_enabled(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without enable_row_observation, route returns the routed slots and
+    keeps no counter; with static routing the switch does nothing."""
+    layer = _observed_layer(expert_count=8)
+    slots = torch.tensor([[0, 5], [9, 15]], dtype=torch.int32)
+    monkeypatch.setattr(torch.ops.trtllm,
+                        "moe_load_balance_routing",
+                        lambda *args: slots,
+                        raising=False)
+    assert layer.route(torch.zeros((2, 2), dtype=torch.int32)) is slots
+    assert layer.observed_rank_rows is None
+    assert layer.copy_observed_rows(torch.zeros(13,
+                                                dtype=torch.int64)) is False
+
+    static = _observed_layer(expert_count=8, updates_enabled=False)
+    static.enable_row_observation(ep_size=4, slot_count_per_rank=4,
+                                  device="cpu")
+    assert static.observed_expert_rows is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("flag", [0, 1])
+def test_row_observation_counts_routed_rows_by_rank(
+        monkeypatch: pytest.MonkeyPatch, flag: int) -> None:
+    """Routed slots count toward the EP rank that holds them (invalid slots
+    in the last entry), the EP-wide statistic toward each expert, both only in
+    a forward whose statistic is enabled; a copy reads them."""
+    layer = _observed_layer(expert_count=8)
+    layer.enable_row_observation(ep_size=4, slot_count_per_rank=4,
+                                 device="cpu")
+    layer.statistic_flag_tensor = torch.tensor([flag], dtype=torch.int32)
+    slots = torch.tensor([[0, 1], [4, 5], [8, 15], [16, 3]],
+                         dtype=torch.int32)
+    monkeypatch.setattr(torch.ops.trtllm,
+                        "moe_load_balance_routing",
+                        lambda *args: slots,
+                        raising=False)
+    layer.route(torch.zeros((4, 2), dtype=torch.int32))
+    layer._observe_expert_rows(torch.arange(8, dtype=torch.int32) * flag)
+
+    out = torch.zeros(8 + 5, dtype=torch.int64)
+    assert layer.copy_observed_rows(out)
+    assert out[:8].tolist() == [e * flag for e in range(8)]
+    assert out[8:].tolist() == [3 * flag, 2 * flag, flag, flag, flag]
+
+
+@pytest.mark.cpu_only
+def test_row_observation_reads_the_reduced_statistic(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The expert rows are the statistic the balancer itself reduces, added
+    after its own update."""
+    from tensorrt_llm._torch.moe.fused_moe import \
+        moe_load_balancer as moe_load_balancer_module
+
+    trace = []
+    layer = _observed_layer(expert_count=4)
+    layer.enable_row_observation(ep_size=2, slot_count_per_rank=2,
+                                 device="cpu")
+    layer.local_statistic_tensor = torch.tensor([1, 0, 2, 3],
+                                                dtype=torch.int32)
+    layer.statistic_flag_tensor = torch.tensor([1], dtype=torch.int32)
+    layer.update_local_statistic = lambda *args: trace.append("local")
+    monkeypatch.setattr(moe_load_balancer_module, "do_multi_stream",
+                        lambda: False)
+    monkeypatch.setattr(torch.ops.trtllm,
+                        "moe_hierarchical_statistic_update",
+                        lambda *args: trace.append("update"),
+                        raising=False)
+    for _ in range(2):
+        layer.update_statistic_with_local_ids(
+            "expert_ids",
+            is_first_stage=True,
+            is_last_stage=True,
+            allreduce=lambda tensor: tensor * 2)
+    assert trace == ["local", "update"] * 2
+    assert layer.observed_expert_rows.tolist() == [4, 0, 8, 12]
+
+
+def test_row_observation_is_enabled_before_layers() -> None:
+    balancer = MoeLoadBalancer.__new__(MoeLoadBalancer)
+    balancer.single_layer_load_balancers = ["layer"]
+    with pytest.raises(RuntimeError):
+        balancer.enable_row_observation()
+
+
 if __name__ == '__main__':
     unittest.main()
