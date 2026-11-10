@@ -1867,6 +1867,7 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
     impl = _extract_class(source, "TrtllmCutedslMegaMoeNvfp4Impl", {"quantize_input"}, namespace)
     owner = impl()
     owner.fc31_input_scale = "scale"
+    owner._staging_of_next_run = lambda num_tokens: None  # a forward that run_moe does not stage
 
     owner.quantize_input(Activation(3, 64))
     owner.quantize_input(Activation(3, 64), reserved_sms=4)
@@ -2471,30 +2472,32 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     )
 
     assert out == "out"
-    tail = [("quantize", {}), ("bucket", 6)]
+    # The bucket hint precedes the route and the quantization, which may write
+    # into that bucket's staging.
     if mode == "per_layer_dynamic":
         # The planner consumes the logical routes the calibrator records or
         # replays, and quantization leaves the plan's SMs to its copy kernel.
         # The layer has no CPU stage or host statistics, so only the post-MoE
         # hook that releases its plan runs.
         expected = [
+            ("bucket", 6),
             ("statistic", "logical"),
             ("calibrator", "logical"),
             ("route", "replayed logical"),
             ("quantize", {"reserved_sms": 4}),
-            ("bucket", 6),
             ("run_moe", "physical", plan),
             "start_set_cpu",
         ]
     elif mode == "standard":
         expected = [
             "start_wait_gpu",
+            ("bucket", 6),
             "done_wait_gpu",
             ("update_statistic", "logical"),
             ("route", "logical"),
             ("statistic", "slots"),
             ("calibrator", "slots"),
-            *tail,
+            ("quantize", {}),
             ("run_moe", "replayed slots", None),
             "start_set_cpu",
             "done_set_cpu",
@@ -2502,9 +2505,10 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     else:
         expected = [
             "start_wait_gpu",
+            ("bucket", 6),
             ("statistic", "logical"),
             ("calibrator", "logical"),
-            *tail,
+            ("quantize", {}),
             ("run_moe", "replayed logical", None),
             "start_set_cpu",
             "done_set_cpu",
