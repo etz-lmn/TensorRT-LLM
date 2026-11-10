@@ -821,6 +821,11 @@ class DecoderRunner(ScheduledModelRunner):
                 moe_load_balancer.release_hold_if_decode(
                     contexts or [semantic_requests.num_context_requests]
                 )
+            # Experiment hook: a load balancer that counts decode passes alone keeps the statistic
+            # off in a forward that runs eagerly. graph_key is the decision attention DP agreed on
+            # every rank, so every rank counts the same forwards.
+            if moe_load_balancer is not None:
+                moe_load_balancer.set_decode_pass(graph_key is not None)
             captures_model_body = self._graphs.captures_model_body(graph_key)
             outputs = self._graphs.run(
                 graph_key,

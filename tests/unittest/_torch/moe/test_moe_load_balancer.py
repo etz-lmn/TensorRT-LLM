@@ -680,5 +680,107 @@ def test_hold_until_decode_starts_at_the_first_forward_without_contexts(
         False, True)
 
 
+def _decode_balancer(hold: bool) -> tuple[MoeLoadBalancer, list]:
+    """A held or unheld balancer that counts decode passes only, without its
+    C++ side (_held_balancer)."""
+    balancer, calls = _held_balancer(hold)
+    balancer._decode_statistics = True
+    balancer._statistic_request = False
+    balancer.eager_statistic_iters_skipped = 0
+    return balancer, calls
+
+
+def _decode_forward(balancer: MoeLoadBalancer, context_requests: list,
+                    graph_replay: bool) -> None:
+    """One engine forward as the decoder runner drives it: the hold, then
+    whether the forward replays a captured graph, then the iteration."""
+    if balancer.holds_until_decode():
+        balancer.release_hold_if_decode(context_requests)
+    balancer.set_decode_pass(graph_replay)
+    with MoeLoadBalancerIterContext(balancer):
+        pass
+
+
+def _count_iters(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(MoeLoadBalancer, "end_iter",
+                        lambda self: setattr(self, "iter_id", self.iter_id + 1)
+                        or setattr(self, "in_iter", False))
+
+
+@pytest.mark.cpu_only
+def test_decode_passes_only_is_off_unless_set(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the switch an eager forward keeps the statistic the engine
+    asks for."""
+    _count_iters(monkeypatch)
+    balancer, calls = _decode_balancer(hold=False)
+    balancer._decode_statistics = False
+    balancer.set_iter_info(True, True)
+    _decode_forward(balancer, [3, 0], graph_replay=False)
+    assert calls == [(0, True, True)]
+    assert balancer.eager_statistic_iters_skipped == 0
+
+
+@pytest.mark.cpu_only
+def test_decode_passes_only_counts_graph_replays(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A forward that runs eagerly passes the statistic off and the weight
+    updates as asked; a graph replay passes both as asked; warmup stays off
+    and is not counted as skipped."""
+    _count_iters(monkeypatch)
+    balancer, calls = _decode_balancer(hold=False)
+    balancer.set_iter_info(False, False)  # warmup
+    _decode_forward(balancer, [0, 0], graph_replay=True)
+    balancer.set_iter_info(True, True)  # warmup ends
+    for contexts, graph in (([0, 0], True), ([4, 0], False), ([0, 0], True),
+                            ([0, 1], False)):
+        _decode_forward(balancer, contexts, graph)
+    assert calls == [(0, False, False), (1, True, True), (2, False, True),
+                     (3, True, True), (4, False, True)]
+    assert balancer.eager_statistic_iters_skipped == 2
+
+
+@pytest.mark.cpu_only
+def test_decode_passes_only_after_the_hold(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The hold keeps both flags off until the first forward with no context
+    request on any rank; after it, eager forwards are not counted."""
+    _count_iters(monkeypatch)
+    balancer, calls = _decode_balancer(hold=True)
+    balancer.set_iter_info(False, False)  # warmup
+    _decode_forward(balancer, [0, 0], graph_replay=True)
+    balancer.set_iter_info(True, True)  # warmup ends
+    for contexts, graph in (([8, 8], False), ([0, 0], True), ([2, 0], False),
+                            ([0, 0], True)):
+        _decode_forward(balancer, contexts, graph)
+    assert calls == [(0, False, False), (1, False, False), (2, True, True),
+                     (3, False, True), (4, True, True)]
+    assert balancer.eager_statistic_iters_skipped == 1
+
+
+@pytest.mark.cpu_only
+def test_decode_passes_only_flag_is_set_before_start_iter(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reader that wraps start_iter and reads enable_statistic there, such
+    as a row counter outside the balancer, sees in every forward the
+    statistic flag the C++ balancer receives."""
+    _count_iters(monkeypatch)
+    seen = []
+    start_iter = MoeLoadBalancer.start_iter
+
+    def observed(self):
+        seen.append(self.enable_statistic)
+        return start_iter(self)
+
+    monkeypatch.setattr(MoeLoadBalancer, "start_iter", observed)
+    balancer, calls = _decode_balancer(hold=True)
+    balancer.set_iter_info(True, True)
+    for contexts, graph in (([8, 0], False), ([0, 0], True), ([0, 3], False),
+                            ([0, 0], True), ([1, 1], False)):
+        _decode_forward(balancer, contexts, graph)
+    assert seen == [statistic for _, statistic, _ in calls]
+    assert seen == [False, True, False, True, False]
+
+
 if __name__ == '__main__':
     unittest.main()

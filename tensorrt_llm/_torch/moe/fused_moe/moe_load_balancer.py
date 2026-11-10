@@ -849,6 +849,10 @@ class BaseMoeLoadBalancer(ABC):
         held until decoding returns True."""
         return False
 
+    def set_decode_pass(self, graph_replay: bool) -> None:
+        """Whether the next forward replays a captured CUDA graph. Only a
+        balancer that counts decode passes alone acts on it."""
+
     def __enter__(self):
         """
         Enter the context manager.
@@ -931,6 +935,16 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         # flags the engine asks for wait in _held_iter_info.
         self._held_iter_info = ((False, False) if os.getenv(
             'TRTLLM_EPLB_HOLD_UNTIL_DECODE') == '1' else None)
+        # Experiment hook: with TRTLLM_EPLB_DECODE_STATISTICS=1, statistics
+        # count only the forwards that replay a captured CUDA graph, the
+        # decode passes of a generation-only server (set_decode_pass).
+        self._decode_statistics = os.getenv(
+            'TRTLLM_EPLB_DECODE_STATISTICS') == '1'
+        self._statistic_request = False
+        self.eager_statistic_iters_skipped = 0
+        if self._decode_statistics:
+            logger.info("MoE load balancer counts decode passes only: the "
+                        "statistic is off in forwards that run eagerly")
         self.enable_statistic = False
         self.enable_update_weights = False
 
@@ -1054,6 +1068,8 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
 
     def set_iter_info(self, enable_statistic: Optional[bool],
                       enable_update_weights: Optional[bool]):
+        if enable_statistic is not None:
+            self._statistic_request = enable_statistic
         if self._held_iter_info is None:
             super().set_iter_info(enable_statistic, enable_update_weights)
             return
@@ -1079,6 +1095,21 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
             "MoE load balancer hold released at iteration %d, the first "
             "forward with no context request on any rank", self.iter_id)
         return True
+
+    def set_decode_pass(self, graph_replay: bool) -> None:
+        """Count decode passes only: the statistic the engine asks for holds
+        in a forward that replays a captured CUDA graph and is off in one that
+        runs eagerly. Under attention DP a forward runs eagerly on every rank
+        as soon as one rank runs a context request, and every rank takes the
+        same decision, so the statistics of the ranks stay identical. The
+        flag is set before start_iter, so whatever reads enable_statistic
+        there sees the flag the C++ balancer gets. Weight updates and the
+        hold are unchanged."""
+        if not self._decode_statistics or self._held_iter_info is not None:
+            return
+        self.enable_statistic = self._statistic_request and graph_replay
+        if self._statistic_request and not graph_replay:
+            self.eager_statistic_iters_skipped += 1
 
     def start_iter(self):
         """
@@ -1108,6 +1139,10 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         local_safe = bool(local_safe and not self.in_iter)
         if not all(self.shared_mpi_comm.allgather(local_safe)):
             return False
+        if self._decode_statistics:
+            logger.info(
+                "MoE load balancer decode passes only: %d eager forwards "
+                "not counted", self.eager_statistic_iters_skipped)
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_pre_shutdown_cleanup()
         self.load_balancer_impl.shutdown()
