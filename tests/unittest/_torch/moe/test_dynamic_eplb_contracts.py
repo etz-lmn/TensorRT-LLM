@@ -2441,7 +2441,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         )
     )
 
-    def route(routes, use_dp):
+    def route(routes, use_dp, token_final_scales=None):
         trace.append(("route", routes.name))
         return _ChunkRoutes("physical" if mode == "per_layer_dynamic" else "slots")
 
