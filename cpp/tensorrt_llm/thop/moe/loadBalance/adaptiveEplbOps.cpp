@@ -95,22 +95,29 @@ void routeInto(at::Tensor const& ids, kernels::AdaptiveEplbRouteTables const& ta
     }
 }
 
-kernels::AdaptiveEplbStats checkStats(
-    at::Tensor const& ids, at::Tensor& rows, at::Tensor& forwards, at::Tensor const& enabled, bool first)
+kernels::AdaptiveEplbStats checkStats(at::Tensor const& ids, at::Tensor& rows, at::Tensor& forwards,
+    at::Tensor const& enabled, bool first, std::optional<at::Tensor> const& liveRowWord)
 {
     checkVector(rows, at::kFloat, ids, "rows");
     checkVector(forwards, at::kLong, ids, "forwards");
     checkVector(enabled, at::kInt, ids, "enabled");
     TORCH_CHECK(forwards.numel() == 1 && enabled.numel() == 1, "forwards and enabled must be one word each");
-    return {rows.data_ptr<float>(), forwards.data_ptr<int64_t>(), enabled.data_ptr<int>(), first};
+    int const* liveRowWordPtr = nullptr;
+    if (liveRowWord.has_value())
+    {
+        checkVector(*liveRowWord, at::kInt, ids, "live_row_word");
+        TORCH_CHECK(liveRowWord->numel() == 1, "live_row_word must be one word");
+        liveRowWordPtr = liveRowWord->data_ptr<int>();
+    }
+    auto const topK = static_cast<int>(ids.dim() > 0 ? ids.size(-1) : 1);
+    return {rows.data_ptr<float>(), forwards.data_ptr<int64_t>(), enabled.data_ptr<int>(), first, liveRowWordPtr, topK};
 }
 
 template <typename IdT>
-void record(at::Tensor const& ids, at::Tensor& rows, at::Tensor& forwards, at::Tensor const& enabled, bool first)
+void record(at::Tensor const& ids, kernels::AdaptiveEplbStats const& stats, int numExperts)
 {
-    kernels::adaptiveEplbRecord(ids.data_ptr<IdT>(), ids.numel(), static_cast<int>(rows.numel()),
-        rows.data_ptr<float>(), forwards.data_ptr<int64_t>(), enabled.data_ptr<int>(), first,
-        at::cuda::getCurrentCUDAStream(ids.get_device()));
+    kernels::adaptiveEplbRecord(ids.data_ptr<IdT>(), ids.numel(), numExperts, stats.rows, stats.forwards, stats.enabled,
+        stats.first, stats.liveRowWord, stats.topK, at::cuda::getCurrentCUDAStream(ids.get_device()));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -121,11 +128,12 @@ void record(at::Tensor const& ids, at::Tensor& rows, at::Tensor& forwards, at::T
 //! ([tokens, top_k] float32 gate weights) and weights_out ([rows, >= top_k] float32, unit column stride), out is a
 //! bucket of rows >= tokens rows whose elements after the ids get slot -1 and weight 0; without them, out has exactly
 //! the ids' elements. With rows, forwards and enabled, the launch adds the ids to the statistics as
-//! adaptive_eplb_record does.
+//! adaptive_eplb_record does, with live_row_word only the ids of the forward's live rows.
 void adaptiveEplbRouteInto(at::Tensor const& ids, at::Tensor const& counts, at::Tensor const& starts,
     at::Tensor const& slots, at::Tensor const& cumulativeShares, int64_t epRank, at::Tensor& out,
     std::optional<at::Tensor> const& weights, std::optional<at::Tensor> weightsOut, std::optional<at::Tensor> rows,
-    std::optional<at::Tensor> forwards, std::optional<at::Tensor> const& enabled, bool first)
+    std::optional<at::Tensor> forwards, std::optional<at::Tensor> const& enabled, bool first,
+    std::optional<at::Tensor> const& liveRowWord)
 {
     auto const tables = checkTables(ids, counts, starts, slots, cumulativeShares, epRank);
     TORCH_CHECK(out.is_contiguous() && out.device() == ids.device() && out.numel() >= ids.numel(),
@@ -154,26 +162,28 @@ void adaptiveEplbRouteInto(at::Tensor const& ids, at::Tensor const& counts, at::
         "rows, forwards and enabled go together");
     if (rows.has_value())
     {
-        stats = checkStats(ids, *rows, *forwards, *enabled, first);
+        stats = checkStats(ids, *rows, *forwards, *enabled, first, liveRowWord);
     }
     routeInto(ids, tables, epRank, out, staging, stats);
 }
 
 //! Add expert ids to a layer's statistics while enabled[0] is set: every call adds its per-expert counts to rows,
-//! and the first call of a forward (not a further chunk or repeat) also increments forwards.
-void adaptiveEplbRecord(
-    at::Tensor const& ids, at::Tensor& rows, at::Tensor& forwards, at::Tensor const& enabled, bool first)
+//! and the first call of a forward (not a further chunk or repeat) also increments forwards. With live_row_word, only
+//! the ids of the forward's live rows are counted.
+void adaptiveEplbRecord(at::Tensor const& ids, at::Tensor& rows, at::Tensor& forwards, at::Tensor const& enabled,
+    bool first, std::optional<at::Tensor> const& liveRowWord)
 {
     checkIds(ids);
-    checkStats(ids, rows, forwards, enabled, first);
+    auto const stats = checkStats(ids, rows, forwards, enabled, first, liveRowWord);
     auto const contiguousIds = ids.contiguous();
+    auto const numExperts = static_cast<int>(rows.numel());
     if (ids.scalar_type() == at::kLong)
     {
-        record<int64_t>(contiguousIds, rows, forwards, enabled, first);
+        record<int64_t>(contiguousIds, stats, numExperts);
     }
     else
     {
-        record<int32_t>(contiguousIds, rows, forwards, enabled, first);
+        record<int32_t>(contiguousIds, stats, numExperts);
     }
 }
 
@@ -186,10 +196,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "adaptive_eplb_route_into(Tensor ids, Tensor counts, Tensor starts, Tensor slots, Tensor cumulative_shares, "
         "int ep_rank, Tensor(a!) out, Tensor? weights=None, Tensor(b!)? weights_out=None, Tensor(c!)? rows=None, "
-        "Tensor(d!)? forwards=None, Tensor? enabled=None, bool first=True) -> ()");
+        "Tensor(d!)? forwards=None, Tensor? enabled=None, bool first=True, Tensor? live_row_word=None) -> ()");
     m.def(
         "adaptive_eplb_record(Tensor ids, Tensor(a!) rows, Tensor(b!) forwards, Tensor enabled, "
-        "bool first=True) -> ()");
+        "bool first=True, Tensor? live_row_word=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

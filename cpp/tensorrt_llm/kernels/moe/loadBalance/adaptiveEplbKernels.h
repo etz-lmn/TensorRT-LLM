@@ -59,6 +59,9 @@ struct AdaptiveEplbStats
     int64_t* forwards;
     int const* enabled;
     bool first;
+    //! The forward's live-row word, or null: only the ids of its live rows of topK ids are counted.
+    int const* liveRowWord;
+    int topK;
 };
 
 //! Route the flat [count] expert ids of one EP rank to slots.
@@ -82,9 +85,12 @@ void adaptiveEplbRoute(IdT const* ids, int64_t count, int epRank, AdaptiveEplbRo
 //! Otherwise every call adds n[e], the number of ids equal to e (ids outside [0, numExperts) are not counted), to
 //! rows[e], which stays an exact integer below 2^24; the first call of a forward (not a further chunk or repeat)
 //! also increments forwards[0]. One block counts the ids.
+//! With a live-row word (tensorrt_llm/_torch/moe/live_rows.py: R real of P requests), only the ids of the live rows
+//! of the count / topK rows are counted: none when P is 0, all when R >= P or P does not divide them, else rows / P *
+//! R.
 template <typename IdT>
 void adaptiveEplbRecord(IdT const* ids, int64_t count, int numExperts, float* rows, int64_t* forwards,
-    int const* enabled, bool first, cudaStream_t stream);
+    int const* enabled, bool first, int const* liveRowWord, int topK, cudaStream_t stream);
 
 } // namespace kernels
 
