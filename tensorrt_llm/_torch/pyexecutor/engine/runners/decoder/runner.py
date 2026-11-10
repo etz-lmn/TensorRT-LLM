@@ -811,6 +811,9 @@ class DecoderRunner(ScheduledModelRunner):
             pending_beam_histories = self._start_beam_histories(semantic_requests)
 
             graph_key = key if can_run_graph else None
+            # Experiment hook: the CUDA graph this forward runs (None: eager), reported with the
+            # other per-iteration states in the iteration log.
+            self._iter_states["cuda_graph_key"] = graph_key
             # Warmup and capture keep every row; a graph's requests own equal rows unless its key
             # mixes in contexts or ragged verification.
             self._live_rows.write(
