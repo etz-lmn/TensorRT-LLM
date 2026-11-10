@@ -47,8 +47,10 @@ def route(ids, counts, starts, slots, cumulative_shares, ep_rank) -> list:
     return out
 
 
-def record(ids, rows, forwards, enabled, first=True) -> None:
-    """Add the ids to ``rows`` and, on a forward's first call, one to ``forwards``, in place."""
+def record(ids, rows, forwards, enabled, first=True, live_row_word=None) -> None:
+    """Add the ids to ``rows`` and, on a forward's first call, one to ``forwards``, in place (CPU
+    tensors: no live-row word)."""
+    assert live_row_word is None
     if int(enabled[0]) == 0:
         return
     flat = ids.reshape(-1).to(torch.int64).cpu().numpy()
@@ -73,6 +75,7 @@ def route_into(
     forwards=None,
     enabled=None,
     first=True,
+    live_row_word=None,
 ):
     """``torch.ops.trtllm.adaptive_eplb_route_into`` on CPU tensors."""
     tables = [t.tolist() for t in (counts, starts, slots)]
@@ -86,4 +89,4 @@ def route_into(
         weights_out[: ids.shape[0], :top_k] = weights
         weights_out[ids.shape[0] : flat.numel() // top_k, :top_k] = 0.0
     if rows is not None:
-        record(ids, rows, forwards, enabled, first)
+        record(ids, rows, forwards, enabled, first, live_row_word)
