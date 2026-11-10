@@ -79,6 +79,32 @@ def test_decode_time_model_streams_the_expert_bytes_and_prices_the_row_flops():
         IMPL.decode_time_model(backend, 37158924, "NVIDIA A100")
 
 
+def test_a_calibration_prices_any_gpu_and_its_identity_resolves_tactics_without_a_launch(
+    monkeypatch,
+):
+    backend = SimpleNamespace(
+        hidden_size=64,
+        expand_intermediate_size_per_partition=64,
+        intermediate_size_per_partition=32,
+        _select_launch_max_tokens=lambda tokens: 256,
+        _use_in_kernel_fc2_reduce=lambda max_tokens: False,
+        apply_topk_in_fc1=False,
+        combine_format="16e2m1xbf16",
+        tactic_autotune=False,
+        routing_method=SimpleNamespace(experts_per_token=6),
+    )
+    model = IMPL.decode_time_model(backend, 1000, "NVIDIA B200", (1e12, 1e15, 0.7))
+    assert model["per_active_slot_us"] == pytest.approx(1e-3) and model["scale"] == 0.7
+    monkeypatch.setattr(mm, "get_sm_version", lambda: 103)
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
+
+    tactic = repr(op._unpack_tactic(op._MEGAMOE_NONBULK_STANDALONE_TACTIC))
+    identity = IMPL.decode_calibration_identity(backend, [32, 1024])
+    assert identity["tactics"] == {"32": tactic, "1024": tactic} and identity["top_k"] == 6
+    backend.tactic_autotune = True
+    assert IMPL.decode_calibration_identity(backend, [32])["tactics"] == {"32": "autotune"}
+
+
 def test_route_staging_hands_out_the_staging_of_a_run_that_stages():
     """``route_staging`` (routes) and ``_staging_of_next_run`` hand out a bucket's staging only for
     a forward that ``run_moe`` would stage."""
