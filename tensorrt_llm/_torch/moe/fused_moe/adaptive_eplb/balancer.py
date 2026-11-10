@@ -335,7 +335,10 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         )
         geometry = ExpertGeometry(self.layers[0].expert_count, self.num_slots, self.ep_size)
         copy_ms = time_layer_copy(transport, first, geometry, self.copy_stream)
-        logger.info(f"adaptive EPLB: one layer's install copy takes {copy_ms:.3f} ms at start-up")
+        logger.info(
+            f"adaptive EPLB balances {len(self.layers)} MoE layers; one layer's install copy "
+            f"takes {copy_ms:.3f} ms at start-up"
+        )
         self.start_runtime(TimeModel(**time_model), self.mapping.gpus_per_node, copy_ms)
 
     def platform_gap(self, backend: AdaptiveEplbBackend) -> str | None:
