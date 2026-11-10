@@ -176,6 +176,24 @@ __device__ __forceinline__ void storeRoute(
     }
 }
 
+// The ids of the live rows among count ids in rows of topK (adaptiveEplbRecord); every id without a word.
+__device__ __forceinline__ int64_t liveIdCount(int const* liveRowWord, int64_t count, int topK)
+{
+    if (liveRowWord == nullptr)
+    {
+        return count;
+    }
+    int const word = __ldg(liveRowWord);
+    int const real = word & 0xFFFF;
+    int const requests = (word >> 16) & 0xFFFF;
+    int64_t const rows = count / topK;
+    if (requests == 0)
+    {
+        return 0;
+    }
+    return real >= requests || rows % requests != 0 ? count : rows / requests * real * topK;
+}
+
 __device__ __forceinline__ void addCounts(int const* counts, int numExperts, float* rows, int64_t* forwards, bool first)
 {
     for (int e = threadIdx.x; e < numExperts; e += blockDim.x)
@@ -243,7 +261,7 @@ __global__ void __launch_bounds__(kTileThreads)
     int const numSlots = tables.numSlots;
     if (stats.rows != nullptr && blockIdx.x == gridDim.x - 1)
     {
-        if (countIds(ids, 0, count, numExperts, stats.enabled, shared))
+        if (countIds(ids, 0, liveIdCount(stats.liveRowWord, count, stats.topK), numExperts, stats.enabled, shared))
         {
             addCounts(shared, numExperts, stats.rows, stats.forwards, stats.first);
         }
@@ -406,10 +424,10 @@ __global__ void __launch_bounds__(kTileThreads)
 template <typename IdT>
 __global__ void __launch_bounds__(kRecordThreads)
     adaptiveEplbRecordKernel(IdT const* __restrict__ ids, int64_t count, int numExperts, float* __restrict__ rows,
-        int64_t* __restrict__ forwards, int const* __restrict__ enabled, bool first)
+        int64_t* __restrict__ forwards, int const* __restrict__ enabled, bool first, int const* liveRowWord, int topK)
 {
     extern __shared__ int histogram[];
-    if (countIds(ids, 0, count, numExperts, enabled, histogram))
+    if (countIds(ids, 0, liveIdCount(liveRowWord, count, topK), numExperts, enabled, histogram))
     {
         addCounts(histogram, numExperts, rows, forwards, first);
     }
@@ -434,12 +452,12 @@ void adaptiveEplbRoute(IdT const* ids, int64_t count, int epRank, AdaptiveEplbRo
 
 template <typename IdT>
 void adaptiveEplbRecord(IdT const* ids, int64_t count, int numExperts, float* rows, int64_t* forwards,
-    int const* enabled, bool first, cudaStream_t stream)
+    int const* enabled, bool first, int const* liveRowWord, int topK, cudaStream_t stream)
 {
     size_t const bytes = static_cast<size_t>(numExperts) * sizeof(int);
     allowSharedBytes<adaptiveEplbRecordKernel<IdT>>(bytes);
-    adaptiveEplbRecordKernel<IdT>
-        <<<1, kRecordThreads, bytes, stream>>>(ids, count, numExperts, rows, forwards, enabled, first);
+    adaptiveEplbRecordKernel<IdT><<<1, kRecordThreads, bytes, stream>>>(
+        ids, count, numExperts, rows, forwards, enabled, first, liveRowWord, topK);
 }
 
 #define INSTANTIATE_ADAPTIVE_EPLB_ROUTE(IdT, OutT)                                                                     \
@@ -452,7 +470,8 @@ INSTANTIATE_ADAPTIVE_EPLB_ROUTE(int64_t, int32_t)
 INSTANTIATE_ADAPTIVE_EPLB_ROUTE(int64_t, int64_t)
 
 #define INSTANTIATE_ADAPTIVE_EPLB_RECORD(IdT)                                                                          \
-    template void adaptiveEplbRecord<IdT>(IdT const*, int64_t, int, float*, int64_t*, int const*, bool, cudaStream_t);
+    template void adaptiveEplbRecord<IdT>(                                                                             \
+        IdT const*, int64_t, int, float*, int64_t*, int const*, bool, int const*, int, cudaStream_t);
 
 INSTANTIATE_ADAPTIVE_EPLB_RECORD(int32_t)
 INSTANTIATE_ADAPTIVE_EPLB_RECORD(int64_t)
