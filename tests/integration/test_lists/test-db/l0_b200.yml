@@ -253,6 +253,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_tactic_autotune_defaults_off
   - unittest/_torch/moe/test_moe_backend.py::test_enumerate_megamoe_candidate_tactics_curated_space
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_helper_bearing_candidates_offer_atomic_counter_work_ids
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_helper_bearing_candidates_pair_token_tile_tactics
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_helper_bearing_work_ids_keep_sm107_candidates
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
