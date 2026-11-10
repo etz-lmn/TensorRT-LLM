@@ -2524,6 +2524,16 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
                 spec_dec_algo=llm.args.speculative_config.decoding_type)
             assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            if load_balancer is not None:
+                # Unscored decode-only burst: every rank's batch at once, no
+                # refill, full output budget; the evaluation reads its own stats.
+                batch = llm.args.tensor_parallel_size * llm.args.max_batch_size
+                llm.generate(
+                    load_dataset(GSM8K.DATASET_DIR, "main",
+                                 split="test")["question"][:batch],
+                    SamplingParams(max_tokens=GSM8K.MAX_OUTPUT_LEN,
+                                   ignore_eos=True))
+                llm.get_stats(timeout=2)
             with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
                 task.evaluate(llm, prepared_evaluator=evaluator)
             # Gate on acceptance as well as on the score: a drafter regression
