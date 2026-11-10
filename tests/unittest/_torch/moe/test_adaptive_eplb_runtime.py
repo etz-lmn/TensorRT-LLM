@@ -578,7 +578,7 @@ def test_updates_copy_once_and_a_cost_jump_does_not_hold_back_the_correction(mon
 
 def test_first_update_moves_all_paying_layers_and_corrections_are_judged_out_of_sample(monkeypatch):
     monkeypatch.setattr(rt, "solve_shares", even_split)
-    decision = FakeDecision(0, copy_ms=0.5)  # untimed, the first update moves one layer to time one
+    decision = FakeDecision(0, copy_ms=0.5)  # timed at start-up: the first update moves both layers
     window_stats(decision.stats.numpy())  # GPU 0's experts 0 and 1 are hot
     decision.decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
     assert decision.decider.decide(0).moved == [0, 1]
