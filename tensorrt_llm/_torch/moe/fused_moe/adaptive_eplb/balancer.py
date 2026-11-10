@@ -8,13 +8,22 @@ is needed per step.
 
 from __future__ import annotations
 
+import ctypes
+import hashlib
+import json
+import socket
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pynvml
 import torch
 import torch.distributed as dist
 
+import tensorrt_llm
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
 from ...live_rows import current_word
@@ -30,6 +39,7 @@ from .policy import (
 from .runtime import AdaptiveRuntime, DecisionConfig, DecisionProcess
 from .transport import (
     PeerSlotTransport,
+    _plan_layer,
     find_backends,
     migrate_model_weights,
     peer_copy_gap,
@@ -66,6 +76,94 @@ def time_layer_copy(
         transport.copy(experts, stream, start, end)
         end.synchronize()
     return max(transport.allgather(start.elapsed_time(end)))
+
+
+CALIBRATION = ("tensorrt_llm.adaptive_eplb.decode_time_model", 1)
+"""Schema and version of a calibration file of the decode time model."""
+
+
+def nvlink_domain_error(comm: object) -> tuple[str | None, int]:
+    """Why the EP group of ``comm`` is not one NVLink domain (``None`` when it is), and its hosts.
+
+    Every GPU needs its NVLink up (``MnnvlMemory.supports_mnnvl``); a group over several hosts
+    needs one NVLink fabric (MNNVL): the same NVML fabric cluster and clique on every GPU.
+    Collective over ``comm``.
+    """
+    up, fabric = False, None
+    try:  # every rank reaches the vote below: a failure here only marks this GPU
+        up = MnnvlMemory.supports_mnnvl()
+        pynvml.nvmlInit()
+        info = pynvml.c_nvmlGpuFabricInfoV_t()  # pynvml structures take no keyword arguments
+        info.version = pynvml.nvmlGpuFabricInfo_v2
+        handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+        pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(info))
+        if info.state == pynvml.NVML_GPU_FABRIC_STATE_COMPLETED:
+            fabric = (bytes(info.clusterUuid).hex(), int(info.cliqueId))
+    except (
+        pynvml.NVMLError,
+        RuntimeError,
+        AttributeError,
+        TypeError,
+        ValueError,
+        ctypes.ArgumentError,
+    ):
+        pass
+    views = comm.allgather((up, socket.gethostname(), fabric))
+    hosts = len({host for _, host, _ in views})
+    if not all(up for up, _, _ in views):
+        return "a GPU of the EP group has no NVLink with all links up", hosts
+    if hosts > 1 and (views[0][2] is None or len({f for _, _, f in views}) > 1):
+        return "the EP group spans hosts that share no NVLink fabric (MNNVL)", hosts
+    return None, hosts
+
+
+def calibration_identity(backend: object, ep_size: int, hosts: int, tokens: Sequence[int]) -> dict:
+    """What a calibration holds for: the GPU, the EP group and the backend's decode kernels."""
+    return dict(
+        device=torch.cuda.get_device_name(),
+        sm=get_sm_version(),
+        sm_count=torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count,
+        ep_size=int(ep_size),
+        hosts=int(hosts),
+        **backend.decode_calibration_identity(list(tokens)),
+    )
+
+
+def load_time_model(
+    backend: object, path: str | None, expert_bytes: int, identity: dict, tokens: Sequence[int]
+) -> tuple[TimeModel | None, str | None]:
+    """The decode time model of ``backend`` from the calibration file at ``path``, a scale per
+    CUDA graph bucket, or else its built-in calibration; ``(None, why)`` when neither holds for
+    the ``identity`` of this run or a decode bucket of ``tokens`` tokens per GPU."""
+    device = identity["device"]
+    if path is None:
+        if backend.has_decode_time_model(device):
+            return TimeModel(**backend.decode_time_model(expert_bytes, device)), None
+        return None, f"no calibration file (time_model_file) and no built-in one for {device!r}"
+    doc = json.loads(Path(path).read_text())
+    if (doc.get("schema"), doc.get("version")) != CALIBRATION:
+        return None, f"{path} is not a calibration file of version {CALIBRATION[1]}"
+    theirs = doc["identity"]
+    wrong = [key for key in identity if key != "tactics" and theirs.get(key) != identity[key]]
+    scales = {int(b["tokens"]): float(b["scale"]) for b in doc["buckets"]}
+    wrong += [f"bucket {t}" for t in tokens if t not in scales]
+    wrong += [
+        f"tactic of bucket {t}"
+        for t in tokens
+        if t in scales and theirs["tactics"].get(str(t)) != identity["tactics"][str(t)]
+    ]
+    if wrong:
+        return None, f"{path} does not hold for this run: {', '.join(wrong)} differ or are missing"
+    rates = (doc["rates"]["hbm_bytes_per_s"], doc["rates"]["fp4_dense_flops_per_s"], 1.0)
+    fields = backend.decode_time_model(expert_bytes, device, rates)
+    by_rows = tuple((t * identity["top_k"], k) for t, k in sorted(scales.items()))
+    if doc["measurement"].get("trtllm_version") != tensorrt_llm.__version__:
+        logger.warning(
+            f"{path} was measured with TensorRT LLM {doc['measurement'].get('trtllm_version')}"
+        )
+    return TimeModel(**dict(fields, scale=by_rows[-1][1]), scales=by_rows), None
 
 
 class AdaptiveMoeLayerLoadBalancer:
@@ -307,21 +405,42 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
     finalize_model = _nothing_before_runtime
     set_warm_up_iter_count = _nothing_before_runtime
 
-    def prepare_runtime(self, model: torch.nn.Module) -> None:
-        """Move the slot weights into MNNVL memory, time one layer's install copy
-        (:func:`time_layer_copy`) and start the runtime under the backend's time model. Collective
-        over EP; runs before the KV cache is sized.
+    def prepare_runtime(self, model: torch.nn.Module, decode_tokens: Sequence[int] = ()) -> None:
+        """Check the deployment, move the slot weights into MNNVL memory, time one layer's install
+        copy (:func:`time_layer_copy`) and start the runtime under the backend's time model.
+        Collective over EP; runs before the KV cache is sized.
 
-        Where any EP rank cannot run adaptive EPLB (:meth:`platform_gap`), every rank logs why and
-        keeps it off: the layers serve their home layouts and record no statistics.
+        ``decode_tokens`` are the tokens per GPU per forward of every CUDA graph bucket the
+        deployment decodes in. Every rank checks, without a kernel launch, that the EP group is one
+        NVLink domain (:func:`nvlink_domain_error`), that it can copy experts from every EP rank
+        (:meth:`platform_gap`) and that a calibration holds for this run (:func:`load_time_model`);
+        the ranks vote, and where any check fails on any rank, every rank logs why and keeps
+        adaptive EPLB off: the layers serve their home layouts and record no statistics.
         """
         backends = find_backends(model, self.layers)
         first = self.layers[0].layer_idx
+        backend = backends[first]
         device = torch.device("cuda", torch.cuda.current_device())
         prepare_layers(backends, self.layers, device)
         transport = PeerSlotTransport(self.mapping)
-        gaps = transport.allgather(self.platform_gap(backends[first]))
-        stopped = [f"{gap} (EP rank {rank})" for rank, gap in enumerate(gaps) if gap is not None]
+        why, hosts = nvlink_domain_error(transport)
+        why = why or self.platform_gap(backend)
+        time_model, path, digest = None, self.config.time_model_file, ""
+        if why is None:
+            try:  # every rank reaches the vote: a failure here turns adaptive EPLB off everywhere
+                identity = calibration_identity(backend, self.ep_size, hosts, decode_tokens)
+                expert_bytes = _plan_layer(first, backend).expert_bytes
+                time_model, why = load_time_model(
+                    backend, path, expert_bytes, identity, decode_tokens
+                )
+                if time_model is not None and path is not None:
+                    digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                why = f"{type(error).__name__}: {error}"
+        votes = transport.allgather((why, digest))
+        stopped = [f"{gap} (EP rank {rank})" for rank, (gap, _) in enumerate(votes) if gap]
+        if not stopped and len({file for _, file in votes}) > 1:
+            stopped = [f"the EP ranks read different files at {path}"]
         if stopped:
             self.off_reason = stopped[0]
             logger.warning(
@@ -330,24 +449,18 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
             return
         self.transport = transport
         self.copy_stream = migrate_model_weights(backends, transport, device)
-        time_model = backends[first].decode_time_model(
-            transport.expert_bytes(first), torch.cuda.get_device_name()
-        )
         geometry = ExpertGeometry(self.layers[0].expert_count, self.num_slots, self.ep_size)
         copy_ms = time_layer_copy(transport, first, geometry, self.copy_stream)
         logger.info(
             f"adaptive EPLB balances {len(self.layers)} MoE layers; one layer's install copy "
             f"takes {copy_ms:.3f} ms at start-up"
         )
-        self.start_runtime(TimeModel(**time_model), self.mapping.gpus_per_node, copy_ms)
+        self.start_runtime(time_model, self.mapping.gpus_per_node, copy_ms)
 
     def platform_gap(self, backend: AdaptiveEplbBackend) -> str | None:
-        """Why adaptive EPLB cannot run on this rank, or ``None``: the backend's decode time model
-        needs a calibration for this GPU, and the installs copy experts from every EP rank
-        (:func:`~.transport.peer_copy_gap`)."""
-        device_name = torch.cuda.get_device_name()
-        if not backend.has_decode_time_model(device_name):
-            return f"{type(backend).__name__} has no decode time model calibrated on {device_name}"
+        """Why the installs cannot run on this rank, or ``None``: they copy experts from every EP
+        rank (:func:`~.transport.peer_copy_gap`). Whether a time model prices ``backend`` on this
+        GPU is :func:`load_time_model`'s check."""
         return peer_copy_gap(self.mapping)
 
     def start_runtime(

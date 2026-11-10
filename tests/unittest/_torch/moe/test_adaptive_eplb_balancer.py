@@ -2,13 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests of the adaptive EPLB balancer and of the hooks the MoE modules call on it."""
 
+import importlib.util
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from _torch.moe import adaptive_eplb_reference as reference
 
+import tensorrt_llm
 from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer as base
+from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import balancer as module
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.balancer import AdaptiveMoeLoadBalancer
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
     ExpertStatistics,
@@ -33,8 +39,8 @@ def cpu_ops(monkeypatch):
     monkeypatch.setattr(torch.ops.trtllm, "adaptive_eplb_record", reference.record, raising=False)
 
 
-def _balancer(ep_rank: int = 1) -> AdaptiveMoeLoadBalancer:
-    config = MoeAdaptiveLoadBalancerConfig(num_slots=NUM_SLOTS)
+def _balancer(ep_rank: int = 1, **fields) -> AdaptiveMoeLoadBalancer:
+    config = MoeAdaptiveLoadBalancerConfig(num_slots=NUM_SLOTS, **fields)
     config.setup(ep_rank=ep_rank, ep_size=EP_SIZE)
     return AdaptiveMoeLoadBalancer(ep_rank=ep_rank, ep_size=EP_SIZE, config=config, mapping=None)
 
@@ -168,54 +174,27 @@ def test_layer_route_stages_into_the_backend_and_records_the_statistics():
     assert layer.statistics.forwards.item() == 2
 
 
-def _prepare(monkeypatch, gaps, calibrated=True):
-    """``prepare_runtime`` of rank 0 of a balancer of one layer whose backend has a time model for
-    ``calibrated`` GPUs, the EP ranks reporting ``gaps`` (:meth:`platform_gap`) -> the balancer,
-    its layer and what the runtime start-up saw."""
-    from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import balancer as module
+FIELDS = dict(zip(TimeModel.__dataclass_fields__, (1.0, 2.0, 3.0, 4.0, 0.9, 8)))
 
-    balancer = _balancer(ep_rank=0)
+
+def _prepare(monkeypatch, path=None, tokens=(8, 16), domain=(None, 1), others=(), **fake):
+    """Rank 0's ``prepare_runtime`` on fakes: the NVLink domain check returns ``domain``, the peer
+    copies' check ``fake["gap"]``, the GPU is ``fake["device"]`` and the other ranks vote
+    ``others`` -> the balancer, its layer, what the start-up saw and the warnings."""
+    balancer = _balancer(ep_rank=0, time_model_file=path)
     balancer.mapping = SimpleNamespace(gpus_per_node=4)
     layer = balancer.add_layer(NUM_EXPERTS, TOP_K, NUM_SLOTS // EP_SIZE)
     seen = {}
-    fields = dict(
-        per_active_slot_us=1.0,
-        per_extra_tile_us=2.0,
-        per_row_us=3.0,
-        hot_slot_extra_tile_us=4.0,
-        scale=1.0,
-        tile_rows=8,
-    )
 
-    def decode_time_model(expert_bytes: int, device_name: str) -> dict[str, float]:
-        seen["args"] = (expert_bytes, device_name)
-        return fields
+    def time_model(expert_bytes, device_name, rates=None):
+        seen["priced"] = (expert_bytes, device_name, rates)
+        return dict(FIELDS, scale=rates[2]) if rates else FIELDS
 
     backend = SimpleNamespace(
-        decode_time_model=decode_time_model,
-        has_decode_time_model=lambda device_name: calibrated,
+        has_decode_time_model=lambda name: "GB300" in name,
+        decode_time_model=time_model,
+        decode_calibration_identity=lambda t: dict(top_k=2, tactics={str(n): "a" for n in t}),
         slot_id_dtype=torch.int32,
-    )
-    transport = SimpleNamespace(expert_bytes=lambda index: 1000 + index, ep_rank=0)
-    gathered = []
-
-    def allgather(value):
-        """The platform gaps first, then the copy times, of which the slowest 2.0 is agreed."""
-        gathered.append(value)
-        return gaps if len(gathered) == 1 else [value, 2.0, 1.0, 1.5]
-
-    transport.allgather = allgather
-    transport.copy = lambda experts, *args: seen.setdefault("copies", []).append(experts)
-    event = SimpleNamespace(record=None, synchronize=lambda: None, elapsed_time=lambda end: 0.5)
-    monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: event)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "NVIDIA GB300")
-    monkeypatch.setattr(module, "find_backends", lambda model, layers: {layer.layer_idx: backend})
-    monkeypatch.setattr(module, "PeerSlotTransport", lambda mapping: transport)
-    monkeypatch.setattr(module, "peer_copy_gap", lambda mapping: None)
-    monkeypatch.setattr(
-        module, "migrate_model_weights", lambda *args: seen.update(moved=args) or "stream"
     )
 
     def prepare_layers(backends, layers, device):
@@ -223,34 +202,80 @@ def _prepare(monkeypatch, gaps, calibrated=True):
         for handle in layers:
             handle.prepare_device_state(backends[handle.layer_idx].slot_id_dtype, "cpu")
 
+    transport = SimpleNamespace(allgather=lambda vote: [vote, *others])
+    monkeypatch.setattr(module, "find_backends", lambda model, layers: {layer.layer_idx: backend})
     monkeypatch.setattr(module, "prepare_layers", prepare_layers)
+    monkeypatch.setattr(module, "PeerSlotTransport", lambda mapping: transport)
+    monkeypatch.setattr(module, "nvlink_domain_error", lambda comm: domain)
+    monkeypatch.setattr(module, "peer_copy_gap", lambda mapping: fake.get("gap"))
+    monkeypatch.setattr(module, "_plan_layer", lambda i, b: SimpleNamespace(expert_bytes=1000 + i))
+    monkeypatch.setattr(
+        torch.cuda, "get_device_name", lambda: f"NVIDIA {fake.get('device', 'GB300')}"
+    )
+    monkeypatch.setattr(module, "get_sm_version", lambda: 103)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    gpu = SimpleNamespace(multi_processor_count=152)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: gpu)
+    monkeypatch.setattr(
+        module, "migrate_model_weights", lambda *a: seen.update(moved=a) or "stream"
+    )
+    monkeypatch.setattr(module, "time_layer_copy", lambda *args: 2.0)
     monkeypatch.setattr(balancer, "start_runtime", lambda *args: seen.update(start=args))
-    balancer.prepare_runtime("model")
-    return balancer, layer, seen, fields, backend
+    warnings = []
+    monkeypatch.setattr(module.logger, "warning", warnings.append)
+    balancer.prepare_runtime("model", list(tokens))
+    return balancer, layer, seen, warnings
 
 
-def test_prepare_runtime_times_a_layer_copy_and_takes_the_time_model_from_the_backend(monkeypatch):
-    balancer, layer, seen, fields, backend = _prepare(monkeypatch, [None] * EP_SIZE)
-    assert seen["args"] == (1000, "NVIDIA GB300")
-    # Rank 0's free slot 2 of layer 0 takes the home expert of rank 2, untimed and then timed.
-    assert seen["copies"] == [[(0, 2, 2, 0)]] * 2
-    assert seen["start"] == (TimeModel(**fields), 4, 2.0)
+def _calibration(tmp_path, **identity) -> str:
+    """A calibration file of buckets of 8 and 16 tokens per GPU for the fakes of :func:`_prepare`."""
+    mine = dict(device="NVIDIA GB300", sm=103, sm_count=152, ep_size=EP_SIZE, hosts=1, top_k=2)
+    doc = dict(zip(("schema", "version"), module.CALIBRATION))
+    doc.update(identity=dict(dict(mine, tactics={"8": "a", "16": "a"}), **identity))
+    doc.update(rates=dict(hbm_bytes_per_s=4e12, fp4_dense_flops_per_s=1e16))
+    doc.update(buckets=[dict(tokens=8, scale=0.8), dict(tokens=16, scale=1.1)])
+    doc.update(measurement=dict(trtllm_version=tensorrt_llm.__version__))
+    (tmp_path / "calibration.json").write_text(json.dumps(doc))
+    return str(tmp_path / "calibration.json")
+
+
+def test_prepare_runtime_times_a_layer_copy_and_takes_the_built_in_time_model(monkeypatch):
+    balancer, _, seen, warnings = _prepare(monkeypatch)
+    assert seen["priced"] == (1000, "NVIDIA GB300", None) and not warnings
+    assert seen["start"] == (TimeModel(**FIELDS), 4, 2.0)
     assert (balancer.transport, balancer.copy_stream) == (seen["moved"][1], "stream")
     assert balancer.off_reason is None
-    assert balancer.platform_gap(backend) is None
 
 
-@pytest.mark.parametrize("calibrated", [True, False])
-def test_adaptive_eplb_stays_off_where_any_rank_cannot_run_it(monkeypatch, calibrated):
-    """A GPU without a calibrated time model, or EP ranks outside one NVLink domain, turn adaptive
-    EPLB off on every rank: no weights move, no runtime starts, the layers route by their home
-    layouts and record nothing."""
-    gap = "the EP ranks span 2 nodes outside one MNNVL domain"
-    balancer, layer, seen, _, backend = _prepare(monkeypatch, [None, gap, None, None], calibrated)
-    assert balancer.off_reason == f"{gap} (EP rank 1)"
-    assert "moved" not in seen and "start" not in seen and balancer.runtime is None
-    if not calibrated:
-        assert "no decode time model calibrated on NVIDIA GB300" in balancer.platform_gap(backend)
+def test_a_calibration_file_prices_every_decode_bucket_at_its_own_scale(monkeypatch, tmp_path):
+    path = _calibration(tmp_path, device="NVIDIA B200")  # no built-in calibration for it
+    _, _, seen, warnings = _prepare(monkeypatch, path, device="B200")
+    model = seen["start"][0]
+    assert seen["priced"][2] == (4e12, 1e16, 1.0) and not warnings
+    assert model.scales == ((16, 0.8), (32, 1.1)) and model.at(20).scale == 1.1
+
+
+@pytest.mark.parametrize(
+    "identity, tokens, domain, others, gap, why",
+    [
+        (dict(ep_size=8), (8, 16), (None, 1), (), None, "ep_size"),
+        ({}, (8, 32), (None, 1), (), None, "bucket 32"),
+        (dict(tactics={"8": "a", "16": "b"}), (8, 16), (None, 1), (), None, "tactic of bucket 16"),
+        ({}, (8, 16), ("no NVLink", 2), (), None, "no NVLink"),
+        ({}, (8, 16), (None, 1), (), "2 nodes outside one MNNVL domain", "MNNVL domain"),
+        ({}, (8, 16), (None, 1), [("rank 1 failed", "")], None, "rank 1 failed (EP rank 1)"),
+        ({}, (8, 16), (None, 1), [(None, "another file")], None, "different files"),
+    ],
+)
+def test_adaptive_eplb_stays_off_on_every_rank_when_a_check_fails(
+    monkeypatch, tmp_path, identity, tokens, domain, others, gap, why
+):
+    """No weights move and no runtime starts; the layers route by their home layouts and record
+    nothing."""
+    path = _calibration(tmp_path, **identity)
+    balancer, layer, seen, warnings = _prepare(monkeypatch, path, tokens, domain, others, gap=gap)
+    assert "moved" not in seen and "start" not in seen and why in warnings[0]
+    assert balancer.runtime is None and why in balancer.off_reason
     _observe(balancer, 4)
     assert not balancer.recording
     experts = torch.tensor([[1, 2], [7, 4]], dtype=torch.int32)
@@ -259,6 +284,57 @@ def test_adaptive_eplb_stays_off_where_any_rank_cannot_run_it(monkeypatch, calib
     assert layer.route(experts).tolist() == [[1, 3], [10, 6]]
     assert layer.statistics.forwards.item() == 0
     assert balancer.shutdown() is True
+
+
+def test_without_a_file_a_gpu_without_a_built_in_calibration_stays_off(monkeypatch):
+    _, _, seen, warnings = _prepare(monkeypatch, device="B200")
+    assert "start" not in seen and "time_model_file" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "views, why",
+    [
+        ([(True, "a", None), (True, "a", None)], None),
+        ([(True, "a", ("c", 1)), (True, "b", ("c", 1))], None),
+        ([(True, "a", ("c", 1)), (True, "b", ("c", 2))], "NVLink fabric"),
+        ([(True, "a", None), (True, "b", None)], "NVLink fabric"),
+        ([(True, "a", None), (False, "a", None)], "all links up"),
+    ],
+)
+def test_the_ep_group_must_be_one_nvlink_domain(views, why):
+    got, hosts = module.nvlink_domain_error(SimpleNamespace(allgather=lambda own: views))
+    assert hosts == len({host for _, host, _ in views})
+    assert got is None if why is None else why in got
+
+
+def test_the_nvml_fabric_query_fills_this_gpus_view(monkeypatch):
+    sent, done = [], module.pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
+
+    def fabric_info(handle, info):  # the real pynvml structure, filled as NVML fills it
+        info._obj.clusterUuid[:2], info._obj.cliqueId, info._obj.state = (7, 9), 5, done
+
+    monkeypatch.setattr(module.pynvml, "nvmlInit", lambda: None)
+    monkeypatch.setattr(module.pynvml, "nvmlDeviceGetHandleByIndex", lambda index: "gpu")
+    monkeypatch.setattr(module.pynvml, "nvmlDeviceGetGpuFabricInfoV", fabric_info)
+    monkeypatch.setattr(module.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: True))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    module.nvlink_domain_error(SimpleNamespace(allgather=lambda own: sent.append(own) or [own]))
+    assert sent[0][0] is True and sent[0][2] == ("0709" + "00" * 14, 5)
+
+
+def test_a_bucket_is_refused_when_its_held_out_designs_disagree():
+    tool = Path(__file__).parents[4] / "examples" / "wide_ep" / "ep_load_balancer"
+    tool = tool / "measure_adaptive_eplb_time_model.py"
+    spec = importlib.util.spec_from_file_location("measure_adaptive_eplb_time_model", tool)
+    measure = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(measure)
+    rng = np.random.default_rng(0)
+    p = rng.uniform(40.0, 160.0, 128)
+    y = 70.0 + 0.9 * p + rng.normal(0.0, 0.5, 128)
+    scale, se, z = measure.fit_bucket(p, y, np.random.default_rng(1), draws=200)
+    assert abs(scale - 0.9) < 3 * se and abs(z) <= 3.0
+    y[3::4] += 0.2 * p[3::4]  # the held-out designs scale differently
+    assert abs(measure.fit_bucket(p, y, np.random.default_rng(1), draws=200)[2]) > 3.0
 
 
 def test_start_runtime_needs_torch_distributed(monkeypatch):

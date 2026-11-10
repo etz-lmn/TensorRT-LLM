@@ -1213,7 +1213,14 @@ def _create_py_executor(
     # A load balancer that moves weights (adaptive EPLB moves the MoE slot
     # planes into peer-mapped memory) does so before the KV cache is sized.
     if model_engine.moe_load_balancer is not None:
-        model_engine.moe_load_balancer.prepare_runtime(model_engine.model)
+        per_request = 1 + model_engine.original_max_total_draft_tokens
+        batches = {
+            model_engine.batch_size,
+            *(model_engine.cuda_graph_batch_sizes or ())
+        }
+        model_engine.moe_load_balancer.prepare_runtime(
+            model_engine.model,
+            decode_tokens=sorted(b * per_request for b in batches))
 
     resources = {}
     estimating_kv_cache = False
