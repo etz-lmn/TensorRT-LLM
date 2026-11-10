@@ -17,6 +17,7 @@ import torch.distributed as dist
 
 from tensorrt_llm.logger import logger
 
+from ...live_rows import current_word
 from ..moe_load_balancer import BaseMoeLoadBalancer
 from .policy import ExpertGeometry, TimeModel, active_slots
 from .runtime import AdaptiveRuntime, DecisionConfig, DecisionProcess, build_route_tables
@@ -79,10 +80,17 @@ class ExpertStatistics(NamedTuple):
         """The statistics of layer ``layer`` in buffers made by :func:`statistics_buffers`."""
         return cls(buffers["rows"][layer], buffers["forwards"][layer], enabled)
 
-    def record(self, token_selected_experts: torch.Tensor, first_call: bool = True) -> None:
-        """Add ``[tokens, top_k]`` expert ids to the statistics; only a forward's first call counts
-        the forward."""
-        torch.ops.trtllm.adaptive_eplb_record(token_selected_experts, *self, first_call)
+    def record(
+        self,
+        token_selected_experts: torch.Tensor,
+        first_call: bool = True,
+        live_row_word: torch.Tensor | None = None,
+    ) -> None:
+        """Add ``[tokens, top_k]`` expert ids to the statistics, of the live rows of
+        ``live_row_word`` only; only a forward's first call counts the forward."""
+        torch.ops.trtllm.adaptive_eplb_record(
+            token_selected_experts, *self, first_call, live_row_word
+        )
 
 
 class AdaptiveMoeLayerLoadBalancer:
@@ -92,6 +100,9 @@ class AdaptiveMoeLayerLoadBalancer:
 
     produces_replica_plan = False
     stages_routes = True
+    # Set by the layer's MoE module when its kernel skips the rows past the engine's live-row
+    # word: the statistics then skip them too, else they count every row the kernel computes.
+    counts_live_rows = False
 
     def __init__(
         self,
@@ -181,7 +192,7 @@ class AdaptiveMoeLayerLoadBalancer:
         pending = self._pending
         self._pending = None
         if pending is not None:
-            statistics.record(*pending)
+            statistics.record(*pending, self._live_rows(pending[0]))
         if self.manager.recording or (
             statistics.rows.is_cuda and torch.cuda.is_current_stream_capturing()
         ):
@@ -208,7 +219,7 @@ class AdaptiveMoeLayerLoadBalancer:
         pending = self._pending
         self._pending = None
         if pending is not None and pending[0] is not ids:
-            self.statistics.record(*pending)
+            self.statistics.record(*pending, self._live_rows(pending[0]))
             pending = None
         staging = None
         if (
@@ -229,10 +240,22 @@ class AdaptiveMoeLayerLoadBalancer:
             statistics_args = (None, None, None, True)
         else:
             statistics_args = (*self.statistics, pending[1])
-        self._route_into(ids, *self._tables, self.manager.ep_rank, out, *weights, *statistics_args)
+        self._route_into(
+            ids,
+            *self._tables,
+            self.manager.ep_rank,
+            out,
+            *weights,
+            *statistics_args,
+            self._live_rows(ids),
+        )
         if overlap_fn is not None:
             overlap_fn()
         return out[: ids.shape[0]]
+
+    def _live_rows(self, ids: torch.Tensor) -> torch.Tensor | None:
+        """The engine's live-row word if the layer's kernel skips the rows past it."""
+        return current_word(ids.device) if self.counts_live_rows else None
 
 
 class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
