@@ -49,6 +49,26 @@ def _counts(*values: float) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.float32)
 
 
+def test_a_layer_built_outside_the_balancer_registers_nothing():
+    """``unbalanced_layer`` hides the balancer while a layer no adaptive backend serves is built,
+    drops the repeat count that was set for that layer and restores the balancer, also on error."""
+    balancer = _balancer()
+    with balancer:
+        balancer.set_repeated_for_next_layer(3)
+        with balancer.unbalanced_layer():
+            assert base.get_moe_load_balancer() is None
+        assert base.get_moe_load_balancer() is balancer
+        layer = balancer.add_layer(NUM_EXPERTS, TOP_K, NUM_SLOTS // EP_SIZE)
+        assert layer.repeated_count == 1
+        assert balancer.layers == [layer]
+        with pytest.raises(KeyError), balancer.unbalanced_layer():
+            raise KeyError("construction failed")
+        assert base.get_moe_load_balancer() is balancer
+    with pytest.raises(RuntimeError, match="only the current"):
+        with balancer.unbalanced_layer():
+            pass
+
+
 def test_layers_are_checked_against_the_slots():
     balancer = _balancer()
     with pytest.raises(ValueError, match="multiple of `ep_size`"):
