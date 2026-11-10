@@ -1646,7 +1646,9 @@ class FusedCommMoEScheduler(MoEScheduler):
                     is_last_call,
                     ignore_allreduce=False,
                 )
-                token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+                token_selected_slots = moe._load_balancer_route(
+                    token_selected_experts, moe.use_dp, token_final_scales=token_final_scales
+                )
             else:
                 token_selected_slots = token_selected_experts
             token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
