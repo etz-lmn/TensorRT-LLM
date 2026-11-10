@@ -906,6 +906,7 @@ def _register_fake():
         forwards: Optional[torch.Tensor] = None,
         enabled: Optional[torch.Tensor] = None,
         first: bool = True,
+        live_row_word: Optional[torch.Tensor] = None,
     ) -> None:
         return None
 
@@ -916,6 +917,7 @@ def _register_fake():
         forwards: torch.Tensor,
         enabled: torch.Tensor,
         first: bool = True,
+        live_row_word: Optional[torch.Tensor] = None,
     ) -> None:
         return None
 
