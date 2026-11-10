@@ -695,6 +695,14 @@ class SingleLayerMoeLoadBalancer:
             if do_multi_stream():
                 with torch.cuda.stream(self.aux_stream):
                     _update_statistic()
+                # In an eager forward, join the EP-wide allreduce before the
+                # caller launches the MoE kernel. A fused-communication kernel
+                # fills the GPU and synchronizes across ranks inside the
+                # kernel, so an allreduce still running on the auxiliary
+                # stream can be ordered differently against it on each rank
+                # and hang every rank. Captured graphs keep the overlap.
+                if not torch.cuda.is_current_stream_capturing():
+                    torch.cuda.current_stream().wait_stream(self.aux_stream)
             else:
                 _update_statistic()
 
