@@ -1997,6 +1997,8 @@ def _autotune_helpers(torch):
         "_TOKEN_BACK_READY_GRANULARITIES",
         "_TACTIC_LEN",
         "_TACTIC_LEN_V4",
+        "_TACTIC_FIELDS",
+        "_ATOMIC_COUNTER_HELPER_SMS",
         "_LEGACY_TACTIC_LEN",
         "_FLAG_BATCH_MAX",
         "_GEOMETRIES",
