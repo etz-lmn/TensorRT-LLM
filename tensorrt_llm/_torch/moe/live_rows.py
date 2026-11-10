@@ -22,6 +22,7 @@ bits 16-31 the requests P of the forward. A kernel over T rows keeps none when
 P is 0, all when R >= P or P does not divide T, else the leading T / P * R.
 """
 
+import os
 from typing import Dict, Optional, Sequence
 
 import torch
@@ -35,6 +36,8 @@ NO_ROWS = 0
 ALL_ROWS = (1 << REQUEST_BITS) | 1
 # Key of an engine's word in the per-forward model extra attrs.
 MODEL_EXTRA_ATTR = "live_row_word"
+# Measurement switch (fork measurement branch only): with it set to 1 every row is kept.
+KEEP_ENV = "TRTLLM_KEEP_PADDING_ROWS"
 
 
 def encode(real_requests: int, requests: int) -> int:
@@ -71,7 +74,11 @@ class LiveRowWord:
     def __init__(self, value: int = ALL_ROWS) -> None:
         self._value = value
         self._tensor: Optional[torch.Tensor] = None
-        self._writes = True
+        # The switch keeps every row, as a driver without stream memory operations does.
+        self._writes = os.environ.get(KEEP_ENV) != "1"
+        logger.info(
+            f"[live rows] padding rows {'dropped' if self._writes else f'kept ({KEEP_ENV}=1)'}"
+        )
 
     def tensor(self, device: torch.device) -> torch.Tensor:
         if self._tensor is None:
