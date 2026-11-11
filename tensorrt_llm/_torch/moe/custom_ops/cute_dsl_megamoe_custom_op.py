@@ -979,6 +979,24 @@ def _megamoe_barrier_reset_slices(kernel) -> Tuple[int, int, int, int, str]:
     return 0, int(local_bytes), 0, int(shared_bytes), f"export-{type(kernel).__name__}"
 
 
+def _require_megamoe_shared_workspace(
+    kernel, shared_workspace: torch.Tensor, num_experts_per_rank: int
+) -> None:
+    """Refuse a caller's shared workspace smaller than ``kernel`` addresses.
+
+    Its layout grows with the expert count and the token bucket, so a workspace sized for
+    another problem lets the kernel write and read past the end of the allocation.
+    """
+    _, needed = kernel.get_workspace_sizes()
+    have = shared_workspace.numel() * shared_workspace.element_size()
+    if have < int(needed):
+        raise ValueError(
+            f"MegaMoE-CuteDSL: the shared workspace has {have} bytes, but the kernel for "
+            f"{num_experts_per_rank} experts per rank needs {int(needed)}; size it with "
+            f"query_megamoe_kernel_properties for this runner's problem."
+        )
+
+
 def megamoe_activation_sf_bytes_per_row(hidden_size: int) -> int:
     """Return the per-row byte width the MegaMoE kernel expects for the
     activation SF tensor.
@@ -2772,6 +2790,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 tactic_t,
                 allow_fallback=use_default_tactic,
             )
+            if shared_workspace is not None:
+                _require_megamoe_shared_workspace(
+                    kernel, shared_workspace, self.num_experts_per_rank
+                )
 
             # form-B accumulates the top-k reduction into ``combine_output``,
             # so its live rows MUST start at 0; the CALLER zeros [:num_tokens]

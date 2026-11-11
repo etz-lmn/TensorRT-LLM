@@ -4481,6 +4481,43 @@ def test_megamoe_helper_bearing_candidates_pair_token_tile_tactics(sm_version: i
     assert len(_megamoe_token_tile_pairs(tactics)) == 4
 
 
+@pytest.mark.cpu_only
+def test_megamoe_runner_refuses_a_shared_workspace_smaller_than_its_kernel_needs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner given another problem's shared workspace fails before it launches.
+
+    The shared layout grows with the slot count, so a workspace sized for 16 slots is short for a
+    runner with two more helper slots; the kernel would write and read past its end.
+    """
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
+    needed = 4096
+    kernel = SimpleNamespace(get_workspace_sizes=lambda: (0, needed))
+    runner = megamoe_op.Sm100MegaMoENvfp4Runner.__new__(megamoe_op.Sm100MegaMoENvfp4Runner)
+    runner.world_size, runner.num_experts_per_rank, runner._profiling_scratch = 1, 18, None
+    monkeypatch.setattr(
+        runner, "_resolve_kernel_descriptor", lambda tactic, allow_fallback: (kernel, tactic)
+    )
+    launched = []
+    monkeypatch.setattr(
+        megamoe_op,
+        "_get_or_alloc_local_workspace",
+        lambda *args, **kwargs: launched.append(args) or torch.zeros(0, dtype=torch.uint8),
+    )
+    inputs = [torch.empty(1)] * 12
+    with pytest.raises(ValueError, match=r"has 4095 bytes, but the kernel for 18 experts"):
+        runner.forward(
+            inputs,
+            tactic=("not", "the", "default"),
+            peer_offsets=[0],
+            shared_workspace=torch.empty(needed - 1, dtype=torch.uint8),
+        )
+    assert not launched
+
+
 def _with_slot_copies(tensor: torch.Tensor, slots: int, sources: Tuple[int, ...]) -> torch.Tensor:
     """``tensor`` (expert-major over ``slots`` slots) with byte copies of slots ``sources`` appended."""
     if tensor.dim() == 0:
@@ -4664,6 +4701,26 @@ def test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch(
             combine_format=launch["combine_format"],
             helper_expert_count=len(sources),
         )
+        # The shared workspace layout grows with the slot count: the backend's is sized for
+        # ``slots``, so the helper runner gets its own, sized as the backend sizes one.
+        helper_workspace_bytes, _ = megamoe_op.query_megamoe_kernel_properties(
+            world_size=1,
+            num_topk=top_k,
+            num_experts_per_rank=slots + len(sources),
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=launch["intermediate_size_per_partition"],
+            expand_intermediate_size_per_partition=launch["expand_intermediate_size_per_partition"],
+            max_tokens_per_rank=launch["max_tokens_per_rank"],
+            apply_topk_in_fc1=launch["apply_topk_in_fc1"],
+            swiglu_alpha=launch["swiglu_alpha"],
+            swiglu_beta=launch["swiglu_beta"],
+            gate_up_clamp=launch["gate_up_clamp"],
+            situ_beta=launch["act_alpha"],
+            situ_linear_beta=launch["act_beta"],
+            in_kernel_fc2_reduce=launch["in_kernel_fc2_reduce"],
+            combine_format=launch["combine_format"],
+        )
+        helper_workspace = torch.zeros(helper_workspace_bytes, dtype=torch.uint8, device="cuda")
 
         def inputs(output: torch.Tensor) -> List[torch.Tensor]:
             return [
@@ -4691,7 +4748,7 @@ def test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch(
                 inputs(output),
                 tactic=tactic,
                 peer_offsets=launch["peer_offsets"],
-                shared_workspace=launch["shared_workspace"],
+                shared_workspace=helper_workspace,
             )
             torch.cuda.synchronize()
             return output
