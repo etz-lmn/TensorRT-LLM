@@ -9,11 +9,12 @@ from utils.util import skip_pre_blackwell
 pytestmark = skip_pre_blackwell
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("rows,bucket,hidden", [(37, 64, 7168), (64, 64, 7168), (1, 8, 1024)])
-def test_fp4_quantize_into_writes_what_fp4_quantize_returns(rows, bucket, hidden):
+def test_fp4_quantize_into_writes_what_fp4_quantize_returns(rows, bucket, hidden, dtype):
     """The rows land in the first rows of a bucket's buffers; the rest stays untouched."""
     torch.manual_seed(rows)
-    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(rows, hidden, device="cuda", dtype=dtype)
     scale = torch.tensor([1.7], device="cuda")
     want, want_sf = torch.ops.trtllm.fp4_quantize(x, scale, 16, False, False)
     act = torch.full((bucket, hidden // 2), 9, dtype=torch.uint8, device="cuda")
@@ -24,3 +25,24 @@ def test_fp4_quantize_into_writes_what_fp4_quantize_returns(rows, bucket, hidden
     assert (act[rows:] == 9).all() and (act_sf[rows:] == 9).all()
     with pytest.raises(RuntimeError):  # a buffer short of the rows
         torch.ops.trtllm.fp4_quantize_into(x, scale, act[: rows - 1], act_sf[:rows], False)
+
+
+def test_fp4_quantize_into_refuses_buffers_it_would_misread():
+    """A misaligned input and outputs of the right size but the wrong layout are refused."""
+    rows, hidden = 4, 1024
+    scale = torch.tensor([1.7], device="cuda")
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    act = torch.empty((rows, hidden // 2), dtype=torch.uint8, device="cuda")
+    act_sf = torch.empty((rows, hidden // 16), dtype=torch.uint8, device="cuda")
+    # One element off: contiguous, but not on the 16-byte boundary of the kernel's vector loads.
+    flat = torch.randn(rows * hidden + 1, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="16-byte alignment"):
+        torch.ops.trtllm.fp4_quantize_into(flat[1:].view(rows, hidden), scale, act, act_sf, False)
+    # The same bytes as [M, K / 2], transposed.
+    with pytest.raises(RuntimeError, match=r"out must be"):
+        torch.ops.trtllm.fp4_quantize_into(x, scale, act.view(hidden // 2, rows), act_sf, False)
+    # Rows padded past K / 16: large enough, but every row after the first would land at the wrong offset.
+    padded_sf = torch.empty((rows, hidden // 16 + 4), dtype=torch.uint8, device="cuda")
+    with pytest.raises(RuntimeError, match=r"out_sf must be"):
+        torch.ops.trtllm.fp4_quantize_into(x, scale, act, padded_sf, False)
+    torch.ops.trtllm.fp4_quantize_into(x, scale, act, act_sf, False)
