@@ -27,9 +27,12 @@ proxy wrote and the other reads needs a proxy fence in between:
   TMA issues ``fence.proxy.async.global`` between the two. The acquire orders the data
   for the generic proxy only. This holds for the token communication and for the GEMM
   kernels that read the FC1 input and the FC1 output after a counter wait.
-- Completion: ``token_in`` publishes a token row's FC1 ready flag only after the bulk
-  store of that row has completed; ``cp.async.bulk.wait_group.read`` waits only until the
-  store has read its shared-memory stage.
+- Completion: ``token_in`` publishes FC1 ready flags only after the bulk stores of the
+  rows they cover have completed: a full ``cp.async.bulk.wait_group 0`` right before every
+  publication (each row when every row publishes, else the row that fills a batch, and the
+  tail flush). ``cp.async.bulk.wait_group.read`` waits only until a store has read its
+  shared-memory stage, which is all a row that does not publish needs before the stage is
+  reused.
 """
 
 import ast
@@ -194,30 +197,73 @@ def test_tma_reads_of_published_data_follow_a_proxy_fence(source: str) -> None:
 # ----------------------------------------------------------------------------- bulk drain
 
 
-def _fc1_ready_publications(source: Path) -> list[tuple[int, str, int]]:
-    """Each publication of a token row's FC1 ready flag, as (line, the last bulk wait before
-    it, the line of the last bulk store before it), within its method."""
+_FULL_WAIT = "cute.arch.cp_async_bulk_wait_group(0)"
+
+
+def _is_full_wait(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and ast.unparse(node) == _FULL_WAIT
+
+
+def _fc1_ready_publications(source: Path) -> list[tuple[int, str, int, int]]:
+    """Each point where token_in may publish FC1 ready flags, within its method: every
+    accumulate() with the token-in batch and the tracker's fire() after the loop. Returned as
+    (line, the drain that guards it, the line of that drain, the line of the last bulk store
+    before it). The drain is the last bulk wait before the point, or a full wait under an
+    ``if <tracker>.publishes_on_accumulate(<the accumulate's phase and batch>)`` that is the
+    last such guard before the point."""
     sites = []
     for function in ast.walk(ast.parse(source.read_text())):
         if not isinstance(function, ast.FunctionDef):
             continue
         calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+        publications = [
+            c
+            for c in calls
+            if isinstance(c.func, ast.Attribute)
+            and c.func.attr == "accumulate"
+            and "self.token_in_flag_batch" in ast.unparse(c)
+        ]
+        if not publications:
+            continue
+        receivers = {ast.unparse(c.func.value) for c in publications}
+        publications += [
+            c
+            for c in calls
+            if isinstance(c.func, ast.Attribute)
+            and c.func.attr == "fire"
+            and ast.unparse(c.func.value) in receivers
+        ]
         waits = [c for c in calls if ast.unparse(c.func) == "cute.arch.cp_async_bulk_wait_group"]
         stores = [c.lineno for c in calls if ast.unparse(c.func) == "cp_async_bulk_s2g"]
-        for call in calls:
-            if not (
-                isinstance(call.func, ast.Attribute)
+        guards = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Call)
+            and isinstance(node.test.func, ast.Attribute)
+            and node.test.func.attr == "publishes_on_accumulate"
+        ]
+        for call in publications:
+            last_store = max((line for line in stores if line < call.lineno), default=0)
+            earlier_guards = [g for g in guards if g.lineno < call.lineno]
+            guard = max(earlier_guards, key=lambda g: g.lineno) if earlier_guards else None
+            if (
+                guard is not None
                 and call.func.attr == "accumulate"
-                and "self.token_in_flag_batch" in ast.unparse(call)
+                and guard.lineno > last_store
+                and [ast.unparse(a) for a in guard.test.args]
+                == [ast.unparse(a) for a in call.args[:2]]
+                and any(_is_full_wait(n) for stmt in guard.body for n in ast.walk(stmt))
             ):
+                sites.append((call.lineno, _FULL_WAIT, guard.lineno, last_store))
                 continue
             earlier_waits = [w for w in waits if w.lineno < call.lineno]
             last_wait = max(earlier_waits, key=lambda w: w.lineno) if earlier_waits else None
-            last_store = max((line for line in stores if line < call.lineno), default=0)
             sites.append(
                 (
                     call.lineno,
-                    "" if last_wait is None else f"{last_wait.lineno}:{ast.unparse(last_wait)}",
+                    "" if last_wait is None else ast.unparse(last_wait),
+                    0 if last_wait is None else last_wait.lineno,
                     last_store,
                 )
             )
@@ -229,11 +275,10 @@ def test_fc1_ready_is_published_after_the_row_store_completes(source: str) -> No
     sites = _fc1_ready_publications(_NVLINK_DOMAIN / source)
 
     assert sites
-    for lineno, last_wait, last_store in sites:
-        wait_line, _, wait = last_wait.partition(":")
-        assert wait == "cute.arch.cp_async_bulk_wait_group(0)" and int(wait_line) > last_store, (
-            f"{source}:{lineno} publishes FC1 ready before its bulk store completes "
-            f"(last bulk store at {last_store}, last wait {last_wait})"
+    for lineno, drain, drain_line, last_store in sites:
+        assert drain == _FULL_WAIT and drain_line > last_store, (
+            f"{source}:{lineno} may publish FC1 ready before its bulk stores complete "
+            f"(last bulk store at {last_store}, drain {drain!r} at {drain_line})"
         )
 
 
