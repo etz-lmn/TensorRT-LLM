@@ -4765,22 +4765,34 @@ def test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch(
             in_kernel_fc2_reduce=launch["in_kernel_fc2_reduce"],
             combine_format=launch["combine_format"],
         )
-        cases = {
-            "default selection": -1,
-            "default tactic, grid-stride work ids": default,
-            # The last tactic is the default's atomic-counter twin, or the default itself when it
-            # already takes its tiles by atomic counter.
-            "default tactic, atomic-counter work ids": megamoe_op._with_atomic_counter_work_ids(
-                [default], sm_version
-            )[-1],
-        }
+        cases = {"default selection": -1}
+        # Each tactic runs once (every run compiles its kernel): the selection's own tactic is
+        # skipped when it comes up again below. Tactics hold lists, so they are compared by repr.
+        selected = megamoe_op._default_megamoe_tactic_for_key(
+            runner.unique_id(), num_tokens=num_tokens
+        )
+        seen = {repr(tuple(megamoe_op._unpack_tactic(selected)))}
+
+        def add(name: str, tactic) -> None:
+            key = repr(tuple(megamoe_op._unpack_tactic(tactic)))
+            if key not in seen:
+                seen.add(key)
+                cases[name] = tactic
+
+        add("default tactic, grid-stride work ids", default)
+        # The last tactic is the default's atomic-counter twin, or the default itself when it
+        # already takes its tiles by atomic counter.
+        add(
+            "default tactic, atomic-counter work ids",
+            megamoe_op._with_atomic_counter_work_ids([default], sm_version)[-1],
+        )
         pairs = _megamoe_token_tile_pairs(
             runner.get_valid_tactics(inputs(torch.empty_like(reference)), None)
         )
         assert len(pairs) == _MEGAMOE_TOKEN_TILE_BASES
         for expert_twin, token_tile in pairs:
-            cases[f"expert READY {expert_twin}"] = expert_twin
-            cases[f"token-tile READY {token_tile}"] = token_tile
+            add(f"expert READY {expert_twin}", expert_twin)
+            add(f"token-tile READY {token_tile}", token_tile)
         mismatched = {}
         with torch.inference_mode():
             for name, tactic in cases.items():

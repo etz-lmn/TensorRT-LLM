@@ -55,8 +55,8 @@ void megaMoeStageRoutes(IdT const* ids, float const* weights, int64_t liveRows, 
         return;
     }
     auto const blocks = static_cast<int>(std::min((elements + kThreads - 1) / kThreads, kMaxBlocks));
-    megaMoeStageRoutesKernel<IdT, OutT><<<blocks, kThreads, 0, stream>>>(
-        ids, weights, liveRows * topK, idsOut, weightsOut, elements);
+    megaMoeStageRoutesKernel<IdT, OutT>
+        <<<blocks, kThreads, 0, stream>>>(ids, weights, liveRows * topK, idsOut, weightsOut, elements);
 }
 
 #define INSTANTIATE_MEGAMOE_STAGE_ROUTES(IdT, OutT)                                                                    \

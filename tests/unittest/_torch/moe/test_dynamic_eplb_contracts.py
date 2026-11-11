@@ -1876,7 +1876,8 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
     impl = _extract_class(source, "TrtllmCutedslMegaMoeNvfp4Impl", {"quantize_input"}, namespace)
     owner = impl()
     owner.fc31_input_scale = "scale"
-    owner._staging_of_next_run = lambda num_tokens, device: None  # a forward that run_moe does not stage
+    # A forward that run_moe does not stage.
+    owner._staging_of_next_run = lambda num_tokens, device: None
 
     owner.quantize_input(Activation(3, 64))
     owner.quantize_input(Activation(3, 64), reserved_sms=4)

@@ -48,8 +48,8 @@ void launchFp4QuantizeInto(at::Tensor const& input, at::Tensor const& globalScal
 {
     kernels::invokeFP4Quantization<T, kSfVecSize>(/*b=*/1, static_cast<int>(input.size(0)),
         static_cast<int>(input.size(1)), static_cast<T const*>(input.data_ptr()), globalScale.data_ptr<float>(),
-        static_cast<int64_t*>(out.data_ptr()), static_cast<int32_t*>(outSf.data_ptr()), /*useUE8M0=*/false, layout,
-        sms, stream);
+        static_cast<int64_t*>(out.data_ptr()), static_cast<int32_t*>(outSf.data_ptr()), /*useUE8M0=*/false, layout, sms,
+        stream);
 }
 
 } // namespace
@@ -64,8 +64,8 @@ void fp4QuantizeInto(
     TORCH_CHECK(input.scalar_type() == at::kHalf || input.scalar_type() == at::kBFloat16, "input must be fp16 or bf16");
     // Each thread reads eight inputs as one 16-byte vector.
     TORCH_CHECK(reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0, "input needs 16-byte alignment");
-    TORCH_CHECK(globalScale.device() == input.device() && globalScale.scalar_type() == at::kFloat
-            && globalScale.numel() == 1,
+    TORCH_CHECK(
+        globalScale.device() == input.device() && globalScale.scalar_type() == at::kFloat && globalScale.numel() == 1,
         "globalScale must be one float32 on the input's device");
     auto const m = input.size(0);
     auto const k = input.size(1);
@@ -76,9 +76,8 @@ void fp4QuantizeInto(
             && out.dim() == 2 && out.size(0) == m && out.size(1) == k / 2,
         "out must be contiguous uint8 [M, K / 2] on the input's device");
     // The linear layout writes K / 16 bytes per row at a row stride of K / 16; the swizzled one fills a padded block.
-    bool const sfFits = isSfSwizzledLayout
-        ? outSf.numel() >= sfBytes
-        : outSf.dim() == 2 && outSf.size(0) == m && outSf.size(1) == k / kSfVecSize;
+    bool const sfFits = isSfSwizzledLayout ? outSf.numel() >= sfBytes
+                                           : outSf.dim() == 2 && outSf.size(0) == m && outSf.size(1) == k / kSfVecSize;
     TORCH_CHECK(outSf.is_cuda() && outSf.is_contiguous() && outSf.scalar_type() == at::kByte
             && outSf.device() == input.device() && sfFits,
         "out_sf must be contiguous uint8 on the input's device: [M, K / 16] in the linear layout, at least the "
