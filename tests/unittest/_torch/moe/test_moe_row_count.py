@@ -8,6 +8,7 @@ import base64
 import importlib
 import inspect
 import json
+import threading
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -135,6 +136,33 @@ def test_only_live_rows_count(tmp_path, host_op):
     assert second["iter"] == 8 and second["rows"][0, PADDING_EXPERT] == 6 * TOP_K
     assert second["totals"] == [4 * 6 * TOP_K, 0, 0]
     assert end == dict(kind="end", forwards=2, stalls=0, unrecorded_forwards=0, error=None)
+
+
+@pytest.mark.cpu_only
+def test_no_writer_thread_before_the_first_recorded_forward(tmp_path, host_op):
+    def writers():
+        return [t for t in threading.enumerate() if t.name == "moe-row-count"]
+
+    before = writers()
+    rows = counter(tmp_path)
+    rows.record(0, routes(2, 2, 6), True)  # warmup and capture forwards
+    rows.skipped()
+    rows.begin()
+    rows.record(0, routes(2, 2, 6), True)
+    assert rows._thread is None and writers() == before
+    rows.end(dict(iter=1))
+    assert rows._thread is not None and rows._thread.is_alive()
+    rows.drain()
+    rows.close()
+    assert not rows._thread.is_alive()
+    assert [x["kind"] for x in read_lines(rows.path)] == ["header", "forward", "end"]
+
+
+@pytest.mark.cpu_only
+def test_a_counter_without_a_recorded_forward_closes(tmp_path, host_op):
+    rows = counter(tmp_path)
+    rows.close()
+    assert [x["kind"] for x in read_lines(rows.path)] == ["header", "end"]
 
 
 @pytest.mark.cpu_only

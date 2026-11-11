@@ -32,13 +32,14 @@ dummy forward. ``begin`` zeroes the accumulator on the forward's stream, which w
 unrecorded forward (warmup, graph capture, dummy) added; ``end`` enqueues on the same stream a copy
 into a pinned host slot and an event. A writer thread waits for the event and appends one JSON line
 to ``<directory>/rank<rank>.moe-rows.jsonl``, flushed line by line: a killed process keeps every
-line it completed, and a reader drops a last line without its newline.
+line it completed, and a reader drops a last line without its newline. The writer starts at the
+first recorded forward: while the engine warms up and captures its CUDA graphs no thread of the
+counter exists, since a CUDA call from another thread invalidates a capture in the global mode.
 
 Lines: ``header`` (the geometry), one ``forward`` per recorded forward (the executor iteration, the
 CUDA graph key, the live-row word, the host's monotonic clock at the forward's end, per layer slot
-the routing launches and the total, the counts as
-base64 of zlib of little-endian unsigned integers ``[layer slots, experts]`` in row-major order),
-``end`` at exit.
+the routing launches and the total, the counts as base64 of zlib of little-endian unsigned integers
+``[layer slots, experts]`` in row-major order), ``end`` at exit.
 """
 
 import atexit
@@ -178,8 +179,7 @@ class RowCounter:
                 start_unix=time.time(),
             )
         )
-        self._thread = threading.Thread(target=self._drain, name="moe-row-count", daemon=True)
-        self._thread.start()
+        self._thread: Optional[threading.Thread] = None
         atexit.register(self.close)
 
     def record(self, layer_idx: int, token_selected_experts: torch.Tensor, first: bool) -> None:
@@ -207,6 +207,9 @@ class RowCounter:
             except queue.Empty:
                 stall = True
         self.stalls += stall
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._drain, name="moe-row-count", daemon=True)
+            self._thread.start()
         self._host[slot].copy_(self._storage, non_blocking=True)
         if self._events[slot] is not None:
             self._events[slot].record()
@@ -217,11 +220,17 @@ class RowCounter:
         """A forward of the engine that is not recorded (warmup, dummy, no executor iteration)."""
         self.unrecorded += 1
 
+    def drain(self) -> None:
+        """Wait until the writer has written every recorded forward, or has stopped."""
+        while self._error is None and self._free.qsize() < len(self._host):
+            time.sleep(WAIT_S / 100)
+
     def close(self) -> None:
         if self._file is None:
             return
-        self._work.put(None)
-        self._thread.join()
+        if self._thread is not None:
+            self._work.put(None)
+            self._thread.join()
         self._write(
             dict(
                 kind="end",
