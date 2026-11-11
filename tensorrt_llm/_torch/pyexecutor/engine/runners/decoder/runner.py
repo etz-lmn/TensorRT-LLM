@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.moe import row_count
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -288,6 +289,12 @@ class DecoderRunner(ScheduledModelRunner):
         self._live_rows = LiveRowWord()
         if hasattr(model, "extra_attrs"):
             model.extra_attrs[MODEL_EXTRA_ATTR] = self._live_rows
+        # Measurement switch: every MoE layer's live rows per expert in every forward of the loop.
+        self._row_counter = (
+            row_count.attach(model, mapping.rank, torch.device("cuda", torch.cuda.current_device()))
+            if row_count.ENABLED
+            else None
+        )
         self._warmup = DecoderWarmup(
             config=self._config,
             mapping=mapping,
@@ -816,7 +823,7 @@ class DecoderRunner(ScheduledModelRunner):
             self._iter_states["cuda_graph_key"] = graph_key
             # Warmup and capture keep every row; a graph's requests own equal rows unless its key
             # mixes in contexts or ragged verification.
-            self._live_rows.write(
+            word = (
                 ALL_ROWS
                 if is_dummy
                 else forward_word(
@@ -827,6 +834,7 @@ class DecoderRunner(ScheduledModelRunner):
                     and key.ragged_verify_bucket is None,
                 )
             )
+            self._live_rows.write(word)
             # Experiment hook: a load balancer held until decoding starts at the first forward
             # with no context request on any rank. Every rank exchanges its count in the same
             # forwards and decides from the same counts.
@@ -839,6 +847,7 @@ class DecoderRunner(ScheduledModelRunner):
                 moe_load_balancer.release_hold_if_decode(
                     contexts or [semantic_requests.num_context_requests]
                 )
+            counted = self._count_rows_begin(is_dummy)
             captures_model_body = self._graphs.captures_model_body(graph_key)
             outputs = self._graphs.run(
                 graph_key,
@@ -861,6 +870,15 @@ class DecoderRunner(ScheduledModelRunner):
             )
             # No-op unless a pack was opened above and the replay did not issue it.
             step_inputs.flush()
+            if counted is not None:
+                self._count_rows_end(
+                    counted,
+                    graph_key,
+                    word,
+                    execution_requests.all_requests(),
+                    semantic_requests.num_context_requests,
+                    runtime_draft_len,
+                )
             if captures_model_body:
                 return outputs
 
@@ -875,6 +893,43 @@ class DecoderRunner(ScheduledModelRunner):
                 return outputs
             outputs = self._restore_attention_dp_semantic_outputs(semantic_requests, outputs)
             return {**outputs, "runtime_draft_len": runtime_draft_len}
+
+    def _count_rows_begin(self, is_dummy: bool) -> int | None:
+        """The executor iteration of this forward if the row counter records it, else None."""
+        counter = self._row_counter
+        if counter is None:
+            return None
+        iter_id = row_count.take_iter()
+        if is_dummy or iter_id is None:
+            counter.skipped()
+            return None
+        counter.begin()
+        return iter_id
+
+    def _count_rows_end(
+        self,
+        iter_id: int,
+        graph_key: Any,
+        word: int,
+        requests: list,
+        context_requests: int,
+        runtime_draft_len: int,
+    ) -> None:
+        """Hand the recorded forward to the row counter with what aligns it to the iteration log."""
+        self._row_counter.end(
+            dict(
+                iter=iter_id,
+                graph=None if graph_key is None else repr(graph_key),
+                graph_batch=getattr(graph_key, "batch_size", None),
+                graph_draft_len=getattr(graph_key, "draft_len", None),
+                runtime_draft_len=runtime_draft_len,
+                word=word,
+                word_written=self._live_rows._writes,
+                requests=len(requests),
+                real_requests=sum(not request.is_dummy for request in requests),
+                context_requests=context_requests,
+            )
+        )
 
     @contextmanager
     def _maybe_bypass_torch_compile(self, bypass: bool = False) -> Iterator[None]:

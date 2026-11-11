@@ -76,6 +76,7 @@ from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
+from ..moe import row_count
 from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SpecSampler
@@ -9995,6 +9996,9 @@ class PyExecutor:
             forward_completion="clear",
         )
         ExpertStatistic.set_iter(self.iter_counter)
+        if row_count.ENABLED:
+            # Measurement switch: the MoE row counter records the forwards of serving passes.
+            row_count.set_iter(None if self.is_warmup else self.iter_counter)
         # Router Replay (R3): the capturer is owned by the model engine (None
         # when the feature is off or for engines that do not support it).
         route_capture = self.model_engine.route_capture

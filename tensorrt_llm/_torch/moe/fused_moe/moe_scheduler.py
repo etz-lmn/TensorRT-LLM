@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
-from tensorrt_llm._torch.moe import live_rows
+from tensorrt_llm._torch.moe import live_rows, row_count
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
@@ -538,6 +538,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 route_capture = get_active_route_capture()
                 if route_capture is not None:  # R3: in-graph device-buffer capture
                     route_capture.capture(moe.layer_idx, token_selected_experts, row_offset)
+            # Measurement switch: the rows of this chunk per expert (a re-run chunk counts once).
+            if row_count.ENABLED and row_offset is not None:
+                row_count.record(moe.layer_idx, token_selected_experts, is_first_call)
 
             assert token_selected_experts.shape[1] == moe.routing_method.experts_per_token
             assert token_selected_experts.shape == token_final_scales.shape
@@ -1593,6 +1596,9 @@ class FusedCommMoEScheduler(MoEScheduler):
                 dtype=torch.float32,
                 device=device,
             )
+        # Measurement switch: the rows of this chunk per expert, an empty chunk included.
+        if row_count.ENABLED:
+            row_count.record(moe.layer_idx, token_selected_experts, is_first_call)
 
         # CuteDSL needs the scheduler's rank-identical chunk maximum to select
         # one adaptive bucket on every EP rank; using a local token count could
