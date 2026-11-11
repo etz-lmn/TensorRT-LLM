@@ -1841,6 +1841,8 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
     calls = []
 
     class Activation:
+        device = "cpu"
+
         def __init__(self, rows, cols):
             self.shape = (rows, cols)
 
