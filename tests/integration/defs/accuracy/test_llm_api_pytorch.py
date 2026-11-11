@@ -2581,7 +2581,13 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 f"TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp{tp_size}]",
                 acceptance_length)
 
-    def _gsm8k_dep4_megamoe_cutedsl(self, test_name, load_balancer=None):
+    def _gsm8k_dep4_megamoe_cutedsl(
+            self,
+            test_name,
+            load_balancer=None,
+            max_draft_len=5,
+            block_size=None,
+            al_key="TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl"):
         # MegaMoE CuTe DSL is the backend that serves the NVFP4 export. DEP4
         # doubles the per-rank model footprint relative to DEP8, so bound both
         # the serving and the CUDA-graph batch to what fits without a warmup
@@ -2589,7 +2595,9 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.5)
         spec_config = DSparkDecodingConfig(
-            max_draft_len=5, speculative_model=self.NVFP4_MODEL_PATH)
+            max_draft_len=max_draft_len,
+            block_size=block_size,
+            speculative_model=self.NVFP4_MODEL_PATH)
         # Build the evaluator (dataset and harness) before the LLM claims the
         # GPUs.
         task = GSM8K(self.MODEL_NAME)
@@ -2631,9 +2639,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
             acceptance_length = acceptance_length_from_iteration_stats(stats)
             print(f"[AL] {test_name} acceptance_length = "
                   f"{acceptance_length:.3f}")
-            assert_acceptance_length(
-                "TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl",
-                acceptance_length)
+            assert_acceptance_length(al_key, acceptance_length)
             if load_balancer is not None:
                 _assert_adaptive_eplb_installed(test_name, stats)
 
@@ -2641,6 +2647,18 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(4)
     def test_gsm8k_dep4_megamoe_cutedsl(self):
         self._gsm8k_dep4_megamoe_cutedsl("test_gsm8k_dep4_megamoe_cutedsl")
+
+    # Measurement variant: the serving setting of six draft positions per
+    # block (the checkpoint's own block is five), without balancing.
+    @pytest.mark.skip_less_device_memory(DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_gsm8k_dep4_megamoe_cutedsl_draft6(self):
+        name = "test_gsm8k_dep4_megamoe_cutedsl_draft6"
+        self._gsm8k_dep4_megamoe_cutedsl(
+            name,
+            max_draft_len=6,
+            block_size=6,
+            al_key=f"TestDeepSeekV4ProDSpark::{name}")
 
     # Adaptive EPLB prices its installs with the MoE backend's decode time
     # model, which MegaMoE CuTe DSL provides for GB300 only.
