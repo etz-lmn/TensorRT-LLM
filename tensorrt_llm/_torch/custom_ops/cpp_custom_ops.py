@@ -660,11 +660,8 @@ def _register_fake():
                                       sf_use_ue8m0, swizzled_layout)
 
     @torch.library.register_fake("trtllm::fp4_quantize_into")
-    def _(input: torch.Tensor,
-          global_scale: torch.Tensor,
-          out: torch.Tensor,
-          out_sf: torch.Tensor,
-          is_sf_swizzled_layout: bool = False) -> None:
+    def _(input: torch.Tensor, globalScale: torch.Tensor, out: torch.Tensor,
+          out_sf: torch.Tensor, isSfSwizzledLayout: bool) -> None:
         return None
 
     @torch.library.register_fake("trtllm::megamoe_stage_routes")

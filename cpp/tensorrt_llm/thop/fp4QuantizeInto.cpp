@@ -24,6 +24,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <torch/library.h>
@@ -45,17 +46,17 @@ template <typename T>
 void launchFp4QuantizeInto(at::Tensor const& input, at::Tensor const& globalScale, at::Tensor& out, at::Tensor& outSf,
     QuantizationSFLayout layout, int sms, cudaStream_t stream)
 {
-    kernels::invokeFP4Quantization<T, kSfVecSize>(1, static_cast<int>(input.size(0)), static_cast<int>(input.size(1)),
-        reinterpret_cast<T const*>(input.data_ptr()), globalScale.data_ptr<float>(),
-        reinterpret_cast<int64_t*>(out.data_ptr()), reinterpret_cast<int32_t*>(outSf.data_ptr()), false, layout, sms,
-        stream);
+    kernels::invokeFP4Quantization<T, kSfVecSize>(/*b=*/1, static_cast<int>(input.size(0)),
+        static_cast<int>(input.size(1)), static_cast<T const*>(input.data_ptr()), globalScale.data_ptr<float>(),
+        static_cast<int64_t*>(out.data_ptr()), static_cast<int32_t*>(outSf.data_ptr()), /*useUE8M0=*/false, layout,
+        sms, stream);
 }
 
 } // namespace
 
 // input: [M, K] half or bfloat16, K a multiple of 16, 16-byte aligned; globalScale: [1] float32. out: [M, K / 2]
 // uint8 (two E2M1 per byte); out_sf: uint8 [M, K / 16] in the linear layout, or at least the 128 x 4 swizzled
-// layout's padded size. Both contiguous on the input's device.
+// layout's padded size. All on the input's device; the outputs contiguous.
 void fp4QuantizeInto(
     at::Tensor const& input, at::Tensor const& globalScale, at::Tensor& out, at::Tensor& outSf, bool isSfSwizzledLayout)
 {
@@ -63,8 +64,9 @@ void fp4QuantizeInto(
     TORCH_CHECK(input.scalar_type() == at::kHalf || input.scalar_type() == at::kBFloat16, "input must be fp16 or bf16");
     // Each thread reads eight inputs as one 16-byte vector.
     TORCH_CHECK(reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0, "input needs 16-byte alignment");
-    TORCH_CHECK(globalScale.is_cuda() && globalScale.scalar_type() == at::kFloat && globalScale.numel() == 1,
-        "globalScale must be one float32 on the device");
+    TORCH_CHECK(globalScale.device() == input.device() && globalScale.scalar_type() == at::kFloat
+            && globalScale.numel() == 1,
+        "globalScale must be one float32 on the input's device");
     auto const m = input.size(0);
     auto const k = input.size(1);
     TORCH_CHECK(k % kSfVecSize == 0, "K must be a multiple of 16");
@@ -88,6 +90,7 @@ void fp4QuantizeInto(
     {
         return;
     }
+    c10::cuda::CUDAGuard const deviceGuard(input.device());
     auto const layout = isSfSwizzledLayout ? QuantizationSFLayout::SWIZZLED : QuantizationSFLayout::LINEAR;
     int const sms = at::cuda::getDeviceProperties(input.get_device())->multiProcessorCount;
     auto const stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -105,7 +108,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fp4_quantize_into(Tensor input, Tensor globalScale, Tensor(a!) out, Tensor(b!) out_sf, "
-        "bool isSfSwizzledLayout=False) -> ()");
+        "bool isSfSwizzledLayout) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
