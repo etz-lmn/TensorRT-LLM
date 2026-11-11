@@ -1227,6 +1227,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 lambda value: value == Int32(self.token_comm.metadata_ready_target),
                 scope="gpu",
             )
+            # The acquire orders the peers' token rows for the generic proxy only;
+            # the TMA loads that follow read them through the async proxy.
+            cute.arch.fence_proxy("async.global")
             iket.range_pop()
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_tma_gather_b1(

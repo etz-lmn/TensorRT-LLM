@@ -1010,6 +1010,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 expert_idx = work_tile.expert_idx
                 expert_sf_blocks = ceil_div(expert_sizes[expert_idx], Int32(self.sf_padding_block))
                 spin_wait(fc1_sf_ready_pointer + expert_idx, lambda value: value == expert_sf_blocks, scope="gpu")
+                # The acquire orders the refined FC1 scales for the generic proxy only;
+                # the TMA loads that follow read them through the async proxy.
+                cute.arch.fence_proxy("async.global")
                 iket.range_pop()
                 k_tile_count = self.fc1_k_tile_count
                 real_sfb, sfb_descriptor_ptr = kernel_extension.get_gmem_tensor("sfb", fc1_tma_sfb_tensor, work_tile)
@@ -1063,6 +1066,9 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                     sleep_cycles=500,
                     peek_status=work_tile.peek_ready,
                 )
+                # The acquire orders the FC1 output and its scales for the generic proxy only;
+                # the TMA loads that follow read them through the async proxy.
+                cute.arch.fence_proxy("async.global")
                 iket.range_pop()
 
                 k_tile_count = self.fc2_k_tile_count

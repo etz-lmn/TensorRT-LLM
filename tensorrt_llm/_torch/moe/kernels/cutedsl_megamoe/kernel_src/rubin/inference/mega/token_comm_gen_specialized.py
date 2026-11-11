@@ -1984,6 +1984,10 @@ class GenphaseTokenComm(KernelComponent):
                 scope="sys",
             )
         cute.arch.sync_threads()
+        # Thread 0's acquire, passed on by the barrier, orders the received
+        # scales for the generic proxy only; the TMA loads below read them
+        # through the async proxy.
+        cute.arch.fence_proxy("async.global")
         iket.range_pop()
 
         group_mbarriers = self._smem_workspace.ptr(self.refine_mbarrier_region, smem_base)

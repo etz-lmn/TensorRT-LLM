@@ -565,7 +565,8 @@ class _MetadataPushRouter(KernelComponent):
             iket.range_pop()
 
             iket.range_push("router.prefix_and_publish")
-            # Ordinary stores wrote the counts; the bulk copy that publishes them reads them through the async proxy.
+            # Generic-proxy writes (stores or shared-memory atomics) produced the counts; the bulk
+            # copy that publishes them reads them through the async proxy.
             cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.sync_threads()
             publish_sizes = self._broadcast_sizes_to_peers(
@@ -733,7 +734,8 @@ class _MetadataPushRouter(KernelComponent):
                     cta_histograms[cta_idx, expert] = running
                     running = running + count
                 totals[expert] = running
-        # Ordinary stores wrote the counts; the bulk copy that publishes them reads them through the async proxy.
+        # Generic-proxy writes (stores or shared-memory atomics) produced the counts; the bulk
+        # copy that publishes them reads them through the async proxy.
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_threads()
 
@@ -2356,10 +2358,10 @@ class TokenCommDeterministic(KernelComponent):
                                     destination_sf_vectors[None, sf_vector_idx],
                                 )
 
-                    if cutlass.const_expr(self.token_in_flag_batch == 1):
-                        cute.arch.cp_async_bulk_wait_group(0)
-                    elif cutlass.const_expr(not self.token_in_stage_split):
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    # The FC1 GEMM reads this row with TMA once the flag below is visible, so the
+                    # bulk store has to be complete, not only done reading the stage (read=True),
+                    # before the flag is published, batched or not.
+                    cute.arch.cp_async_bulk_wait_group(0)
                     cute.arch.sync_warp()
                     ready_address = (fc1_ready_counter + ready_slot_idx).toint()
                     flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)

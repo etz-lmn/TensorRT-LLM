@@ -2114,7 +2114,10 @@ class TokenCommDedup(KernelComponent):
                             destination_sf_vectors[None, sf_vector_idx],
                         )
 
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                # The FC1 GEMM reads this row with TMA once the flag below is visible, so the
+                # bulk store has to be complete, not only done reading the stage (read=True),
+                # before the flag is published, batched or not.
+                cute.arch.cp_async_bulk_wait_group(0)
                 cute.arch.sync_warp()
                 ready_address = (fc1_ready_counter + ready_slot_idx).toint()
                 flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)

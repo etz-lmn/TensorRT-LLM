@@ -939,6 +939,9 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                     sleep_cycles=500,
                     peek_status=work_tile.peek_ready,
                 )
+                # The acquire orders the FC1 output and its scales for the generic proxy only;
+                # the TMA loads that follow read them through the async proxy.
+                cute.arch.fence_proxy("async.global")
                 iket.range_pop()
 
                 k_tile_count = self.fc2_k_tile_count

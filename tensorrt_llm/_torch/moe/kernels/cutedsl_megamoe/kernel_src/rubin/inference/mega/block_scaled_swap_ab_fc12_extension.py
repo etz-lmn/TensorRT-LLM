@@ -137,6 +137,10 @@ class BlockScaledSwapAbFc12Extension:
                 lambda value: value >= work_tile.valid_tokens_in_cta_tile,
                 peek_status=work_tile.peek_ready,
             )
+            # The acquire (or the scheduler warp's peek) orders the FC1 input rows
+            # and scales for the generic proxy only; the TMA loads that follow read
+            # them through the async proxy.
+            cute.arch.fence_proxy("async.global")
 
     @cute.jit
     def get_gmem_tensor(

@@ -25,7 +25,11 @@ proxy wrote and the other reads needs a proxy fence in between:
   the writes.
 - Consumption: a thread that acquires a flag and then reads the data it publishes with
   TMA issues ``fence.proxy.async.global`` between the two. The acquire orders the data
-  for the generic proxy only.
+  for the generic proxy only. This holds for the token communication and for the GEMM
+  kernels that read the FC1 input and the FC1 output after a counter wait.
+- Completion: ``token_in`` publishes a token row's FC1 ready flag only after the bulk
+  store of that row has completed; ``cp.async.bulk.wait_group.read`` waits only until the
+  store has read its shared-memory stage.
 """
 
 import ast
@@ -39,7 +43,9 @@ _ROOT = Path(__file__).resolve().parents[4]
 _NVLINK_DOMAIN = (
     _ROOT / "tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/communication/nvlink_domain"
 )
-_SOURCES = ["token_comm.py", "token_comm_dedup.py", "token_comm_deterministic.py"]
+_SOURCES = sorted(
+    path.name for path in _NVLINK_DOMAIN.glob("*.py") if 'sem="acquire"' in path.read_text()
+)
 _PUBLISH = "_broadcast_sizes_to_peers"
 _PREAMBLE = [
     "cute.arch.fence_proxy('async.shared', space='cta')",
@@ -144,6 +150,9 @@ def _acquire_waits(source: Path) -> list[tuple[str, str, int, list[str]]]:
                 flag = _helper_wait(statement)
                 if flag is None and isinstance(statement, ast.While):
                     flag = _acquired_flag(statement)
+                if flag is None:
+                    # A wait written with spin_wait is a wait too, and has to be sorted.
+                    flag = _spin_wait_flag(statement)
                 if flag is not None:
                     after = [ast.unparse(s) for s in body[index + 1 : index + 3]]
                     waits.append((function.name, flag, statement.lineno, after))
@@ -180,3 +189,216 @@ def test_tma_reads_of_published_data_follow_a_proxy_fence(source: str) -> None:
         assert after[:1] == [_GLOBAL_FENCE], (
             f"{source}:{lineno} {method} reads {flag}'s data with TMA unfenced"
         )
+
+
+# ----------------------------------------------------------------------------- bulk drain
+
+
+def _fc1_ready_publications(source: Path) -> list[tuple[int, str, int]]:
+    """Each publication of a token row's FC1 ready flag, as (line, the last bulk wait before
+    it, the line of the last bulk store before it), within its method."""
+    sites = []
+    for function in ast.walk(ast.parse(source.read_text())):
+        if not isinstance(function, ast.FunctionDef):
+            continue
+        calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+        waits = [c for c in calls if ast.unparse(c.func) == "cute.arch.cp_async_bulk_wait_group"]
+        stores = [c.lineno for c in calls if ast.unparse(c.func) == "cp_async_bulk_s2g"]
+        for call in calls:
+            if not (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "accumulate"
+                and "self.token_in_flag_batch" in ast.unparse(call)
+            ):
+                continue
+            earlier_waits = [w for w in waits if w.lineno < call.lineno]
+            last_wait = max(earlier_waits, key=lambda w: w.lineno) if earlier_waits else None
+            last_store = max((line for line in stores if line < call.lineno), default=0)
+            sites.append(
+                (
+                    call.lineno,
+                    "" if last_wait is None else f"{last_wait.lineno}:{ast.unparse(last_wait)}",
+                    last_store,
+                )
+            )
+    return sites
+
+
+@pytest.mark.parametrize("source", _SOURCES)
+def test_fc1_ready_is_published_after_the_row_store_completes(source: str) -> None:
+    sites = _fc1_ready_publications(_NVLINK_DOMAIN / source)
+
+    assert sites
+    for lineno, last_wait, last_store in sites:
+        wait_line, _, wait = last_wait.partition(":")
+        assert wait == "cute.arch.cp_async_bulk_wait_group(0)" and int(wait_line) > last_store, (
+            f"{source}:{lineno} publishes FC1 ready before its bulk store completes "
+            f"(last bulk store at {last_store}, last wait {last_wait})"
+        )
+
+
+# ----------------------------------------------------------------------------- GEMM-side waits
+
+_KERNEL_SRC = _ROOT / "tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/kernel_src"
+_SKIPPED_AFTER_A_WAIT = {
+    "iket.range_pop()",
+    "cute.arch.sync_threads()",
+    "cute.arch.sync_warp()",
+}
+
+# Every spin_wait of the kernel sources that read data another CTA or rank published, as
+# (file, method, flag) -> whether TMA reads the data it guards. A new wait has to be sorted.
+_KERNEL_WAITS = {
+    (
+        "blackwell/inference/mega/block_scaled_swap_ab_fc12_extension.py",
+        "wait_for_input",
+        "counter_pointer",
+    ): True,
+    (
+        "blackwell/inference/mega/block_scaled_swap_ab_fc12_mainloop.py",
+        "run_tma_b",
+        "counter_pointer",
+    ): True,
+    (
+        "rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py",
+        "wait_for_input",
+        "counter_pointer",
+    ): True,
+    (
+        "rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py",
+        "run_tma_b",
+        "counter_pointer",
+    ): True,
+    (
+        "rubin/inference/local_mega/block_scaled_swap_ab_fc12_mainloop.py",
+        "run_tma_b",
+        "counter_pointer",
+    ): True,
+    (
+        "rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py",
+        "run_tma_b",
+        "counter_pointer",
+    ): True,
+    (
+        "rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py",
+        "run_tma_b",
+        "fc1_sf_ready_pointer",
+    ): True,
+    (
+        "rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py",
+        "_kernel",
+        "self.token_comm.token_data_ready_region",
+    ): True,
+    (
+        "rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py",
+        "_kernel",
+        "self.token_comm.sizes_ready_region",
+    ): False,
+    (
+        "rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py",
+        "_kernel",
+        "self.token_comm.metadata_ready_region",
+    ): None,  # the epilogue reads the records with loads; the gather warps read the rows with TMA
+    (
+        "rubin/inference/mega/token_comm_gen_specialized.py",
+        "_run_refine",
+        "self.metadata_ready_region",
+    ): True,
+    (
+        "rubin/inference/mega/token_comm_gen_specialized.py",
+        "_run_refine",
+        "self.token_sf_plain_ready_region",
+    ): True,
+    (
+        "rubin/inference/mega/token_comm_gen_specialized.py",
+        "_run_sort",
+        "self.topk_ready_region",
+    ): False,
+    (
+        "rubin/inference/mega/token_comm_gen_specialized.py",
+        "_run_sort",
+        "self.prefix_ready_region",
+    ): False,
+    (
+        "rubin/inference/mega/token_comm_gen_specialized.py",
+        "_run_helper",
+        "self.rank_count_ready_region",
+    ): False,
+}
+
+
+def _spin_wait_flag(statement: ast.stmt) -> str | None:
+    """The flag a ``spin_wait(...)`` statement waits on: the region a ``ptr(...)`` names,
+    or the root name of the address."""
+    if not (
+        isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Call)
+        and ast.unparse(statement.value.func) == "spin_wait"
+    ):
+        return None
+    address = statement.value.args[0]
+    while isinstance(address, ast.BinOp):
+        address = address.left
+    if isinstance(address, ast.Call) and getattr(address.func, "attr", None) == "ptr":
+        address = address.args[0]
+    return ast.unparse(address)
+
+
+def _wait_flags(statement: ast.stmt) -> list[str]:
+    """The flags a statement waits on: a spin_wait, or a block of them one thread runs."""
+    flag = _spin_wait_flag(statement)
+    if flag is not None:
+        return [flag]
+    if isinstance(statement, ast.If) and not statement.orelse:
+        flags = [_spin_wait_flag(s) for s in statement.body]
+        if flags and all(flags):
+            return flags
+    return []
+
+
+def _kernel_waits(path: Path) -> list[tuple[str, list[str], int, str]]:
+    """Each wait as (method, flags, line, the first statement after it that is not a barrier,
+    a profiler range or another wait)."""
+    waits = []
+    tree = ast.parse(path.read_text())
+    # The waits inside a one-thread block are found as the block.
+    blocks = {
+        id(node.body) for node in ast.walk(tree) if isinstance(node, ast.If) and _wait_flags(node)
+    }
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.FunctionDef):
+            continue
+        for body in _bodies(function):
+            if id(body) in blocks:
+                continue
+            index = 0
+            while index < len(body):
+                flags = _wait_flags(body[index])
+                if not flags:
+                    index += 1
+                    continue
+                lineno = body[index].lineno
+                index += 1
+                while index < len(body) and (
+                    _wait_flags(body[index]) or ast.unparse(body[index]) in _SKIPPED_AFTER_A_WAIT
+                ):
+                    flags += _wait_flags(body[index])
+                    index += 1
+                after = ast.unparse(body[index]) if index < len(body) else ""
+                waits.append((function.name, flags, lineno, after))
+    return waits
+
+
+@pytest.mark.parametrize("source", sorted({file for file, _, _ in _KERNEL_WAITS}))
+def test_gemm_tma_reads_after_a_counter_wait_follow_a_proxy_fence(source: str) -> None:
+    waits = _kernel_waits(_KERNEL_SRC / source)
+
+    found = {(source, method, flag) for method, flags, _, _ in waits for flag in flags}
+    expected = {key for key in _KERNEL_WAITS if key[0] == source}
+    assert found == expected, f"{source}: sort the acquire waits {sorted(found ^ expected)}"
+    for method, flags, lineno, after in waits:
+        reads_with_tma = [_KERNEL_WAITS[(source, method, flag)] for flag in flags]
+        if any(reads_with_tma):
+            assert after == _GLOBAL_FENCE, (
+                f"{source}:{lineno} {method} reads {flags}'s data with TMA unfenced"
+            )
