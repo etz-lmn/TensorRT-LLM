@@ -38,18 +38,22 @@ def test_the_staging_of_the_next_run_is_handed_out_only_for_a_run_that_stages():
         _genphase_direct_input_buckets={4},
         dtype=torch.bfloat16,
         hidden_size=4,
+        routing_method=SimpleNamespace(experts_per_token=2),
         _local_staging_cache={},
         _select_launch_max_tokens=lambda hint: 4 if hint <= 4 else 8,
         _acquire_buffers=lambda **kw: acquired.append(kw) or bufs,
     )
-    backend._reads_inputs_in_place = types.MethodType(IMPL._reads_inputs_in_place, backend)
+    backend._may_read_inputs_in_place = types.MethodType(IMPL._may_read_inputs_in_place, backend)
+    cpu = torch.device("cpu")
     staging = types.MethodType(IMPL._staging_of_next_run, backend)
-    assert staging(2) is None  # no bucket hint yet
+    assert staging(2, cpu) is None  # no bucket hint yet
     backend._active_launch_max_tokens = 3
-    assert staging(2) is None  # the staging is not built
+    assert staging(2, cpu) is None  # the staging is not built
     backend._local_staging_cache[mm._StagingKey(4, 2, 4, "cpu", torch.bfloat16)] = {}
-    got, bucket = staging(2)
-    assert got is bufs and bucket == 4
-    assert acquired[-1]["launch_max_T"] == 4 and acquired[-1]["device"] == torch.device("cpu")
-    for rows in (4, 5):  # an exact-size direct-input bucket; the next bucket is not built
-        assert staging(rows) is None
+    assert staging(2, cpu) is bufs
+    assert acquired[-1]["launch_max_T"] == 4 and acquired[-1]["device"] == cpu
+    assert staging(2, torch.device("meta")) is None  # a staging set of another device
+    assert staging(4, cpu) is None  # an exact-size direct-input bucket
+    assert staging(5, cpu) is None  # more rows than the hinted bucket holds
+    backend._active_launch_max_tokens = 5
+    assert staging(5, cpu) is None  # bucket 8 is selected but not built

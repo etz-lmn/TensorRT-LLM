@@ -169,9 +169,9 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 _TACTIC_LEN = 11
 _TACTIC_LEN_V4 = 10
 _LEGACY_TACTIC_LEN = 8
-# SMs whose load-balanced (helper-bearing) tactic candidates also come with atomic-counter work
-# ids; measured on SM103, and SM100 runs the same kernel.
-_ATOMIC_COUNTER_HELPER_SMS = (100, 103)
+# SM versions whose load-balanced (helper-bearing) tactic candidates also come with atomic-counter
+# work ids; measured on SM103, and SM100 runs the same kernel.
+_ATOMIC_COUNTER_TWIN_SM_VERSIONS = (100, 103)
 _DEFAULT_TOKEN_BACK_READY_GRANULARITY = "expert"  # nosec B105 -- scheduler mode name, not a credential
 _TOKEN_BACK_READY_GRANULARITIES = ("expert", "token_tile")
 
@@ -1246,9 +1246,9 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
             )
 
 
-def _with_atomic_counter_work_ids(candidates: List[Tuple], sm_version: int) -> List[Tuple]:
+def _with_atomic_counter_work_ids(candidates: list[Tuple], sm_version: int) -> list[Tuple]:
     """The candidates of a helper-bearing (load-balanced) launch and, on
-    _ATOMIC_COUNTER_HELPER_SMS, each one's twin with atomic-counter work ids.
+    _ATOMIC_COUNTER_TWIN_SM_VERSIONS, each one's twin with atomic-counter work ids.
 
     The autotuner then chooses the work-id mode per shape.
 
@@ -1258,7 +1258,7 @@ def _with_atomic_counter_work_ids(candidates: List[Tuple], sm_version: int) -> L
     from its candidate only in the work-id field and is validated again. Other
     SMs keep their candidates.
     """
-    if sm_version not in _ATOMIC_COUNTER_HELPER_SMS:
+    if sm_version not in _ATOMIC_COUNTER_TWIN_SM_VERSIONS:
         return list(candidates)
     tactics = list(candidates)
     canonical = [tuple(_unpack_tactic(tactic)) for tactic in candidates]
