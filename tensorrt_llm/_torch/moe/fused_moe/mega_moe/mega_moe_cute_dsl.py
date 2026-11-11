@@ -1220,10 +1220,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         HALO-Q/TMA kernel of a replica plan; zero uses the default
         quantization overload.
 
-        With a bucket hint set (``set_adaptive_launch_tokens``), no reserved
-        SMs and an SF row that needs no padding, the rows are quantized
-        straight into the staging of the bucket the next ``run_moe`` selects,
-        and the returned tensors are views of it. On EP>1 that staging is the
+        With a bucket hint set (``set_adaptive_launch_tokens``) and an SF row
+        that needs no padding, the rows are quantized straight into the
+        staging of the bucket the next ``run_moe`` selects (with the same SM
+        reservation), and the returned tensors are views of it. On EP>1 that staging is the
         symmetric region every same-shape MegaMoE layer shares, so the views
         hold these rows only until the next MegaMoE ``quantize_input`` or
         ``run_moe``. That ``run_moe`` raises unless it launches exactly these
@@ -1261,14 +1261,17 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # rows, which run_moe recognizes by address and does not copy again.
         staged = (
             self._staging_of_next_run(x_bf16.shape[0], x_bf16.device)
-            if reserved_sms == 0 and sf_cols == raw_cols
+            if sf_cols == raw_cols
             else None
         )
         if staged is not None:
             rows = x_bf16.shape[0]
             x_fp4 = staged.activation[:rows]
             x_sf = staged.activation_sf[:rows]
-            torch.ops.trtllm.fp4_quantize_into(x_bf16, self.fc31_input_scale, x_fp4, x_sf, False)
+            # Positional, linear scale factors, and the replica plan's SMs left to HALO-Q/TMA.
+            torch.ops.trtllm.fp4_quantize.into(
+                x_bf16, self.fc31_input_scale, x_fp4, x_sf, False, reserved_sms
+            )
             self._quantized_into = (staged.activation.data_ptr(), rows)
             return x_fp4, x_sf
         # Leave a replica plan's SMs to its concurrent HALO-Q/TMA kernel. The

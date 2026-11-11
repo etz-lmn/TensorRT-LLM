@@ -2519,6 +2519,10 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(monkeypatch, requ
         calls.append(("sm_budget", sf_vec_size, sf_use_ue8m0, is_sf_swizzled, reserved_sms))
         return outputs(x)
 
+    def into(x, scale, out, out_sf, is_sf_swizzled, reserved_sms):
+        calls.append(("into", is_sf_swizzled, reserved_sms))
+
+    fp4_quantize.into = into
     if has_sm_budget:
         fp4_quantize.sm_budget = sm_budget
     monkeypatch.setattr(torch.ops.trtllm, "fp4_quantize", fp4_quantize, raising=False)
@@ -2532,10 +2536,17 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(monkeypatch, requ
 
     moe.quantize_input(x)
     moe.quantize_input(x, reserved_sms=4)
+    # A forward that run_moe stages quantizes into the staging, with the same reservation.
+    staging = SimpleNamespace(
+        activation=outputs(x)[0], activation_sf=torch.zeros(3, 4, dtype=torch.uint8)
+    )
+    moe._staging_of_next_run = lambda rows, device: staging
+    moe.quantize_input(x)
+    moe.quantize_input(x, reserved_sms=4)
 
     default = ("default", 16, False, False)
     budget = ("sm_budget", 16, False, False, 4) if has_sm_budget else default
-    assert calls == [default, budget]
+    assert calls == [default, budget, ("into", False, 0), ("into", False, 4)]
 
 
 @pytest.mark.cpu_only
@@ -5074,13 +5085,13 @@ def test_megamoe_cutedsl_nvfp4_awq_matches_cutlass() -> None:
         ref_fused_moe.check_accuracy(megamoe_output, unscaled_ref_output)
 
 
-@pytest.mark.parametrize("reserved_sms", [0])
+@pytest.mark.parametrize("reserved_sms", [0, 8])
 def test_megamoe_cutedsl_quantizes_into_the_staging_of_a_hinted_run(
     monkeypatch: pytest.MonkeyPatch, reserved_sms: int
 ) -> None:
     """With the bucket hint set and the bucket's staging built, ``quantize_input`` quantizes into
     that staging and ``run_moe`` launches from it without copying the activation; the rows and the
-    output equal the copy path's bit for bit."""
+    output equal the copy path's bit for bit, also with SMs left to a replica plan's HALO-Q/TMA."""
     dtype, num_experts, top_k = torch.bfloat16, 8, 2
     hidden_size, intermediate_size, seq_len = 512, 512, 16
     verdict = MegaMoECuteDsl.can_implement(
