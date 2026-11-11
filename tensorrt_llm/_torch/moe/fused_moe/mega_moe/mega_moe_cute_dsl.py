@@ -1312,7 +1312,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         )
 
     def _wait_rebalance_routes(self, replica_plan=None) -> None:
-        """Order route consumers after HALO-Q while leaving setup overlapped."""
+        """Order route consumers after HALO-Q.
+
+        Only the activation staging runs before this wait; the route staging, tails included,
+        runs after it."""
         if replica_plan is not None:
             replica_plan.wait_for_routes()
 
@@ -1606,12 +1609,16 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         ``num_tokens`` alone, so a CUDA graph replay resets rows that an
         eager launch into the same bucket wrote after the capture.
         """
+        if topk_idx.shape[0] != num_tokens:
+            raise ValueError(
+                f"MegaMoECuteDsl staging got {topk_idx.shape[0]} route rows for {num_tokens} tokens"
+            )
         if stage_activation and num_tokens > 0:
             bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
             bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
         self._wait_rebalance_routes(replica_plan)
         torch.ops.trtllm.megamoe_stage_routes(
-            topk_idx, topk_weights, bufs.topk_idx_local, bufs.topk_weights[:, :top_k]
+            topk_idx, topk_weights, bufs.topk_idx_local, bufs.topk_weights
         )
 
     def _launch_megamoe_kernel(
@@ -1861,13 +1868,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 output_dtype=output_dtype,
                 launch_max_T=max_T,
             )
-            # A launch without rows: its routes are the bucket's own zero leading rows.
+            # A launch without rows: empty routes, so the op writes -1 and 0 into every row of the
+            # bucket.
             self._stage_inputs(
                 bufs=bufs,
                 x=None,
                 x_sf=None,
-                topk_idx=bufs.topk_idx_local[:0],
-                topk_weights=bufs.topk_weights[:0, :top_k],
+                topk_idx=bufs.topk_idx_local.new_empty((0, top_k)),
+                topk_weights=bufs.topk_weights.new_empty((0, top_k)),
                 num_tokens=0,
                 top_k=top_k,
                 stage_activation=False,
@@ -1877,7 +1885,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 activation=bufs.activation,
                 activation_sf=bufs.activation_sf,
                 topk_idx=bufs.topk_idx_local,
-                topk_weights=bufs.topk_weights[:, :top_k],
+                topk_weights=bufs.topk_weights,
                 weight_view=weight_view,
                 combine_output=bufs.combine_output,
                 shared_workspace=bufs.shared_workspace,
@@ -2004,9 +2012,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             activation=x if use_direct_inputs else bufs.activation,
             activation_sf=x_sf if use_direct_inputs else bufs.activation_sf,
             topk_idx=topk_idx if use_direct_routing_inputs else bufs.topk_idx_local,
-            topk_weights=(
-                topk_weights if use_direct_routing_inputs else bufs.topk_weights[:, :top_k]
-            ),
+            topk_weights=topk_weights if use_direct_routing_inputs else bufs.topk_weights,
             weight_view=weight_view,
             combine_output=bufs.combine_output,
             shared_workspace=bufs.shared_workspace,

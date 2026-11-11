@@ -1807,27 +1807,24 @@ def test_route_wait_occurs_after_independent_staging():
         },
     )
 
-    def run():
-        owner = impl()
-        owner._wait_rebalance_routes = lambda replica_plan=None: trace.append("wait")
-        bufs = SimpleNamespace(
-            **{
-                key: _StageTensor(key, trace)
-                for key in ("topk_idx_local", "activation", "activation_sf", "topk_weights")
-            }
-        )
-        owner._stage_inputs(
-            bufs=bufs,
-            x=_StageTensor("x", trace),
-            x_sf=_StageTensor("sf", trace),
-            topk_idx=_StageTensor("routes", trace),
-            topk_weights=_StageTensor("weights", trace),
-            num_tokens=4,
-            top_k=6,
-            stage_activation=True,
-        )
-
-    run()
+    owner = impl()
+    owner._wait_rebalance_routes = lambda replica_plan=None: trace.append("wait")
+    bufs = SimpleNamespace(
+        **{
+            key: _StageTensor(key, trace)
+            for key in ("topk_idx_local", "activation", "activation_sf", "topk_weights")
+        }
+    )
+    owner._stage_inputs(
+        bufs=bufs,
+        x=_StageTensor("x", trace),
+        x_sf=_StageTensor("sf", trace),
+        topk_idx=_StageTensor("routes", trace, shape=(4, 6)),
+        topk_weights=_StageTensor("weights", trace, shape=(4, 6)),
+        num_tokens=4,
+        top_k=6,
+        stage_activation=True,
+    )
     # The activation stages before the wait; one op after it writes the slot ids and
     # gate weights of the whole bucket.
     assert trace == [

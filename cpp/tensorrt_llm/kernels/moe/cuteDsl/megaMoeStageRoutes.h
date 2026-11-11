@@ -27,12 +27,12 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-//! Stages one MegaMoE launch's routes into its bucket in one launch: rows [0, liveRows) of the [rows, topK] buffers get
-//! the routes' expert ids (converted to OutT) and float32 gate weights, rows [liveRows, rows) get id -1 and weight 0.
-//! weightsOut has a unit column stride and row stride weightsRowStride; its columns from topK on are not written.
+//! Stages one MegaMoE launch's routes into its bucket in one launch: rows [0, liveRows) of the contiguous [rows, topK]
+//! buffers get the routes' expert ids (converted to OutT) and float32 gate weights, rows [liveRows, rows) get id -1 and
+//! weight 0.
 template <typename IdT, typename OutT>
 void megaMoeStageRoutes(IdT const* ids, float const* weights, int64_t liveRows, OutT* idsOut, float* weightsOut,
-    int64_t weightsRowStride, int64_t rows, int topK, cudaStream_t stream);
+    int64_t rows, int topK, cudaStream_t stream);
 
 } // namespace kernels
 

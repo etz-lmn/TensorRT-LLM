@@ -24,6 +24,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/library.h>
 
 #include <cstdint>
@@ -37,60 +38,56 @@ namespace
 {
 
 template <typename IdT, typename OutT>
-void stageRoutes(at::Tensor const& ids, at::Tensor const& weights, at::Tensor& idsOut, at::Tensor& weightsOut)
+void launchStageRoutes(at::Tensor const& ids, at::Tensor const& weights, at::Tensor& idsOut, at::Tensor& weightsOut)
 {
-    auto const rows = idsOut.size(0);
-    auto const topK = idsOut.size(1);
-    auto const live = ids.size(0) * topK;
-    auto const* id = ids.data_ptr<IdT>();
-    auto const* weight = weights.data_ptr<float>();
-    auto* idOut = idsOut.data_ptr<OutT>();
-    auto* weightOut = weightsOut.data_ptr<float>();
-    if (idsOut.is_cuda())
-    {
-        kernels::megaMoeStageRoutes<IdT, OutT>(id, weight, ids.size(0), idOut, weightOut, weightsOut.stride(0), rows,
-            static_cast<int>(topK), at::cuda::getCurrentCUDAStream(idsOut.get_device()));
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        return;
-    }
-    for (int64_t i = 0; i < rows * topK; ++i)
-    {
-        idOut[i] = i < live ? static_cast<OutT>(id[i]) : OutT(-1);
-        weightOut[i / topK * weightsOut.stride(0) + i % topK] = i < live ? weight[i] : 0.F;
-    }
+    kernels::megaMoeStageRoutes<IdT, OutT>(ids.data_ptr<IdT>(), weights.data_ptr<float>(), ids.size(0),
+        idsOut.data_ptr<OutT>(), weightsOut.data_ptr<float>(), idsOut.size(0), static_cast<int>(idsOut.size(1)),
+        at::cuda::getCurrentCUDAStream(idsOut.get_device()));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 } // namespace
 
 // ids: [n, top_k] int32 or int64 expert ids; weights: [n, top_k] float32. ids_out: [rows, top_k] int32 or int64 with
-// rows >= n; weights_out: [rows, top_k] float32 with a unit column stride. All contiguous on one device. Rows [0, n)
-// of the outputs get the ids and weights, rows [n, rows) id -1 and weight 0.
+// rows >= n; weights_out: [rows, top_k] float32. All contiguous on one device. Rows [0, n) of the outputs get the ids
+// and weights, rows [n, rows) id -1 and weight 0.
 void megaMoeStageRoutes(at::Tensor const& ids, at::Tensor const& weights, at::Tensor& idsOut, at::Tensor& weightsOut)
 {
-    TORCH_CHECK(ids.defined() && weights.defined(), "ids and weights are required ([0, top_k] for no rows)");
     auto const isId = [](at::Tensor const& t) { return t.scalar_type() == at::kInt || t.scalar_type() == at::kLong; };
     TORCH_CHECK(isId(ids) && isId(idsOut), "ids and ids_out must be int32 or int64");
     TORCH_CHECK(weights.scalar_type() == at::kFloat && weightsOut.scalar_type() == at::kFloat,
         "weights and weights_out must be float32");
-    TORCH_CHECK(idsOut.dim() == 2 && idsOut.is_contiguous() && weightsOut.dim() == 2
-            && weightsOut.sizes() == idsOut.sizes() && weightsOut.stride(1) == 1,
-        "ids_out must be a contiguous [rows, top_k] buffer and weights_out [rows, top_k] with a unit column stride");
+    TORCH_CHECK(idsOut.dim() == 2 && idsOut.is_contiguous() && weightsOut.sizes() == idsOut.sizes()
+            && weightsOut.is_contiguous(),
+        "ids_out and weights_out must be contiguous [rows, top_k] buffers");
     TORCH_CHECK(ids.dim() == 2 && ids.size(1) == idsOut.size(1) && ids.size(0) <= idsOut.size(0)
             && weights.sizes() == ids.sizes() && ids.is_contiguous() && weights.is_contiguous(),
         "ids and weights must be contiguous [n, top_k] with n at most the rows of ids_out");
     TORCH_CHECK(ids.device() == idsOut.device() && weights.device() == idsOut.device()
             && weightsOut.device() == idsOut.device(),
         "all tensors must be on one device");
+    auto const n = ids.size(0);
+    auto const rows = idsOut.size(0);
+    if (!idsOut.is_cuda())
+    {
+        // The reference staging, in torch ops: copy_ widens the ids.
+        idsOut.narrow(0, 0, n).copy_(ids);
+        idsOut.narrow(0, n, rows - n).fill_(-1);
+        weightsOut.narrow(0, 0, n).copy_(weights);
+        weightsOut.narrow(0, n, rows - n).zero_();
+        return;
+    }
+    c10::cuda::CUDAGuard const deviceGuard(idsOut.device());
     bool const wideIds = ids.scalar_type() == at::kLong;
     if (idsOut.scalar_type() == at::kLong)
     {
-        wideIds ? stageRoutes<int64_t, int64_t>(ids, weights, idsOut, weightsOut)
-                : stageRoutes<int32_t, int64_t>(ids, weights, idsOut, weightsOut);
+        wideIds ? launchStageRoutes<int64_t, int64_t>(ids, weights, idsOut, weightsOut)
+                : launchStageRoutes<int32_t, int64_t>(ids, weights, idsOut, weightsOut);
     }
     else
     {
-        wideIds ? stageRoutes<int64_t, int32_t>(ids, weights, idsOut, weightsOut)
-                : stageRoutes<int32_t, int32_t>(ids, weights, idsOut, weightsOut);
+        wideIds ? launchStageRoutes<int64_t, int32_t>(ids, weights, idsOut, weightsOut)
+                : launchStageRoutes<int32_t, int32_t>(ids, weights, idsOut, weightsOut);
     }
 }
 
