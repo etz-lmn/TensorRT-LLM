@@ -566,18 +566,7 @@ def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
     assert get_moe_load_balancer() is None
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("capturing", [False, True])
-def test_statistic_allreduce_is_joined_before_an_eager_moe_launch(
-        monkeypatch: pytest.MonkeyPatch, capturing: bool) -> None:
-    """Under multi-stream the EP-wide statistic allreduce runs on the auxiliary
-    stream. An eager forward joins it into the current stream before
-    update_statistic_with_local_ids returns, so the MoE kernel launched next
-    cannot overlap it; a stream being captured keeps the overlap."""
-    from tensorrt_llm._torch.moe.fused_moe import \
-        moe_load_balancer as moe_load_balancer_module
-
-    trace = []
+def _statistic_layer(trace: list) -> SingleLayerMoeLoadBalancer:
     layer = SingleLayerMoeLoadBalancer.__new__(SingleLayerMoeLoadBalancer)
     layer.func_called_count = collections.defaultdict(int)
     layer.func_called_count["done_wait_gpu_stage"] = 1
@@ -586,7 +575,15 @@ def test_statistic_allreduce_is_joined_before_an_eager_moe_launch(
     layer.local_statistic_tensor = "local_statistic"
     layer.statistic_flag_tensor = "statistic_flag"
     layer.single_layer_load_balancer_ptr = "balancer"
+    layer.statistic_allreduce_event = SimpleNamespace(
+        record=lambda: trace.append("record:statistic"),
+        wait=lambda: trace.append("wait:statistic"))
     layer.update_local_statistic = lambda *args: trace.append("local")
+    return layer
+
+
+def _patch_streams(monkeypatch: pytest.MonkeyPatch, trace: list,
+                   capturing: bool) -> None:
 
     @contextlib.contextmanager
     def stream(name):
@@ -596,8 +593,9 @@ def test_statistic_allreduce_is_joined_before_an_eager_moe_launch(
 
     current_stream = SimpleNamespace(
         wait_stream=lambda name: trace.append(f"join:{name}"))
-    monkeypatch.setattr(moe_load_balancer_module, "do_multi_stream",
-                        lambda: True)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.do_multi_stream",
+        lambda: True)
     monkeypatch.setattr(torch.cuda, "stream", stream)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing",
@@ -607,14 +605,45 @@ def test_statistic_allreduce_is_joined_before_an_eager_moe_launch(
                         lambda *args: trace.append("update"),
                         raising=False)
 
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capturing", [False, True], ids=["eager", "capturing"])
+def test_statistic_allreduce_overlaps_on_the_aux_stream_and_records_its_end(
+        monkeypatch: pytest.MonkeyPatch, capturing: bool) -> None:
+    """Under multi-stream the EP-wide statistic allreduce runs on the auxiliary
+    stream and records an event when it ends, the same way whether the stream
+    is being captured or not; update_statistic_with_local_ids does not join it,
+    so routing, quantization and staging overlap it."""
+    trace = []
+    layer = _statistic_layer(trace)
+    _patch_streams(monkeypatch, trace, capturing)
+
     layer.update_statistic_with_local_ids(
         "expert_ids",
         is_first_stage=True,
         is_last_stage=True,
         allreduce=lambda tensor: trace.append("allreduce") or tensor)
 
-    expected = ["local", "enter:aux", "allreduce", "update", "exit:aux"]
-    assert trace == expected + ([] if capturing else ["join:aux"])
+    assert trace == [
+        "local", "enter:aux", "allreduce", "update", "record:statistic",
+        "exit:aux"
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capturing", [False, True], ids=["eager", "capturing"])
+def test_a_fused_moe_launch_waits_for_the_statistic_allreduce(
+        monkeypatch: pytest.MonkeyPatch, capturing: bool) -> None:
+    """wait_for_statistic_allreduce makes the current stream wait for the
+    event the allreduce recorded, in an eager forward and while capturing, so a
+    fused-communication kernel launched next never runs alongside it."""
+    trace = []
+    layer = _statistic_layer(trace)
+    _patch_streams(monkeypatch, trace, capturing)
+
+    layer.wait_for_statistic_allreduce()
+
+    assert trace == ["wait:statistic"]
 
 
 if __name__ == '__main__':
