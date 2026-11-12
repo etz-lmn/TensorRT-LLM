@@ -159,10 +159,6 @@ def copy_items(
     return items
 
 
-def _timings(by_group: dict[int, tuple[int, float]]) -> list[tuple[int, int, float]]:
-    return [(group, layers, ms) for group, (layers, ms) in sorted(by_group.items())]
-
-
 class _Decider:
     """State of the decision process: the committed layouts and every timing of the run."""
 
@@ -181,8 +177,9 @@ class _Decider:
         self.next_forwards: int | None = None
         self.open_call = 0
         self.awaiting_copy: dict[int, tuple] = {}
-        # (window, rows per forward [L, E]) of the last two deciding windows.
-        self.window_rows: deque[tuple[int, np.ndarray]] = deque(maxlen=2)
+        # (window, rows per forward [L, E], the requests they stand for) of the last two windows.
+        self.kept: deque[tuple[int, np.ndarray, float]] = deque(maxlen=2)
+        self.close_requests = self.largest_change = 0.0
         self.observe = os.environ.get(OBSERVE_ENV) == "1"
 
     def handle(self, message: tuple) -> tuple:
@@ -203,7 +200,7 @@ class _Decider:
             close,
             self.forwards,
             self.stats_copies,
-            _timings(self.install_timings),
+            [(group, *timing) for group, timing in sorted(self.install_timings.items())],
             growth,
             steps_left,
         )
@@ -247,51 +244,60 @@ class _Decider:
         if min(total["accepted"], total["requests"]) > 0:
             accepted_per_step = total["accepted"] / total["requests"]
             steps_left = total["remaining"] / accepted_per_step / total["requests"]
+        # A batch that changed between two closes more than it ever did (a steady batch never does, a
+        # draining one keeps doing so) is priced where the new layouts serve it: the requests at this
+        # close carried a window ahead at that rate, over their mean across the window.
+        requests, before = total["requests"], self.close_requests
+        change = abs(requests / before - 1.0) if min(requests, before) > 0.0 else 0.0
+        self.close_requests, ahead = requests, None
+        if change > self.largest_change:
+            ahead = requests * requests / before
+            rows = rows * (ahead / ((before + requests) / 2.0))
+        self.largest_change = max(self.largest_change, change)
+        requests = ahead or ((before + requests) / 2.0 if before > 0.0 else requests)
         applied_window = stats[:, layers * (experts + 1) : layers * (experts + 2)].min(0)
         planned = np.flatnonzero(self.committed <= applied_window)
         new_layout = np.empty((len(planned), slots), dtype=np.int64)
         new_shares = np.empty((len(planned), slots))
+        home = cfg.home_layouts[planned]
         for i, layer in enumerate(planned.tolist()):
-            homes = cfg.home_layouts[layer]
-            current = self.layout[layer]
-            new_layout[i] = plan_layout(rows[layer], geometry, homes, current, self.active).layout
+            plan = plan_layout(rows[layer], geometry, home[i], self.layout[layer], self.active)
+            new_layout[i] = plan.layout
             new_shares[i] = solve_shares(rows[layer], new_layout[i], geometry)
         current = (rows[planned], self.layout[planned], self.shares[planned])
         # The busiest rank's rows per forward size the CUDA graph bucket the steps pad to.
         model = cfg.model.at(float((routed.sum(2) / forwards).mean(1).max()))
         self.evaluations.model = model
         gains = evaluate_gains(*current, new_layout, new_shares, model, geometry)
-        timed = copy_ms_per_layer(_timings(self.copy_timings))
+        timed = copy_ms_per_layer([(g, *t) for g, t in sorted(self.copy_timings.items())])
         copy_ms = cfg.copy_ms if timed is None else timed
-        # The home layout is a candidate too: retiring the replicas copies nothing, so it replaces
-        # the plan where it gains more than the plan does net of a layer's copy over the steps left.
-        home = cfg.home_layouts[planned]
+        # The home layout is a candidate too: retiring the replicas copies nothing, so the plan stays
+        # only where it gains more than the home layout, net of a layer's copy over the steps left.
         home_shares = (home >= 0).astype(np.float64)
         home_gains = evaluate_gains(*current, home, home_shares, model, geometry)
-        left = steps_left or 0.0
-        to_home = (home_gains > 0.0) & (home_gains * left >= gains * left - (copy_ms or 0.0))
-        new_layout[to_home], new_shares[to_home] = home[to_home], home_shares[to_home]
-        gains[to_home] = home_gains[to_home]
+        left, copy = steps_left or 0.0, copy_ms or 0.0
+        to_home = (home_gains > 0.0) & (home_gains * left >= gains * left - copy)
         previous_load = None
         for i, layer in enumerate(planned.tolist()):
             # The latest kept window that neither the installed layout (planned on the window the
-            # layer was committed in) nor the new one (planned on this window) was planned on; a
-            # layer without one keeps only this window's gain.
-            seen = next(
-                (r for w, r in reversed(self.window_rows) if w != self.committed[layer]), None
-            )
+            # layer was committed in) nor the new one (planned on this window) was planned on, at
+            # this window's batch; a layer without one keeps only this window's gains.
+            seen = next((x for x in reversed(self.kept) if x[0] != self.committed[layer]), None)
             if seen is not None:
                 previous_load = current[0].copy() if previous_load is None else previous_load
-                previous_load[i] = seen[layer]
+                previous_load[i] = seen[1][layer] * (ahead / seen[2] if ahead and seen[2] else 1.0)
         if previous_load is not None:
-            # A candidate must also gain on that window.
-            previous_gains = evaluate_gains(
-                previous_load, *current[1:], new_layout, new_shares, model, geometry
-            )
-            gains = np.minimum(gains, previous_gains)
+            # Both candidates must also gain on that window, and the plan beat the home layout there.
+            earlier = (previous_load, *current[1:])
+            plan_gains = evaluate_gains(*earlier, new_layout, new_shares, model, geometry)
+            back_gains = evaluate_gains(*earlier, home, home_shares, model, geometry)
+            to_home |= (home_gains > 0.0) & (back_gains * left >= plan_gains * left - copy)
+            gains, home_gains = np.minimum(gains, plan_gains), np.minimum(home_gains, back_gains)
+        new_layout[to_home], new_shares[to_home] = home[to_home], home_shares[to_home]
+        gains[to_home] = home_gains[to_home]
         gain = dict(zip(planned.tolist(), gains.tolist()))
         retire = [layer for layer in planned[to_home].tolist() if gain.pop(layer) * left > 0.0]
-        chosen = choose_layers_to_install(gain, steps_left, copy_ms or 0.0)
+        chosen = choose_layers_to_install(gain, steps_left, copy)
         if copy_ms is None:
             # No copy has been timed yet: install the best layer alone to time one.
             chosen = chosen[:1]
@@ -301,7 +307,7 @@ class _Decider:
         growth = self.evaluations.read_cost(
             range(layers), rows, self.layout, self.shares, self.open_call
         )
-        self.window_rows.append((window, rows))
+        self.kept.append((window, rows, requests))
         self.awaiting_copy[window] = (close, growth, steps_left)
         moved = []
         for i, layer in enumerate(planned.tolist()):
@@ -728,8 +734,7 @@ class AdaptiveRuntime:
         if self._apply_event_pairs:
             begin, end = self._apply_event_pairs.popleft()
         else:
-            begin = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
+            begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         begin.record()
         if update.tables:
             first, stop = min(update.tables), max(update.tables) + 1
