@@ -62,13 +62,13 @@ from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
 from .impl_contract import MoECommPlan, MoERunContext, MoESortTables, PreroutedRouting
 from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
 
-# Measurement hook: stamps inside the open MoE pass (adaptive_eplb/probe.py) when the probe is on.
+# Measurement hook: stamps inside the open MoE pass (moe_probe.py) when the probe is on.
 _MOE_PROBE = bool(os.environ.get("TRTLLM_MOE_PROBE_DIR"))
 
 
 def _probe_point(point: str) -> None:
     if _MOE_PROBE:
-        from .adaptive_eplb.probe import active_probe
+        from .moe_probe import active_probe
 
         probe = active_probe()
         if probe is not None:

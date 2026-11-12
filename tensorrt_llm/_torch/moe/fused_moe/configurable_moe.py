@@ -60,7 +60,7 @@ from .activation import install_activation_params
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
 
-# Measurement hook: GPU timestamps inside every MoE pass (adaptive_eplb/probe.py), only when this
+# Measurement hook: GPU timestamps inside every MoE pass (moe_probe.py), only when this
 # names a directory.
 _MOE_PROBE_DIR = os.environ.get("TRTLLM_MOE_PROBE_DIR")
 
@@ -851,7 +851,7 @@ class ConfigurableMoE(MoE):
 
         probe = None
         if _MOE_PROBE_DIR:
-            from .adaptive_eplb.probe import probe_for
+            from .moe_probe import probe_for
 
             probe = probe_for(_MOE_PROBE_DIR, self.mapping.rank)
             probe.stamp(self.layer_idx, 0, router_logits.shape[0])

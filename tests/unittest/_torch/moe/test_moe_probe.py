@@ -8,7 +8,7 @@ import torch
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the stamps are GPU kernels")
 @pytest.mark.parametrize("stages", [False, True])
 def test_probe_rows_forwards_stages_and_mtp_passes(tmp_path, stages):
-    from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.probe import MoeProbe
+    from tensorrt_llm._torch.moe.fused_moe.moe_probe import MoeProbe
 
     probe = MoeProbe(str(tmp_path), 0, stages=stages)
     probe.stamp_point("kernel_start")  # outside a pass: no stamp
