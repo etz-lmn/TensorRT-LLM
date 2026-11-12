@@ -17,9 +17,11 @@
 
 // The route staging of a MegaMoE CuteDSL launch in one op: the kernel reads every row of its bucket, so the rows past
 // the launch's tokens must hold id -1 and weight 0 on every launch, also when a CUDA graph replays it.
+// megamoe_stage_inputs also quantizes the launch's activation into its staging in the same launch.
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/moe/cuteDsl/megaMoeStageRoutes.h"
+#include "tensorrt_llm/thop/moe/cuteDsl/megaMoeStageInputsOp.h"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -60,12 +62,10 @@ void stageRoutes(at::Tensor const& ids, at::Tensor const& weights, at::Tensor& i
     }
 }
 
-} // namespace
-
 // ids: [n, top_k] int32 or int64 expert ids; weights: [n, top_k] float32. ids_out: [rows, top_k] int32 or int64 with
-// rows >= n; weights_out: [rows, top_k] float32 with a unit column stride. All contiguous on one device. Rows [0, n)
-// of the outputs get the ids and weights, rows [n, rows) id -1 and weight 0.
-void megaMoeStageRoutes(at::Tensor const& ids, at::Tensor const& weights, at::Tensor& idsOut, at::Tensor& weightsOut)
+// rows >= n; weights_out: [rows, top_k] float32 with a unit column stride. All contiguous on one device.
+void checkStaging(
+    at::Tensor const& ids, at::Tensor const& weights, at::Tensor const& idsOut, at::Tensor const& weightsOut)
 {
     TORCH_CHECK(ids.defined() && weights.defined(), "ids and weights are required ([0, top_k] for no rows)");
     auto const isId = [](at::Tensor const& t) { return t.scalar_type() == at::kInt || t.scalar_type() == at::kLong; };
@@ -81,17 +81,49 @@ void megaMoeStageRoutes(at::Tensor const& ids, at::Tensor const& weights, at::Te
     TORCH_CHECK(ids.device() == idsOut.device() && weights.device() == idsOut.device()
             && weightsOut.device() == idsOut.device(),
         "all tensors must be on one device");
+}
+
+//! Call stage.template operator()<IdT, OutT>() with the id types of ids and ids_out.
+template <typename Stage>
+void byIdTypes(at::Tensor const& ids, at::Tensor const& idsOut, Stage&& stage)
+{
     bool const wideIds = ids.scalar_type() == at::kLong;
     if (idsOut.scalar_type() == at::kLong)
     {
-        wideIds ? stageRoutes<int64_t, int64_t>(ids, weights, idsOut, weightsOut)
-                : stageRoutes<int32_t, int64_t>(ids, weights, idsOut, weightsOut);
+        wideIds ? stage.template operator()<int64_t, int64_t>() : stage.template operator()<int32_t, int64_t>();
     }
     else
     {
-        wideIds ? stageRoutes<int64_t, int32_t>(ids, weights, idsOut, weightsOut)
-                : stageRoutes<int32_t, int32_t>(ids, weights, idsOut, weightsOut);
+        wideIds ? stage.template operator()<int64_t, int32_t>() : stage.template operator()<int32_t, int32_t>();
     }
+}
+
+} // namespace
+
+// Rows [0, n) of the outputs (checkStaging) get the ids and weights, rows [n, rows) id -1 and weight 0.
+void megaMoeStageRoutes(at::Tensor const& ids, at::Tensor const& weights, at::Tensor& idsOut, at::Tensor& weightsOut)
+{
+    checkStaging(ids, weights, idsOut, weightsOut);
+    byIdTypes(
+        ids, idsOut, [&]<typename IdT, typename OutT>() { stageRoutes<IdT, OutT>(ids, weights, idsOut, weightsOut); });
+}
+
+// megamoe_stage_routes, and in the same launch x quantized into x_fp4 and x_sf (megaMoeQuantizeOf) as
+// fp4_quantize_into(x, global_scale, x_fp4, x_sf) quantizes it.
+void megaMoeStageInputs(at::Tensor const& x, at::Tensor const& globalScale, at::Tensor& xFp4, at::Tensor& xSf,
+    at::Tensor const& ids, at::Tensor const& weights, at::Tensor& idsOut, at::Tensor& weightsOut)
+{
+    checkStaging(ids, weights, idsOut, weightsOut);
+    TORCH_CHECK(idsOut.device() == x.device(), "the staging must be on x's device");
+    auto const quantize = megaMoeQuantizeOf(x, globalScale, xFp4, xSf);
+    byIdTypes(ids, idsOut,
+        [&]<typename IdT, typename OutT>()
+        {
+            kernels::megaMoeStageInputs<IdT, OutT>(quantize, ids.data_ptr<IdT>(), weights.data_ptr<float>(),
+                ids.size(0), idsOut.data_ptr<OutT>(), weightsOut.data_ptr<float>(), weightsOut.stride(0),
+                idsOut.size(0), static_cast<int>(idsOut.size(1)), at::cuda::getCurrentCUDAStream(x.get_device()));
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
 }
 
 } // namespace torch_ext
@@ -101,6 +133,10 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("megamoe_stage_routes(Tensor ids, Tensor weights, Tensor(a!) ids_out, Tensor(b!) weights_out) -> ()");
+    m.def(
+        "megamoe_stage_inputs(Tensor x, Tensor global_scale, Tensor(a!) x_fp4, Tensor(b!) x_sf, Tensor ids, Tensor "
+        "weights, "
+        "Tensor(c!) ids_out, Tensor(d!) weights_out) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)
@@ -111,4 +147,5 @@ TORCH_LIBRARY_IMPL(trtllm, CPU, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("megamoe_stage_routes", &tensorrt_llm::torch_ext::megaMoeStageRoutes);
+    m.impl("megamoe_stage_inputs", &tensorrt_llm::torch_ext::megaMoeStageInputs);
 }
