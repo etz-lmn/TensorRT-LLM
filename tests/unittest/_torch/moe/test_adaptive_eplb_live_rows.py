@@ -20,6 +20,13 @@ def _stage_routes(ids, weights, bucket, word):
     return idx, out
 
 
+def _dropped(routes, count):
+    """The staged routes the MegaMoE kernel drops when it serves ``count`` experts or slots: its
+    dispatch and top-k reduce drop an id that is not below ``count`` as an unsigned value, so the
+    padding rows' -1 and the route's unroutable slot (the slot count) are both dropped."""
+    return (routes < 0) | (routes >= count)
+
+
 @needs_gpu
 @pytest.mark.parametrize(
     "real,requests",
@@ -29,8 +36,9 @@ def _stage_routes(ids, weights, bucket, word):
 def test_the_route_drops_the_padding_rows_as_the_megamoe_staging_does(real, requests):
     """Bit for bit, one launch into a bucket under the word stages what megamoe_stage_routes stages
     from the plain routes of the same ids (balancing on through the backend's own staging), and
-    its padding rows and weights are those of the experts staged under the word (balancing off).
-    The statistics of the launch, and of the record op, count only the live rows."""
+    the kernel drops the same routes of it, and takes the same weights, as of the experts staged
+    under the word (balancing off): the padding rows, and the live rows' unroutable ids of the
+    case. The statistics of the launch, and of the record op, count only the live rows."""
     layout, shares, ids = _dsv4_case(2)
     tables = _tables(*build_route_tables(layout, shares, 384, 512))
     ids = torch.tensor(ids[: 32 * TOP_K], dtype=torch.int32, device="cuda").view(32, TOP_K)
@@ -48,7 +56,7 @@ def test_the_route_drops_the_padding_rows_as_the_megamoe_staging_does(real, requ
     off_experts, off_weights = _stage_routes(ids, weights, 48, word)
     bits = slot_weights.view(torch.int32)
     assert torch.equal(slots, on_slots) and torch.equal(bits, on_weights.view(torch.int32))
-    assert torch.equal(slots < 0, off_experts < 0)
+    assert torch.equal(_dropped(slots, 512), _dropped(off_experts, 384))
     assert torch.equal(bits, off_weights.view(torch.int32))
     torch.ops.trtllm.adaptive_eplb_record(ids, *recorded, True, word)
     reference.record(ids.cpu(), *expected, True, word.cpu())
