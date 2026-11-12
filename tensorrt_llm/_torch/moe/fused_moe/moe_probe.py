@@ -123,6 +123,7 @@ class MoeProbe:
 
     def _flusher(self, device: int) -> None:
         torch.cuda.set_device(device)
+        _ignore_other_threads_captures()
         seen, written, changed, flushed = 0, 0, time.monotonic(), time.monotonic()
         while True:
             time.sleep(POLL_S)
@@ -172,6 +173,17 @@ class MoeProbe:
             tmp = self.path + ".tmp.npz"
             np.savez(tmp, **out)
             os.replace(tmp, self.path)
+
+
+def _ignore_other_threads_captures() -> None:
+    """Set the calling thread's capture mode to thread-local: in the default (global) mode, a copy or synchronization
+    on this thread while another thread captures a CUDA graph invalidates that capture."""
+    from cuda.bindings import driver
+
+    mode = driver.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL
+    err, _ = driver.cuThreadExchangeStreamCaptureMode(mode)
+    if err != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuThreadExchangeStreamCaptureMode: {err}")
 
 
 def _watch_installs(probe: MoeProbe) -> None:

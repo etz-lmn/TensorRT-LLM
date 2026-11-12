@@ -55,3 +55,26 @@ def test_probe_records_installs_at_their_forward(tmp_path):
     assert list(out["install_forward"]) == [2, 3]
     assert out["install_changed"][:, :3].tolist() == [[False, True, False], [False, True, True]]
     assert out["install_replicated"][:, :3].tolist() == [[False, True, False], [False, False, True]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the stamps are GPU kernels")
+def test_the_writer_thread_leaves_a_graph_capture_on_another_thread_intact(tmp_path, monkeypatch):
+    from tensorrt_llm._torch.moe.fused_moe import moe_probe
+
+    monkeypatch.setattr(moe_probe, "POLL_S", 0.001)
+    monkeypatch.setattr(moe_probe, "FLUSH_S", 0.0)
+    probe = moe_probe.MoeProbe(str(tmp_path), 0)
+    probe.stamp(
+        0, 0, 8
+    )  # a forward, so that the writer copies the ring while the capture below runs
+    probe.stamp(0, 1, 8)
+    x = torch.zeros(1024, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        for _ in range(20000):  # long enough on the host for the writer to poll and copy many times
+            x.add_(1.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert float(x[0]) == 20000.0
