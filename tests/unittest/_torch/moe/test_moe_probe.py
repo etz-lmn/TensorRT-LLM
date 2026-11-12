@@ -29,3 +29,27 @@ def test_probe_rows_forwards_stages_and_mtp_passes(tmp_path, stages):
         assert (parts[:, [0, 1]] >= 0).all() and (parts[:, [0, 1]].sum(axis=2) > 0).all()
         assert (parts[:, [0, 1]].sum(axis=2) == out["duration_ns"][1:4][:, [0, 1]]).all()
         assert (parts[:, 61] == 0).all()  # a pass without the inner stamps has no parts
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the stamps are GPU kernels")
+def test_probe_records_installs_at_their_forward(tmp_path):
+    from tensorrt_llm._torch.moe.fused_moe.moe_probe import MoeProbe
+
+    probe = MoeProbe(str(tmp_path), 0)
+    tables = np.zeros((3, 4), dtype=np.int32)
+    probe.home = tables.copy()
+    for forward in range(4):
+        for layer in (0, 1, 2):
+            probe.stamp(layer, 0, 8)
+            probe.stamp(layer, 1, 8)
+        if forward == 1:  # layer 1 takes replicas after forward 1
+            tables[1, 2] = 7
+            probe.installed(tables, [1])
+        if forward == 2:  # layer 1 goes home, layer 2 takes replicas
+            tables[1, 2], tables[2, 0] = 0, 5
+            probe.installed(tables, [1, 2])
+    probe.write(True)
+    out = np.load(tmp_path / "rank0.moe-probe.npz")
+    assert list(out["install_forward"]) == [2, 3]
+    assert out["install_changed"][:, :3].tolist() == [[False, True, False], [False, True, True]]
+    assert out["install_replicated"][:, :3].tolist() == [[False, True, False], [False, False, True]]

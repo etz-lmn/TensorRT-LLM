@@ -19,10 +19,16 @@ started for ``IDLE_S`` seconds (the run's end, before its shutdown) and at least
 forwards run; the exit writes it once more with ``final`` set. Per row: the forward number and layer 0's
 ``pass_start`` (ns); per row and layer: the pass's duration (ns, 0 where the pass was not stamped whole), its token
 count and, with ``stages``, the four parts of the pass (ns, 0 where a part was not stamped).
+
+With adaptive EPLB on, every install of new route tables is recorded too: the device forward counter at the point of the
+stream where the tables are copied (the next forward routes by them), the layers whose tables changed and the layers whose
+tables differ from the start-up (home) tables after it, as ``install_forward``, ``install_changed`` and
+``install_replicated`` (one row per install, a layer mask each).
 """
 
 import atexit
 import os
+import sys
 import threading
 import time
 
@@ -40,8 +46,14 @@ STAGES = ("routing", "quantize_and_stage", "kernel", "after_kernel")
 POINTS_ENV = "TRTLLM_MOE_PROBE_POINTS"
 TOKENS = len(POINTS)  # the column of a row's token count
 POLL_S, IDLE_S, FLUSH_S = 2.0, 4.0, 120.0
+MAX_INSTALLS = 4096
 
 _probe = None
+
+
+@triton.jit
+def _mark_kernel(marks_ptr, state_ptr, index):
+    tl.store(marks_ptr + index, tl.load(state_ptr))
 
 
 @triton.jit
@@ -69,6 +81,10 @@ class MoeProbe:
         self.stream = torch.cuda.Stream()
         self.lock = threading.Lock()
         self.layer = None  # the layer whose pass is open (host side), None between passes
+        self.marks = torch.full((MAX_INSTALLS,), -1, dtype=torch.int64, device="cuda")
+        self.installs = []  # (changed layers, replicated layers) per install, in mark order
+        self.home = None
+        _watch_installs(self)
         threading.Thread(target=self._flusher, args=(torch.cuda.current_device(),), daemon=True).start()
         atexit.register(self.write, True)
 
@@ -91,6 +107,14 @@ class MoeProbe:
         without ``stages``."""
         if self.stages and self.layer is not None:
             self._stamp(self.layer, POINTS.index(point), 0)
+
+    def installed(self, host_tables: np.ndarray, changed) -> None:
+        """Record an install whose route tables were just copied on the current stream."""
+        if self.home is None or len(self.installs) >= MAX_INSTALLS:
+            return
+        replicated = [i for i in range(len(host_tables)) if not np.array_equal(host_tables[i], self.home[i])]
+        _mark_kernel[(1,)](self.marks, self.state, len(self.installs))
+        self.installs.append((list(changed), replicated))
 
     def _flusher(self, device: int) -> None:
         torch.cuda.set_device(device)
@@ -123,6 +147,12 @@ class MoeProbe:
                 written_ns=time.time_ns(),
                 points=np.array(POINTS),
             )
+            masks = np.zeros((2, len(self.installs), LAYERS), dtype=bool)
+            for i, (changed, replicated) in enumerate(self.installs):
+                masks[0, i, [x for x in changed if x < LAYERS]] = True
+                masks[1, i, [x for x in replicated if x < LAYERS]] = True
+            out.update(install_forward=self.marks[: len(self.installs)].cpu().numpy(),
+                       install_changed=masks[0], install_replicated=masks[1])
             if self.stages:
                 parts = np.diff(stamps, axis=2)
                 reached = (stamps[:, :, :-1] > 0) & (stamps[:, :, 1:] > 0) & (parts >= 0)
@@ -132,6 +162,26 @@ class MoeProbe:
             tmp = self.path + ".tmp.npz"
             np.savez(tmp, **out)
             os.replace(tmp, self.path)
+
+
+def _watch_installs(probe: MoeProbe) -> None:
+    """Wrap adaptive EPLB's table install so that each one is recorded (the start-up tables taken as home at the first)."""
+    runtime = sys.modules.get(__name__.rsplit(".", 1)[0] + ".adaptive_eplb.runtime")
+    if runtime is None:  # no adaptive EPLB in this process
+        return
+    install = runtime.AdaptiveRuntime._apply_tables
+    if getattr(install, "probe_wrapped", False):
+        return
+
+    def apply_tables(self, call, update):
+        if probe.home is None:
+            probe.home = self._host_tables_np.copy()
+        install(self, call, update)
+        if update.tables:
+            probe.installed(self._host_tables_np, sorted(update.tables))
+
+    apply_tables.probe_wrapped = True
+    runtime.AdaptiveRuntime._apply_tables = apply_tables
 
 
 def probe_for(directory: str, rank: int) -> MoeProbe:
