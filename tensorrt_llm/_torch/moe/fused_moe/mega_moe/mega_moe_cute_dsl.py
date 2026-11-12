@@ -672,6 +672,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._active_launch_max_tokens: Optional[int] = None
         # (staging address, rows) that ``quantize_input`` quantized into for the NEXT run_moe.
         self._quantized_into: Optional[Tuple[int, int]] = None
+        # (route staging address, rows) that ``_stage_bf16_inputs`` staged for the NEXT run_moe.
+        self._routes_staged_into: Optional[Tuple[int, int]] = None
 
         # Resolve EP ProcessGroup at construction. Resolving at forward
         # time would be collective on a non-synchronous call stack and
@@ -1251,18 +1253,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
         hidden = x.shape[1]
         sf_cols = megamoe_activation_sf_bytes_per_row(hidden)
-        x_bf16 = x.to(torch.bfloat16).contiguous()
-        if x_bf16.shape[0] == 0:
-            empty_x = torch.empty((0, hidden // 2), dtype=torch.uint8, device=x_bf16.device)
-            empty_sf = torch.empty((0, sf_cols), dtype=torch.uint8, device=x_bf16.device)
+        if x.shape[0] == 0:
+            empty_x = torch.empty((0, hidden // 2), dtype=torch.uint8, device=x.device)
+            empty_sf = torch.empty((0, sf_cols), dtype=torch.uint8, device=x.device)
             return empty_x, empty_sf
-        fc31_act_scale = getattr(self, "fc31_act_scale", None)
-        if fc31_act_scale is not None:
-            # Product stays bf16, which is what ``fp4_quantize`` below is given
-            # on every other route into it: ``_SUPPORTED_ACTIVATION_DTYPES``
-            # admits bf16 activations only, so ``fc31_act_scale``, created at
-            # ``module.dtype``, is bf16 as well.
-            x_bf16 = x_bf16 * fc31_act_scale
+        x_bf16 = self._activation_to_quantize(x)
         raw_cols = ceil_div(hidden, 16)
         # A forward that run_moe stages: quantize straight into the bucket's activation
         # rows, which run_moe recognizes by address and does not copy again.
@@ -1308,6 +1303,64 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         padded_sf = torch.zeros((x_bf16.shape[0], sf_cols), dtype=torch.uint8, device=x_bf16.device)
         padded_sf[:, :raw_cols] = x_sf_raw
         return x_fp4, padded_sf
+
+    def _activation_to_quantize(self, x: torch.Tensor) -> torch.Tensor:
+        """``x`` as the NVFP4 quantization reads it: contiguous bfloat16, times a checkpoint's
+        per-channel pre-quant scale ``fc31_act_scale`` (``[1, hidden]``) if it has one, on which
+        ``fc31_input_scale`` was calibrated."""
+        x_bf16 = x.to(torch.bfloat16).contiguous()
+        fc31_act_scale = getattr(self, "fc31_act_scale", None)
+        if fc31_act_scale is not None:
+            # Product stays bf16, which is what the quantization is given on
+            # every route into it: ``_SUPPORTED_ACTIVATION_DTYPES`` admits bf16
+            # activations only, so ``fc31_act_scale``, created at
+            # ``module.dtype``, is bf16 as well.
+            x_bf16 = x_bf16 * fc31_act_scale
+        return x_bf16
+
+    def supports_fused_prepare(self) -> bool:
+        """Whether ``run_moe`` takes the BF16 activation (``x_sf`` None) and quantizes it in the
+        launch that stages the routes (:meth:`_stage_bf16_inputs`). A layer with a replica plan
+        keeps ``quantize_input``, which leaves SMs to the plan's concurrent HALO-Q/TMA kernel."""
+        balancer = self.layer_load_balancer
+        return hasattr(torch.ops.trtllm, "megamoe_stage_inputs") and (
+            balancer is None or not balancer.produces_replica_plan
+        )
+
+    def _stage_bf16_inputs(
+        self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize ``x`` and stage the routes in one launch (``megamoe_stage_inputs``) into the
+        staging of the bucket the next launch selects, under the forward's live-row word where that
+        bucket drops the padding rows, as ``_stage_inputs`` stages them.
+
+        Returns the activation, its scale factors and the routes, which ``_run_moe`` finds staged.
+        Without a staging (inputs read in place, tactic autotuning, SF rows that need padding)
+        ``quantize_input`` quantizes and ``_run_moe`` stages the routes.
+        """
+        num_tokens, hidden = x.shape
+        bufs = None
+        if megamoe_activation_sf_bytes_per_row(hidden) == ceil_div(hidden, 16):
+            bufs = self._staging_of_next_run(num_tokens, x.device)
+        if bufs is None:
+            return (*self.quantize_input(x), topk_idx)
+        bucket = self._select_launch_max_tokens(self._active_launch_max_tokens)
+        word = live_rows.current_word(x.device) if bucket in self._padding_drop_buckets else None
+        x_fp4, x_sf = bufs.activation[:num_tokens], bufs.activation_sf[:num_tokens]
+        torch.ops.trtllm.megamoe_stage_inputs(
+            self._activation_to_quantize(x),
+            self.fc31_input_scale,
+            x_fp4,
+            x_sf,
+            topk_idx,
+            topk_weights,
+            bufs.topk_idx_local,
+            bufs.topk_weights,
+            word,
+        )
+        self._quantized_into = (bufs.activation.data_ptr(), num_tokens)
+        self._routes_staged_into = (bufs.topk_idx_local.data_ptr(), num_tokens)
+        return x_fp4, x_sf, bufs.topk_idx_local[:num_tokens]
 
     def _replica_plan_launch_args(self, replica_plan):
         """Validate and unpack the caller-owned per-forward replica plan."""
@@ -1370,7 +1423,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         output_dtype = ctx.output_dtype
         if output_dtype is None:
             output_dtype = self.dtype or torch.bfloat16
-        if x_sf is None:
+        if x_sf is None and not self.supports_fused_prepare():
             raise ValueError("MegaMoECuteDsl requires x_sf from quantize_input")
 
         # Surface a missing multi-rank symm provider BEFORE the weights
@@ -1402,6 +1455,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         topk_weights_f32 = token_final_scales
         if topk_weights_f32.dtype != torch.float32 or not topk_weights_f32.is_contiguous():
             topk_weights_f32 = topk_weights_f32.to(torch.float32).contiguous()
+        if x_sf is None:
+            x, x_sf, token_selected_experts = self._stage_bf16_inputs(
+                x, token_selected_experts, topk_weights_f32
+            )
 
         # Routes stay as produced: the route staging widens int32 to the
         # kernel's index dtype, and it is the first route reader.
@@ -1977,6 +2034,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
         self._active_launch_max_tokens = None
         quantized_into, self._quantized_into = self._quantized_into, None
+        routes_staged_into, self._routes_staged_into = self._routes_staged_into, None
         if num_tokens > launch_max_T:
             # By construction num_tokens <= max(all_rank_num_tokens) <=
             # launch_max_T; fail loudly rather than desync the barrier.
@@ -2047,7 +2105,19 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 f"{bufs.activation.data_ptr():#x}. Set the bucket hint before quantize_input "
                 f"and run_moe on its output."
             )
-        if not use_direct_routing_inputs:
+        # _stage_bf16_inputs staged this bucket's routes with the activation: the routes are its rows.
+        routes_staged = routes_staged_into is not None
+        staging_rows = (bufs.topk_idx_local.data_ptr(), num_tokens)
+        if routes_staged and not routes_staged_into == staging_rows == (
+            topk_idx.data_ptr(),
+            num_tokens,
+        ):
+            raise RuntimeError(
+                f"MegaMoECuteDsl: routes staged at (address, rows) {routes_staged_into}, but run_moe "
+                f"launches {num_tokens} rows from bucket {launch_max_T}'s staging at "
+                f"{bufs.topk_idx_local.data_ptr():#x}."
+            )
+        if not use_direct_routing_inputs and not routes_staged:
             self._stage_inputs(
                 bufs=bufs,
                 x=x,
