@@ -12,6 +12,7 @@ import ctypes
 import hashlib
 import json
 import math
+import os
 import socket
 import threading
 from collections.abc import Callable, Sequence
@@ -39,7 +40,7 @@ from .policy import (
     build_route_tables,
     statistics_buffers,
 )
-from .runtime import GATHER_SLICE_S, AdaptiveRuntime, DecisionConfig, DecisionProcess
+from .runtime import GATHER_SLICE_S, OBSERVE_ENV, AdaptiveRuntime, DecisionConfig, DecisionProcess
 from .transport import (
     PeerSlotTransport,
     _plan_layer,
@@ -486,9 +487,11 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         self.copy_stream = migrate_model_weights(backends, transport, device)
         geometry = ExpertGeometry(self.layers[0].expert_count, self.num_slots, self.ep_size)
         copy_ms = time_layer_copy(transport, first, geometry, self.copy_stream)
+        observe = os.environ.get(OBSERVE_ENV) == "1"
         logger.info(
             f"adaptive EPLB balances {len(self.layers)} MoE layers; one layer's install copy "
             f"takes {copy_ms:.3f} ms at start-up"
+            + (f"; observing only ({OBSERVE_ENV}=1): nothing is installed" if observe else "")
         )
         self.start_runtime(time_model, self.mapping.gpus_per_node, copy_ms)
 

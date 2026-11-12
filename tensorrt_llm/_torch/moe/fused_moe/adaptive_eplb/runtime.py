@@ -66,6 +66,9 @@ CLOSE_WAIT_S = 30.0
 """float: Seconds a close waits for the worker thread, again after telling it to leave."""
 GATHER_SLICE_S = 1.0
 """float: Seconds of one wait in an all-gather between looks at whether to leave it."""
+OBSERVE_ENV = "TRTLLM_ADAPTIVE_EPLB_OBSERVE"
+"""str: Measurement switch (fork measurement branch only): with it set to 1 every window is decided and
+nothing is installed, so the layers keep their home layouts on the balanced path."""
 FIELDS = (
     "remaining",
     "requests",
@@ -180,6 +183,7 @@ class _Decider:
         self.awaiting_copy: dict[int, tuple] = {}
         # (window, rows per forward [L, E]) of the last two deciding windows.
         self.window_rows: deque[tuple[int, np.ndarray]] = deque(maxlen=2)
+        self.observe = os.environ.get(OBSERVE_ENV) == "1"
 
     def handle(self, message: tuple) -> tuple:
         if message[0] == "window":
@@ -292,6 +296,8 @@ class _Decider:
             # No copy has been timed yet: install the best layer alone to time one.
             chosen = chosen[:1]
         chosen += retire  # a retirement copies nothing: it pays as soon as it gains
+        if self.observe:
+            chosen = []
         growth = self.evaluations.read_cost(
             range(layers), rows, self.layout, self.shares, self.open_call
         )
