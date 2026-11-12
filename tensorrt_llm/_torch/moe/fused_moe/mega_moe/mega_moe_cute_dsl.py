@@ -143,6 +143,19 @@ _RUNTIME_PROBE_CACHE: Dict[int, Union[bool, str]] = {}
 _MEGAMOE_PRIME_LADDER = os.environ.get("MEGAMOE_PRIME_LADDER", "1") == "1"
 _MEGAMOE_PRIMED_LADDERS: set = set()
 
+# Measurement hook: stamps inside the open MoE pass (adaptive_eplb/probe.py) when the probe is on.
+_MOE_PROBE = bool(os.environ.get("TRTLLM_MOE_PROBE_DIR"))
+
+
+def _probe_point(point: str) -> None:
+    if _MOE_PROBE:
+        from ..adaptive_eplb.probe import active_probe
+
+        probe = active_probe()
+        if probe is not None:
+            probe.stamp_point(point)
+
+
 
 def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
     """Return whether the CUDA 13 Cutlass DSL runtime exposes all symbols the
@@ -1926,6 +1939,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # The provider owns its symmetric regions, so it owns their cute views.
         provider = self._symm_providers.get(launch_max_T) if staged_inputs else None
         set_active_megamoe_cute_buffer_cache(provider.cute_views if provider is not None else None)
+        _probe_point("kernel_start")
         try:
             megamoe_op(
                 activation=_as_nvfp4(activation),
@@ -1980,6 +1994,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             set_active_megamoe_profiling_scratch_factory(None)
             set_active_megamoe_cute_weight_cache(None)
             set_active_megamoe_cute_buffer_cache(None)
+        _probe_point("kernel_end")
         if num_tokens == 0:
             return torch.empty((0, hidden), dtype=output_dtype, device=combine_output.device)
         # The kernel already collapsed the top-k axis into the (T, 1, hidden)

@@ -43,6 +43,7 @@ exchange runs:
 from __future__ import annotations
 
 import contextlib
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
@@ -60,6 +61,19 @@ from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVL
 from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
 from .impl_contract import MoECommPlan, MoERunContext, MoESortTables, PreroutedRouting
 from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
+
+# Measurement hook: stamps inside the open MoE pass (adaptive_eplb/probe.py) when the probe is on.
+_MOE_PROBE = bool(os.environ.get("TRTLLM_MOE_PROBE_DIR"))
+
+
+def _probe_point(point: str) -> None:
+    if _MOE_PROBE:
+        from .adaptive_eplb.probe import active_probe
+
+        probe = active_probe()
+        if probe is not None:
+            probe.stamp_point(point)
+
 
 __all__ = [
     "MoEScheduler",
@@ -1651,6 +1665,8 @@ class FusedCommMoEScheduler(MoEScheduler):
                 token_selected_slots = token_selected_experts
             token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
             replica_plan = None
+
+        _probe_point("routed")
 
         # ----- quantize / prepare -----
         if getattr(moe.backend, "supports_fused_prepare", lambda: False)():

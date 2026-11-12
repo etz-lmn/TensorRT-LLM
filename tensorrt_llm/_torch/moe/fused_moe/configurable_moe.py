@@ -29,6 +29,7 @@ Design Principles:
 
 import copy
 import functools
+import os
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
@@ -58,6 +59,10 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .activation import install_activation_params
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
+
+# Measurement hook: GPU timestamps inside every MoE pass (adaptive_eplb/probe.py), only when this
+# names a directory.
+_MOE_PROBE_DIR = os.environ.get("TRTLLM_MOE_PROBE_DIR")
 
 # Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
 # layer_idx + load balancer) and must be mirrored onto the backend after
@@ -844,6 +849,12 @@ class ConfigurableMoE(MoE):
         if self.enable_dwdp:
             self.dwdp_manager.wait_and_bind(self.backend, self.layer_idx)
 
+        probe = None
+        if _MOE_PROBE_DIR:
+            from .adaptive_eplb.probe import probe_for
+
+            probe = probe_for(_MOE_PROBE_DIR, self.mapping.rank)
+            probe.stamp(self.layer_idx, 0, router_logits.shape[0])
         outputs = self.scheduler.forward(
             x,
             router_logits,
@@ -857,6 +868,9 @@ class ConfigurableMoE(MoE):
             input_ready_event=input_ready_event,
             prerouted=prerouted,
         )
+
+        if probe is not None:
+            probe.stamp(self.layer_idx, 1, router_logits.shape[0])
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).
         # Owned at the wrapper because schedulers must not run it twice (external-comm
