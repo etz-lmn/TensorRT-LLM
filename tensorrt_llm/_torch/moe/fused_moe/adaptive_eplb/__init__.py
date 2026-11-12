@@ -7,3 +7,7 @@ statistics buffers of the ops), ``runtime`` (statistics windows, the decision pr
 ``transport`` (expert weights in MNNVL memory and the copies between ranks) and ``balancer`` (the
 model-level balancer and its layer handle).
 """
+
+from .balancer import AdaptiveMoeLayerLoadBalancer, AdaptiveMoeLoadBalancer
+
+__all__ = ["AdaptiveMoeLayerLoadBalancer", "AdaptiveMoeLoadBalancer"]
