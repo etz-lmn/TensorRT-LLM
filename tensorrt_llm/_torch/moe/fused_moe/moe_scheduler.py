@@ -43,6 +43,7 @@ exchange runs:
 from __future__ import annotations
 
 import contextlib
+import functools
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
@@ -96,6 +97,11 @@ def _record_routes(
         ExpertStatistic.set_layer(moe.layer_idx)
         ExpertStatistic.maybe_add_info(num_slots, routes)
     return get_calibrator().maybe_collect_or_replay_slots(num_slots, routes)
+
+
+def _routes_recorded() -> bool:
+    """Whether ``_record_routes`` reads or replaces the slots (expert statistics, the calibrator)."""
+    return ExpertStatistic.get() is not None or get_calibrator().mode.name != "NONE"
 
 
 def _wait_input_ready(event: Optional[torch.cuda.Event]) -> None:
@@ -1628,6 +1634,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         # as expert IDs; otherwise the recorded routes are the slots routed to.
         # With the load balancer off, slots are expert IDs, so one recording
         # drives both arms.
+        fused_prepare = getattr(moe.backend, "supports_fused_prepare", lambda: False)()
+        deferred_route = None
         if uses_replica_plan:
             token_selected_experts = _record_routes(moe, token_selected_experts, moe.num_experts)
             token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
@@ -1644,19 +1652,32 @@ class FusedCommMoEScheduler(MoEScheduler):
                     is_last_call,
                     ignore_allreduce=False,
                 )
-                token_selected_slots = moe._load_balancer_route(
-                    token_selected_experts, moe.use_dp, token_final_scales=token_final_scales
-                )
+                if (
+                    fused_prepare
+                    and moe.layer_load_balancer.stages_routes
+                    and not _routes_recorded()
+                ):
+                    # run_moe launches the route with its input staging; nothing reads the slots before.
+                    deferred_route = functools.partial(
+                        moe._load_balancer_route,
+                        token_selected_experts,
+                        moe.use_dp,
+                        token_final_scales=token_final_scales,
+                    )
+                    token_selected_slots = token_selected_experts
+                else:
+                    token_selected_slots = moe._load_balancer_route(
+                        token_selected_experts, moe.use_dp, token_final_scales=token_final_scales
+                    )
             else:
                 token_selected_slots = token_selected_experts
             token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
             replica_plan = None
 
         # ----- quantize / prepare -----
-        if getattr(moe.backend, "supports_fused_prepare", lambda: False)():
-            # MegaMoE can fuse BF16->MXFP8 quantization with the SymmBuffer
-            # topk copies, so keep the original activations and let run_moe
-            # prepare its workspace.
+        if fused_prepare:
+            # The backend quantizes in run_moe, in the launch that stages its
+            # inputs, so keep the original activations.
             moe_input = x_chunk_real
             x_sf = None
         elif replica_plan is None:
@@ -1685,6 +1706,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 x_sf=x_sf,
                 output_dtype=output_dtype,
                 replica_plan=replica_plan,
+                route=deferred_route,
             )
         )
 

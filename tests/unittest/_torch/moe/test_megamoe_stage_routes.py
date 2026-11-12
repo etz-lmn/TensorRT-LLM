@@ -65,6 +65,79 @@ def test_stage_routes_matches_torch_copies_and_fills(id_dtype, out_dtype, rows, 
     assert torch.equal(weights_buf.view(torch.uint8), want_weights.view(torch.uint8))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("rows,bucket", [(0, 16), (5, 16), (16, 16), (37, 64)])
+def test_bf16_inputs_stage_in_one_launch_as_in_two(rows, bucket):
+    """run_moe's fused prepare without a load balancer (``_stage_bf16_inputs``) leaves a bucket's
+    staging byte for byte as the quantization and the route staging leave it, replayed from a CUDA
+    graph over new inputs; ``_run_moe`` then finds the activation and the routes staged."""
+    gen = torch.Generator().manual_seed(rows)
+    shapes = dict(activation=(3584, torch.uint8), activation_sf=(448, torch.uint8))
+    shapes.update(topk_idx_local=(TOP_K, torch.int64), topk_weights=(WEIGHT_COLUMNS, torch.float32))
+    fused = SimpleNamespace(**{k: _garbage((bucket, n), t, gen) for k, (n, t) in shapes.items()})
+    separate = SimpleNamespace(**{k: v.clone() for k, v in vars(fused).items()})
+    scale = torch.tensor([448 * 6 / 7.5], device="cuda")
+    moe = SimpleNamespace(fc31_input_scale=scale, _staging_of_next_run=lambda n, k: (fused, bucket))
+    moe._activation_to_quantize = MegaMoECuteDsl._activation_to_quantize.__get__(moe)
+    x = torch.zeros(rows, 7168, dtype=torch.bfloat16, device="cuda")
+    ids = torch.zeros(rows, TOP_K, dtype=torch.int32, device="cuda")
+    weights = torch.zeros(rows, TOP_K, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = MegaMoECuteDsl._stage_bf16_inputs(moe, x, ids, weights, None)
+    assert [t.data_ptr() for t in got] == [
+        fused.activation.data_ptr(),
+        fused.activation_sf.data_ptr(),
+        fused.topk_idx_local.data_ptr(),
+    ]
+    assert moe._handed_out_route_staging == fused.topk_idx_local.data_ptr()
+    for _ in range(2):
+        x.copy_(torch.randn(rows, 7168, generator=gen) * 3)
+        ids.copy_(torch.randint(-1, 384, (rows, TOP_K), generator=gen))
+        weights.copy_(torch.rand(rows, TOP_K, generator=gen))
+        graph.replay()
+        if rows:
+            torch.ops.trtllm.fp4_quantize_into(
+                x, scale, separate.activation[:rows], separate.activation_sf[:rows], False
+            )
+        torch.ops.trtllm.megamoe_stage_routes(
+            ids, weights, separate.topk_idx_local, separate.topk_weights[:, :TOP_K]
+        )
+        for name, want in vars(separate).items():
+            assert torch.equal(getattr(fused, name).view(torch.uint8), want.view(torch.uint8)), name
+
+
+def test_bf16_inputs_launch_apart_where_the_next_run_stages_nothing(monkeypatch):
+    """Without a staging (inputs read in place, tactic autotuning, SF rows that need padding) the fused
+    prepare launches a load balancer's route alone, then quantize_input; a layer whose balancer
+    plans replicas keeps quantize_input, which leaves SMs to the plan's HALO-Q/TMA kernel."""
+    calls = []
+    moe = SimpleNamespace(
+        _staging_of_next_run=lambda rows, top_k: calls.append("staging"),
+        quantize_input=lambda x: calls.append("quantize") or ("fp4", "sf"),
+    )
+    ids = torch.zeros(4, TOP_K, dtype=torch.int32)
+
+    def route(quantize=None):
+        calls.append(("route", quantize))
+        return "slots"
+
+    for hidden, looked in (
+        (7168, ["staging"]),
+        (2080, []),
+    ):  # 2080 / 16 = 130 SF bytes, padded to 132
+        calls.clear()
+        got = MegaMoECuteDsl._stage_bf16_inputs(moe, torch.zeros(4, hidden), ids, None, route)
+        assert got == ("fp4", "sf", "slots") and calls == looked + [("route", None), "quantize"]
+    monkeypatch.setattr(torch.ops.trtllm, "megamoe_stage_inputs", object(), raising=False)
+    for balancer, fused in ((None, True), (False, True), (True, False)):
+        plans = None if balancer is None else SimpleNamespace(produces_replica_plan=balancer)
+        assert (
+            MegaMoECuteDsl.supports_fused_prepare(SimpleNamespace(layer_load_balancer=plans))
+            is fused
+        )
+
+
 def test_bucket_priming_stages_a_launch_without_rows():
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)

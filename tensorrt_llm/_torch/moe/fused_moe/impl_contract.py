@@ -817,6 +817,11 @@ class MoERunContext:
     prerouted: Optional[PreroutedRouting] = None
     # produced by per-layer dynamic EPLB; None for standard EPLB and OFF.
     replica_plan: Optional[MoEReplicaPlan] = None
+    # produced by a load balancer whose route the impl launches with its own input staging
+    # (``supports_fused_prepare``): token_selected_experts are then expert IDs, and
+    # ``route(quantize=None)`` returns the slots, quantizing in the same launch when given
+    # ``(x, global_scale, x_fp4, x_sf)``.
+    route: Optional[Callable[..., torch.Tensor]] = None
     # produced by routing when the impl's ``try_route_with_sort`` routed this
     # forward: the ``moe_sort`` tables of ``token_selected_experts``.
     sort_tables: Optional[MoESortTables] = None

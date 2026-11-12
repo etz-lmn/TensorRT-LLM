@@ -319,6 +319,7 @@ class AdaptiveMoeLayerLoadBalancer:
         *,
         overlap_fn: Callable[[], None] | None = None,
         token_final_scales: torch.Tensor | None = None,
+        quantize: tuple | None = None,
     ) -> torch.Tensor:
         """Map every routed expert to a slot, in one launch that also adds the kept routes to the
         statistics.
@@ -326,6 +327,7 @@ class AdaptiveMoeLayerLoadBalancer:
         Ids outside the experts map to ``num_slots``. With ``token_final_scales`` (``[tokens,
         top_k]`` float32) and a backend that stages routes, the launch writes the slots and weights
         into the backend's staging and returns a view of it, which the backend does not stage again.
+        With ``quantize`` (``x, global_scale, x_fp4, x_sf``), the launch also quantizes ``x``.
         """
         ids = token_selected_experts
         pending, self._pending = self._pending, None
@@ -356,6 +358,7 @@ class AdaptiveMoeLayerLoadBalancer:
             *weights,
             *stats,
             self._live_rows(ids),
+            *(quantize or ()),
         )
         if overlap_fn is not None:
             overlap_fn()
