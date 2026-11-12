@@ -920,6 +920,10 @@ def _register_fake():
         enabled: Optional[torch.Tensor] = None,
         first: bool = True,
         live_row_word: Optional[torch.Tensor] = None,
+        x: Optional[torch.Tensor] = None,
+        x_global_scale: Optional[torch.Tensor] = None,
+        x_fp4: Optional[torch.Tensor] = None,
+        x_sf: Optional[torch.Tensor] = None,
     ) -> None:
         return None
 

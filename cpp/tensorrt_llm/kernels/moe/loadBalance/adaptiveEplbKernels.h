@@ -27,6 +27,8 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
+struct MegaMoeQuantize;
+
 //! Route tables of one adaptive EPLB layer, every expert's copies in table order.
 struct AdaptiveEplbRouteTables
 {
@@ -75,9 +77,12 @@ struct AdaptiveEplbStats
 //! ranks and split blocks. An id outside the experts, or a table entry outside the slots, takes numSlots. With staging,
 //! the launch also writes the gate weights and the staging rows after the routed elements; with statistics, one more
 //! block of the launch updates them as adaptiveEplbRecord does.
+//! With quantize, the launch also quantizes a MegaMoE launch's activation (megaMoeStageInputs.cuh): its blocks after
+//! the route's run the quantization at the same time.
 template <typename IdT, typename OutT>
 void adaptiveEplbRoute(IdT const* ids, int64_t count, int epRank, AdaptiveEplbRouteTables tables, OutT* out,
-    AdaptiveEplbStaging staging, AdaptiveEplbStats stats, cudaStream_t stream);
+    AdaptiveEplbStaging staging, AdaptiveEplbStats stats, cudaStream_t stream,
+    MegaMoeQuantize const* quantize = nullptr);
 
 //! Add a forward's expert ids to a layer's statistics.
 //!
