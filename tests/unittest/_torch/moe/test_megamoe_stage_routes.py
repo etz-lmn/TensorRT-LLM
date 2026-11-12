@@ -254,10 +254,20 @@ def test_bf16_inputs_quantize_apart_where_the_next_run_stages_nothing(monkeypatc
         got = MegaMoECuteDsl._stage_bf16_inputs(moe, torch.zeros(4, hidden), ids, None)
         assert got == ("fp4", "sf", ids) and looked == lookups
     monkeypatch.setattr(torch.ops.trtllm, "megamoe_stage_inputs", object(), raising=False)
-    for balancer, fused in ((None, True), (False, True), (True, False)):
-        plans = None if balancer is None else SimpleNamespace(produces_replica_plan=balancer)
+    # No balancer or static EPLB: fused; a replica plan or dynamic EPLB's statistics: quantize_input.
+    for plans, dynamic, fused in (
+        (None, None, True),
+        (False, False, True),
+        (True, False, False),
+        (False, True, False),
+    ):
+        balancer = None
+        if plans is not None:
+            balancer = SimpleNamespace(
+                produces_replica_plan=plans, is_dynamic_routing=lambda d=dynamic: d
+            )
         assert (
-            MegaMoECuteDsl.supports_fused_prepare(SimpleNamespace(layer_load_balancer=plans))
+            MegaMoECuteDsl.supports_fused_prepare(SimpleNamespace(layer_load_balancer=balancer))
             is fused
         )
 

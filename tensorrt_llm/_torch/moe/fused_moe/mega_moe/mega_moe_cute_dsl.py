@@ -1320,11 +1320,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
     def supports_fused_prepare(self) -> bool:
         """Whether ``run_moe`` takes the BF16 activation (``x_sf`` None) and quantizes it in the
-        launch that stages the routes (:meth:`_stage_bf16_inputs`). A layer with a replica plan
-        keeps ``quantize_input``, which leaves SMs to the plan's concurrent HALO-Q/TMA kernel."""
+        launch that stages the routes (:meth:`_stage_bf16_inputs`). A layer whose load balancer
+        plans replicas or gathers statistics keeps ``quantize_input``: the plan's quantization
+        leaves SMs to its concurrent HALO-Q/TMA kernel, and the scheduler's quantization overlaps
+        the statistics' allreduce, which the scheduler waits for right before ``run_moe``."""
         balancer = self.layer_load_balancer
         return hasattr(torch.ops.trtllm, "megamoe_stage_inputs") and (
-            balancer is None or not balancer.produces_replica_plan
+            balancer is None
+            or not (balancer.produces_replica_plan or balancer.is_dynamic_routing())
         )
 
     def _stage_bf16_inputs(
