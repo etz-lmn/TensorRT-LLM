@@ -1543,9 +1543,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             if route is not None:
                 topk_idx = route()
             return (*self.quantize_input(x), topk_idx)
+        _probe_point("routed")
         bufs = staged[0]
         x_fp4, x_sf = bufs.activation[:num_tokens], bufs.activation_sf[:num_tokens]
         quantize = (self._activation_to_quantize(x), self.fc31_input_scale, x_fp4, x_sf)
+        self._staged_in_one_launch = "the balancer's route op" if route else "megamoe_stage_inputs"
         if route is not None:
             return x_fp4, x_sf, route(quantize=quantize)
         torch.ops.trtllm.megamoe_stage_inputs(
@@ -2293,8 +2295,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 stage_activation=not use_direct_inputs and not activation_staged,
                 replica_plan=replica_plan,
             )
+        one_launch, self._staged_in_one_launch = getattr(self, "_staged_in_one_launch", None), None
         _log_route_staging(
-            "the balancer's route op wrote them"
+            f"{one_launch} wrote them with the quantization"
+            if routes_staged and one_launch
+            else "the balancer's route op wrote them"
             if routes_staged
             else "the kernel reads them in place"
             if use_direct_routing_inputs
