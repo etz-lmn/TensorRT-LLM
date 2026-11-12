@@ -156,6 +156,16 @@ def _probe_point(point: str) -> None:
             probe.stamp_point(point)
 
 
+# Measurement hook: the route-staging paths this process's launches took, each logged once per bucket.
+_ROUTE_STAGING_SEEN: set = set()
+
+
+def _log_route_staging(path: str, bucket: int) -> None:
+    if (path, bucket) not in _ROUTE_STAGING_SEEN:
+        _ROUTE_STAGING_SEEN.add((path, bucket))
+        logger.info(f"MegaMoE route staging: {path} (bucket {bucket})")
+
+
 
 def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
     """Return whether the CUDA 13 Cutlass DSL runtime exposes all symbols the
@@ -2223,6 +2233,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 stage_activation=not use_direct_inputs and not activation_staged,
                 replica_plan=replica_plan,
             )
+        _log_route_staging(
+            "the balancer's route op wrote them"
+            if routes_staged
+            else "the kernel reads them in place"
+            if use_direct_routing_inputs
+            else "megamoe_stage_routes",
+            launch_max_T,
+        )
         return self._launch_megamoe_kernel(
             activation=x if use_direct_inputs else bufs.activation,
             activation_sf=x_sf if use_direct_inputs else bufs.activation_sf,
