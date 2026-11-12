@@ -191,6 +191,10 @@ class _Decider:
         # got: the replicas the update's busiest receiving GPU copied
         close, growth, steps_left, got = self.awaiting_copy.pop(window)
         self.copy_samples += [(apply_call, ms / got) for _, n, ms in agreed_timings(per_rank) if n]
+        for _, n, ms in agreed_timings(per_rank) if self.config.ep_rank == 0 else ():
+            if n:  # measurement hook: every timed install's copy, as its price reads it
+                line = f"window {window} apply call {apply_call} layers {n} ms {ms:.4f} busiest replicas {got}"
+                print(f"[TRT-LLM] [I] adaptive EPLB copy: {line}", file=sys.stderr, flush=True)
         self.forwards = self.next_forwards or self.forwards
         plan = self.evaluations.plan(
             apply_call,
