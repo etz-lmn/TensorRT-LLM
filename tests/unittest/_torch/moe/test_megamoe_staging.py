@@ -90,6 +90,7 @@ def test_run_moe_launches_from_the_staging_only_the_rows_quantize_input_put_ther
         _launch_megamoe_kernel=lambda **kw: "out",
     )
     backend._may_read_inputs_in_place = types.MethodType(IMPL._may_read_inputs_in_place, backend)
+    backend._routes_staged = types.MethodType(IMPL._routes_staged, backend)
     routes = torch.zeros(3, 2, dtype=torch.int64)
 
     def run(x: torch.Tensor, x_sf: torch.Tensor) -> str:
@@ -124,6 +125,15 @@ def test_run_moe_launches_from_the_staging_only_the_rows_quantize_input_put_ther
             run(*inputs)
         assert backend._quantized_into is None  # consumed by the launch it was meant for
     assert stage_activation == [False, True]
+    # Routes a load balancer wrote into the staging (route_staging) are not staged again: after
+    # quantize_input nothing is staged, otherwise only the activation rows are copied.
+    routes = bufs.topk_idx_local[:3]
+    backend._handed_out_route_staging = routes.data_ptr()
+    backend._quantized_into = (act.data_ptr(), 3)
+    assert run(*staged) == "out"
+    backend._handed_out_route_staging = routes.data_ptr()
+    assert run(torch.full((3, 4), 7, dtype=torch.uint8), act_sf[:3].clone()) == "out"
+    assert (act[:3] == 7).all() and stage_activation == [False, True]
 
 
 @pytest.mark.parametrize("drops_padding_rows", [True, False])
@@ -158,6 +168,7 @@ def test_run_moe_stages_with_the_forward_word_only_where_the_kernel_masks_droppe
         _launch_megamoe_kernel=lambda **kw: "out",
     )
     backend._may_read_inputs_in_place = types.MethodType(IMPL._may_read_inputs_in_place, backend)
+    backend._routes_staged = types.MethodType(IMPL._routes_staged, backend)
     word = torch.zeros(1, dtype=torch.int32)
     monkeypatch.setattr(mm.live_rows, "current_word", lambda device: word)
     routes = torch.zeros(3, 2, dtype=torch.int64)
