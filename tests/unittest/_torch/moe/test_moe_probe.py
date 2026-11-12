@@ -21,7 +21,9 @@ def test_probe_rows_forwards_stages_and_mtp_passes(tmp_path, stages):
             probe.stamp(layer, 1, 8 + layer)
     probe.write(True)
     out = np.load(tmp_path / "rank0.moe-probe.npz")
-    assert list(out["forward"][1:4]) == [1, 2, 3] and int(out["forwards"]) == 3 and bool(out["final"])
+    assert (
+        list(out["forward"][1:4]) == [1, 2, 3] and int(out["forwards"]) == 3 and bool(out["final"])
+    )
     assert (out["duration_ns"][1:4][:, [0, 1, 61]] > 0).all() and out["tokens"][2, 61] == 69
     assert ("stage_ns" in out) == stages
     if stages:

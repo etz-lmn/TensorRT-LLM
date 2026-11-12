@@ -166,7 +166,6 @@ def _log_route_staging(path: str, bucket: int) -> None:
         logger.info(f"MegaMoE route staging: {path} (bucket {bucket})")
 
 
-
 def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
     """Return whether the CUDA 13 Cutlass DSL runtime exposes all symbols the
     ported MegaMoE CuteDSL kernel needs.
@@ -1440,6 +1439,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """
         del post_quant_comm  # MegaMoE owns dispatch / combine in-kernel.
         del kwargs
+        _probe_point("routed")
         if isinstance(x, Fp4QuantizedTensor):
             raise NotImplementedError(
                 "MegaMoECuteDsl.quantize_input expects BF16 activation; "

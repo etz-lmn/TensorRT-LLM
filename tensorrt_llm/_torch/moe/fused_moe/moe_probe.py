@@ -2,27 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """Measurement hook (fork measurement branch only): GPU timestamps inside every MoE layer's pass.
 
-Off unless ``TRTLLM_MOE_PROBE_DIR`` names a directory: then nothing of this module is imported, allocated or launched.
-On, ``ConfigurableMoE.forward`` stamps the GPU global timer on the current stream right before (``pass_start``) and
-right after (``pass_end``) its scheduler's pass, whatever the backend. With ``TRTLLM_MOE_PROBE_POINTS=stages`` a
-fused-communication (MegaMoE) layer is also stamped once its routes are ready, before the input quantization
-(``routed``), and right before and right after the MegaMoE kernel (``kernel_start``, ``kernel_end``), so its pass splits
-into the routing (top-k, the load balancer's route and statistics), the quantization and route staging, the MegaMoE
-kernel (dispatch, both GEMMs and the combine) and what follows it. Each stamp is one single-thread kernel, so a CUDA
-graph replays the stamps with the forward; each stamp adds a kernel boundary to the stream.
+Off unless ``TRTLLM_MOE_PROBE_DIR`` names a directory: then nothing of this module is imported, allocated or
+launched. On, ``ConfigurableMoE.forward`` stamps the GPU global timer on the current stream right before
+(``pass_start``) and right after (``pass_end``) its scheduler's pass, whatever the backend. With
+``TRTLLM_MOE_PROBE_POINTS=stages`` a MegaMoE layer is also stamped once its routes are ready, as its input
+quantization starts (``routed``), and right before and right after the MegaMoE kernel (``kernel_start``,
+``kernel_end``), so its pass splits into the routing (top-k, the load balancer's route and statistics), the
+quantization and route staging, the MegaMoE kernel (dispatch, both GEMMs and the combine) and what follows it. Each
+stamp is one single-thread kernel, so a CUDA graph replays the stamps with the forward; each stamp adds a kernel
+boundary to the stream.
 
 The stamps go into a device ring of ``RING`` forwards by ``LAYERS`` layers. A forward starts when a ``pass_start``
 layer index is smaller than the last one; a layer passed several times in one forward (the MTP layer, once per draft
-token) keeps its last pass. A thread of the rank reads the forward counter every ``POLL_S`` seconds on its own stream
-and writes the ring to ``<dir>/rank<r>.moe-probe.npz`` (a whole file each time, renamed into place) once no forward has
-started for ``IDLE_S`` seconds (the run's end, before its shutdown) and at least every ``FLUSH_S`` seconds while
-forwards run; the exit writes it once more with ``final`` set. Per row: the forward number and layer 0's
-``pass_start`` (ns); per row and layer: the pass's duration (ns, 0 where the pass was not stamped whole), its token
-count and, with ``stages``, the four parts of the pass (ns, 0 where a part was not stamped).
+token) keeps its last pass. A thread of the rank reads the forward counter every ``POLL_S`` seconds on its own
+stream and writes the ring to ``<dir>/rank<r>.moe-probe.npz`` (a whole file each time, renamed into place) once no
+forward has started for ``IDLE_S`` seconds (the run's end, before its shutdown) and at least every ``FLUSH_S``
+seconds while forwards run; the exit writes it once more with ``final`` set. Per row: the forward number and layer
+0's ``pass_start`` (ns); per row and layer: the pass's duration (ns, 0 where the pass was not stamped whole), its
+token count and, with ``stages``, the four parts of the pass (ns, 0 where a part was not stamped).
 
-With adaptive EPLB on, every install of new route tables is recorded too: the device forward counter at the point of the
-stream where the tables are copied (the next forward routes by them), the layers whose tables changed and the layers whose
-tables differ from the start-up (home) tables after it, as ``install_forward``, ``install_changed`` and
+With adaptive EPLB on, every install of new route tables is recorded too: the device forward counter at the point of
+the stream where the tables are copied (the next forward routes by them), the layers whose tables changed and the
+layers whose tables differ from the start-up (home) tables after it, as ``install_forward``, ``install_changed`` and
 ``install_replicated`` (one row per install, a layer mask each).
 """
 
@@ -85,7 +86,9 @@ class MoeProbe:
         self.installs = []  # (changed layers, replicated layers) per install, in mark order
         self.home = None
         _watch_installs(self)
-        threading.Thread(target=self._flusher, args=(torch.cuda.current_device(),), daemon=True).start()
+        threading.Thread(
+            target=self._flusher, args=(torch.cuda.current_device(),), daemon=True
+        ).start()
         atexit.register(self.write, True)
 
     def _stamp(self, layer: int, point: int, tokens: int) -> None:
@@ -112,7 +115,9 @@ class MoeProbe:
         """Record an install whose route tables were just copied on the current stream."""
         if self.home is None or len(self.installs) >= MAX_INSTALLS:
             return
-        replicated = [i for i in range(len(host_tables)) if not np.array_equal(host_tables[i], self.home[i])]
+        replicated = [
+            i for i in range(len(host_tables)) if not np.array_equal(host_tables[i], self.home[i])
+        ]
         _mark_kernel[(1,)](self.marks, self.state, len(self.installs))
         self.installs.append((list(changed), replicated))
 
@@ -133,7 +138,9 @@ class MoeProbe:
     def write(self, final: bool) -> None:
         with self.lock, torch.cuda.stream(self.stream):
             ring, forwards = self.ring.cpu().numpy(), int(self.state[0].cpu())
-            number = forwards - (forwards - np.arange(RING)) % RING  # the forward each row holds last
+            number = (
+                forwards - (forwards - np.arange(RING)) % RING
+            )  # the forward each row holds last
             stamps = ring[:, :, :TOKENS]
             first, last = stamps[:, :, 0], stamps[:, :, -1]
             whole = (first > 0) & (last >= first)
@@ -151,8 +158,11 @@ class MoeProbe:
             for i, (changed, replicated) in enumerate(self.installs):
                 masks[0, i, [x for x in changed if x < LAYERS]] = True
                 masks[1, i, [x for x in replicated if x < LAYERS]] = True
-            out.update(install_forward=self.marks[: len(self.installs)].cpu().numpy(),
-                       install_changed=masks[0], install_replicated=masks[1])
+            out.update(
+                install_forward=self.marks[: len(self.installs)].cpu().numpy(),
+                install_changed=masks[0],
+                install_replicated=masks[1],
+            )
             if self.stages:
                 parts = np.diff(stamps, axis=2)
                 reached = (stamps[:, :, :-1] > 0) & (stamps[:, :, 1:] > 0) & (parts >= 0)
@@ -165,7 +175,8 @@ class MoeProbe:
 
 
 def _watch_installs(probe: MoeProbe) -> None:
-    """Wrap adaptive EPLB's table install so that each one is recorded (the start-up tables taken as home at the first)."""
+    """Wrap adaptive EPLB's table install so that each one is recorded (the start-up tables taken as home
+    at the first)."""
     runtime = sys.modules.get(__name__.rsplit(".", 1)[0] + ".adaptive_eplb.runtime")
     if runtime is None:  # no adaptive EPLB in this process
         return
