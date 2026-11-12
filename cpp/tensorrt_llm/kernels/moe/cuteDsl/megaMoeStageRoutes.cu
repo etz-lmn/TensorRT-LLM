@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/kernels/moe/cuteDsl/megaMoeStageInputs.cuh"
 #include "tensorrt_llm/kernels/moe/cuteDsl/megaMoeStageRoutes.h"
 
 #include <algorithm>
@@ -27,22 +28,22 @@ namespace kernels
 namespace
 {
 
-constexpr int kThreads = 256;
 constexpr int64_t kMaxBlocks = 1024; // a larger bucket loops: one launch either way
 
 template <typename IdT, typename OutT>
-__global__ void megaMoeStageRoutesKernel(IdT const* __restrict__ ids, float const* __restrict__ weights, int64_t n,
-    int32_t const* __restrict__ liveRowWord, int topK, OutT* __restrict__ idsOut, float* __restrict__ weightsOut,
-    int64_t elements)
+__global__ void megaMoeStageRoutesKernel(MegaMoeStageWriter<IdT, OutT> writer)
 {
-    int64_t const liveElements = (liveRowWord == nullptr ? n : megaMoeLiveRows(*liveRowWord, n)) * topK;
-    for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < elements;
-         i += static_cast<int64_t>(gridDim.x) * blockDim.x)
-    {
-        bool const live = i < liveElements;
-        idsOut[i] = live ? static_cast<OutT>(ids[i]) : static_cast<OutT>(-1);
-        weightsOut[i] = live ? weights[i] : 0.F;
-    }
+    writer(static_cast<int>(blockIdx.x));
+}
+
+template <typename IdT, typename OutT>
+MegaMoeStageWriter<IdT, OutT> stageWriter(IdT const* ids, float const* weights, int64_t n, int32_t const* liveRowWord,
+    OutT* idsOut, float* weightsOut, int64_t rows, int topK)
+{
+    int64_t const elements = rows * topK;
+    auto const blocks
+        = static_cast<int>(std::min((elements + kMegaMoeStageThreads - 1) / kMegaMoeStageThreads, kMaxBlocks));
+    return {ids, weights, n, liveRowWord, topK, idsOut, weightsOut, elements, blocks};
 }
 
 } // namespace
@@ -51,19 +52,26 @@ template <typename IdT, typename OutT>
 void megaMoeStageRoutes(IdT const* ids, float const* weights, int64_t n, int32_t const* liveRowWord, OutT* idsOut,
     float* weightsOut, int64_t rows, int topK, cudaStream_t stream)
 {
-    int64_t const elements = rows * topK;
-    if (elements == 0)
+    auto const writer = stageWriter(ids, weights, n, liveRowWord, idsOut, weightsOut, rows, topK);
+    if (writer.blocks > 0)
     {
-        return;
+        megaMoeStageRoutesKernel<IdT, OutT><<<writer.blocks, kMegaMoeStageThreads, 0, stream>>>(writer);
     }
-    auto const blocks = static_cast<int>(std::min((elements + kThreads - 1) / kThreads, kMaxBlocks));
-    megaMoeStageRoutesKernel<IdT, OutT>
-        <<<blocks, kThreads, 0, stream>>>(ids, weights, n, liveRowWord, topK, idsOut, weightsOut, elements);
+}
+
+template <typename IdT, typename OutT>
+void megaMoeStageInputs(MegaMoeQuantize const& quantize, IdT const* ids, float const* weights, int64_t n,
+    int32_t const* liveRowWord, OutT* idsOut, float* weightsOut, int64_t rows, int topK, cudaStream_t stream)
+{
+    launchMegaMoeStageInputs(
+        quantize, stageWriter(ids, weights, n, liveRowWord, idsOut, weightsOut, rows, topK), 0, stream);
 }
 
 #define INSTANTIATE_MEGAMOE_STAGE_ROUTES(IdT, OutT)                                                                    \
     template void megaMoeStageRoutes<IdT, OutT>(                                                                       \
-        IdT const*, float const*, int64_t, int32_t const*, OutT*, float*, int64_t, int, cudaStream_t)
+        IdT const*, float const*, int64_t, int32_t const*, OutT*, float*, int64_t, int, cudaStream_t);                 \
+    template void megaMoeStageInputs<IdT, OutT>(MegaMoeQuantize const&, IdT const*, float const*, int64_t,             \
+        int32_t const*, OutT*, float*, int64_t, int, cudaStream_t)
 
 INSTANTIATE_MEGAMOE_STAGE_ROUTES(int32_t, int32_t);
 INSTANTIATE_MEGAMOE_STAGE_ROUTES(int32_t, int64_t);
