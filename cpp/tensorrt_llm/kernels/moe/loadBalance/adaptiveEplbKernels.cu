@@ -18,6 +18,7 @@
 // Device route and statistics of the adaptive expert load balancer. Both read fixed-address tables and write
 // caller-owned buffers on the given stream, so CUDA graphs can capture them.
 
+#include "tensorrt_llm/kernels/moe/cuteDsl/megaMoeStageInputs.cuh"
 #include "tensorrt_llm/kernels/moe/loadBalance/adaptiveEplbKernels.h"
 
 #include "tensorrt_llm/common/envUtils.h"
@@ -245,21 +246,16 @@ __device__ __forceinline__ bool countIds(
 // its expert's elements in the split block needs the counts of every spread id there, so every block counts its whole
 // split block in shared memory: per id in the split block, in the tiles before its own, and in each warp of its own
 // tile, where __match_any_sync ranks the lanes of equal ids. A tile past the routed elements only writes the staged
-// bucket's rest; with statistics, the launch's last block counts all the ids and updates them.
-// Under PDL the launch may start while the stream's earlier kernel drains; completion is reported when the blocks
-// exit, so a dependent that waits on this grid reads whole routes without a fence of this kernel's own.
+// bucket's rest; with statistics, the route's last block (of blocks) counts all the ids and updates them.
 template <typename IdT, typename OutT>
-__global__ void __launch_bounds__(kTileThreads)
-    adaptiveEplbRouteKernel(IdT const* __restrict__ ids, int64_t count, int epRank, AdaptiveEplbRouteTables tables,
-        OutT* __restrict__ out, AdaptiveEplbStaging staging, AdaptiveEplbStats stats)
+__device__ __forceinline__ void routeBlock(unsigned blockId, unsigned blocks, IdT const* __restrict__ ids,
+    int64_t count, int epRank, AdaptiveEplbRouteTables const& tables, OutT* __restrict__ out,
+    AdaptiveEplbStaging const& staging, AdaptiveEplbStats const& stats)
 {
     extern __shared__ __align__(16) int shared[];
-#if __CUDA_ARCH__ >= 900
-    cudaGridDependencySynchronize(); // launched early under PDL: the ids and the tables are the stream's earlier work
-#endif
     int const numExperts = tables.numExperts;
     int const numSlots = tables.numSlots;
-    if (stats.rows != nullptr && blockIdx.x == gridDim.x - 1)
+    if (stats.rows != nullptr && blockId == blocks - 1)
     {
         if (countIds(ids, 0, liveIdCount(stats.liveRowWord, count, stats.topK), numExperts, stats.enabled, shared))
         {
@@ -267,9 +263,9 @@ __global__ void __launch_bounds__(kTileThreads)
         }
         return;
     }
-    if (static_cast<int64_t>(blockIdx.x) * kTileThreads >= count)
+    if (static_cast<int64_t>(blockId) * kTileThreads >= count)
     {
-        storeRoute(static_cast<int64_t>(blockIdx.x) * kTileThreads + threadIdx.x, count, 0, out, staging);
+        storeRoute(static_cast<int64_t>(blockId) * kTileThreads + threadIdx.x, count, 0, out, staging);
         return;
     }
     // Shared memory: the tables, and per spread id its elements in the split block (total), in the tiles before this
@@ -285,8 +281,8 @@ __global__ void __launch_bounds__(kTileThreads)
     int const t = threadIdx.x;
     int const lane = t & 31;
     int const warp = t >> 5;
-    int const block = blockIdx.x / kTilesPerSplitBlock;
-    int const tile = blockIdx.x % kTilesPerSplitBlock;
+    int const block = blockId / kTilesPerSplitBlock;
+    int const tile = blockId % kTilesPerSplitBlock;
     int64_t const base = static_cast<int64_t>(block) * kSplitBlock;
     // The ids and the first kTableEntriesPerThread entries of every table go to registers before the first shared
     // store, so that their reads overlap in one memory round trip.
@@ -420,6 +416,41 @@ __global__ void __launch_bounds__(kTileThreads)
         out, staging);
 }
 
+// Under PDL the launch may start while the stream's earlier kernel drains; completion is reported when the blocks
+// exit, so a dependent that waits on this grid reads whole routes without a fence of this kernel's own.
+template <typename IdT, typename OutT>
+__global__ void __launch_bounds__(kTileThreads)
+    adaptiveEplbRouteKernel(IdT const* __restrict__ ids, int64_t count, int epRank, AdaptiveEplbRouteTables tables,
+        OutT* __restrict__ out, AdaptiveEplbStaging staging, AdaptiveEplbStats stats)
+{
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize(); // launched early under PDL: the ids and the tables are the stream's earlier work
+#endif
+    routeBlock(blockIdx.x, gridDim.x, ids, count, epRank, tables, out, staging, stats);
+}
+
+static_assert(kTileThreads == kMegaMoeStageThreads, "a route block runs as a block of a MegaMoE input staging launch");
+
+// The route as the writer of a MegaMoE input staging launch (megaMoeStageInputs.cuh): its blocks come first in the
+// launch.
+template <typename IdT, typename OutT>
+struct RouteWriter
+{
+    IdT const* ids;
+    int64_t count;
+    int epRank;
+    AdaptiveEplbRouteTables tables;
+    OutT* out;
+    AdaptiveEplbStaging staging;
+    AdaptiveEplbStats stats;
+    int blocks;
+
+    __device__ void operator()(int block) const
+    {
+        routeBlock(block, blocks, ids, count, epRank, tables, out, staging, stats);
+    }
+};
+
 // One block counts all the ids and updates the statistics.
 template <typename IdT>
 __global__ void __launch_bounds__(kRecordThreads)
@@ -437,13 +468,20 @@ __global__ void __launch_bounds__(kRecordThreads)
 
 template <typename IdT, typename OutT>
 void adaptiveEplbRoute(IdT const* ids, int64_t count, int epRank, AdaptiveEplbRouteTables tables, OutT* out,
-    AdaptiveEplbStaging staging, AdaptiveEplbStats stats, cudaStream_t stream)
+    AdaptiveEplbStaging staging, AdaptiveEplbStats stats, cudaStream_t stream, MegaMoeQuantize const* quantize)
 {
     int64_t const extent = staging.weightsOut != nullptr ? staging.total : count;
     auto blocks = static_cast<unsigned>((extent + kTileThreads - 1) / kTileThreads) + (stats.rows != nullptr ? 1u : 0u);
-    if (blocks > 0)
+    size_t const bytes = routeSharedBytes(tables.numExperts, tables.numSlots);
+    if (quantize != nullptr)
     {
-        size_t const bytes = routeSharedBytes(tables.numExperts, tables.numSlots);
+        allowSharedBytes<megaMoeStageInputsKernel<RouteWriter<IdT, OutT>>>(bytes);
+        launchMegaMoeStageInputs(*quantize,
+            RouteWriter<IdT, OutT>{ids, count, epRank, tables, out, staging, stats, static_cast<int>(blocks)}, bytes,
+            stream);
+    }
+    else if (blocks > 0)
+    {
         allowSharedBytes<adaptiveEplbRouteKernel<IdT, OutT>>(bytes);
         common::launchWithPdlWhenEnabled("adaptiveEplbRoute", adaptiveEplbRouteKernel<IdT, OutT>, dim3(blocks),
             dim3(kTileThreads), bytes, stream, ids, count, epRank, tables, out, staging, stats);
@@ -462,7 +500,7 @@ void adaptiveEplbRecord(IdT const* ids, int64_t count, int numExperts, float* ro
 
 #define INSTANTIATE_ADAPTIVE_EPLB_ROUTE(IdT, OutT)                                                                     \
     template void adaptiveEplbRoute<IdT, OutT>(IdT const*, int64_t, int, AdaptiveEplbRouteTables, OutT*,               \
-        AdaptiveEplbStaging, AdaptiveEplbStats, cudaStream_t);
+        AdaptiveEplbStaging, AdaptiveEplbStats, cudaStream_t, MegaMoeQuantize const*);
 
 INSTANTIATE_ADAPTIVE_EPLB_ROUTE(int32_t, int32_t)
 INSTANTIATE_ADAPTIVE_EPLB_ROUTE(int32_t, int64_t)

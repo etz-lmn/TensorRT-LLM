@@ -69,11 +69,6 @@ def _route(ids, tables, ep_rank, slot_dtype):
     return out
 
 
-def _reference_route(ids, tables, ep_rank) -> list:
-    """The routes of the flat ``ids`` by the op's Python version."""
-    return reference.route(list(ids), *tables, ep_rank)
-
-
 def _stats(num_experts: int) -> ExpertStatistics:
     on = torch.ones(1, dtype=torch.int32, device="cuda")
     return ExpertStatistics.of(statistics_buffers(1, num_experts, "cuda"), 0, on)
@@ -141,7 +136,7 @@ def test_route_op_matches_the_reference(id_dtype, slot_dtype, geometry):
         got = _route(ids_device, device_tables, ep_rank, slot_dtype)
         assert got.dtype == slot_dtype and tuple(got.shape) == (rows, TOP_K)
         routed = got.view(-1).tolist()
-        assert routed == _reference_route(ids, tables, ep_rank)
+        assert routed == reference.route(ids, *tables, ep_rank)
         # A slot that holds the element's expert, or the sentinel slot.
         for expert, slot in zip(ids, routed):
             assert slot == num_slots or layout[slot] == expert
@@ -173,7 +168,7 @@ def test_route_op_on_unroutable_tables():
         ids_device = torch.tensor(ids, dtype=torch.int64, device="cuda").view(-1, TOP_K)
         got = _route(ids_device, device_tables, ep_rank, torch.int32)
         routed = got.view(-1).tolist()
-        assert routed == _reference_route(ids, (counts, starts, slots, cumulative_shares), ep_rank)
+        assert routed == reference.route(ids, counts, starts, slots, cumulative_shares, ep_rank)
         for expert, slot in zip(ids, routed):
             if 0 <= expert < num_experts and not (
                 counts[expert] > 0 and 0 <= starts[expert] <= num_slots - counts[expert]
@@ -205,7 +200,7 @@ def test_a_route_in_a_cuda_graph_follows_its_tables():
         tables = install(_random_layout(rng, 384, 512, 32), [rng.random() for _ in range(512)])
         graph.replay()
         torch.cuda.synchronize()
-        assert out.view(-1).tolist() == _reference_route(ids, tables, 3)
+        assert out.view(-1).tolist() == reference.route(ids, *tables, 3)
 
 
 @needs_gpu
@@ -234,8 +229,8 @@ def test_record_op_matches_torch(num_experts):
 @pytest.mark.parametrize("rows,bucket", [(37, 64), (64, 64), (0, 16), (9000, 9216)])
 def test_route_into_op_stages_the_routes_and_records(rows, bucket):
     """One launch writes the slots and gate weights into a bucket's first rows, -1 and 0 into the
-    other rows (the columns after top_k untouched), and adds the ids to the statistics; 9000 rows
-    are more ids than the statistics count in one block."""
+    other rows (the columns after top_k untouched), adds the ids to the statistics (9000 rows are
+    more than one block counts) and, given x, quantizes it as fp4_quantize_into does."""
     layout, shares, _ = _dsv4_case(1)
     tables = build_route_tables(layout, shares, 384, 512)
     device_tables = _tables(*tables)
@@ -244,19 +239,24 @@ def test_route_into_op_stages_the_routes_and_records(rows, bucket):
     ids = _random_ids(rng, rows, 384, hot, False) if rows else []
     ids = torch.tensor(ids, dtype=torch.int32, device="cuda").view(rows, TOP_K)
     weights = torch.rand(rows, TOP_K, device="cuda")
-    out = torch.full((bucket, TOP_K), 7, dtype=torch.int64, device="cuda")
-    weights_out = torch.full((bucket, TOP_K + 2), 5.0, device="cuda")
     stats, expected = _stats(384), _stats(384)
-    torch.ops.trtllm.adaptive_eplb_route_into(
-        ids, *device_tables, 3, out, weights, weights_out, *stats, True
-    )
-    assert out[:rows].tolist() == _route(ids, device_tables, 3, torch.int64).tolist()
-    assert (out[rows:] == -1).all()
-    assert torch.equal(weights_out[:rows, :TOP_K], weights)
-    assert (weights_out[rows:, :TOP_K] == 0).all() and (weights_out[:, TOP_K:] == 5).all()
-    reference.record(ids, *expected)
-    assert torch.equal(stats.forwards, expected.forwards)
-    assert torch.equal(stats.rows.view(torch.int32), expected.rows.view(torch.int32))
+    x = torch.randn(rows, 7168, device="cuda").bfloat16()
+    scale = torch.tensor([99.0], device="cuda")
+    fp4 = [x.new_full((rows, 7168 // d), 255, dtype=torch.uint8) for d in (2, 16, 2, 16)]
+    for quantize in ((), (x, scale, *fp4[:2])):  # the route alone, then with x in the same launch
+        out = torch.full((bucket, TOP_K), 7, dtype=torch.int64, device="cuda")
+        weights_out = torch.full((bucket, TOP_K + 2), 5.0, device="cuda")
+        torch.ops.trtllm.adaptive_eplb_route_into(
+            ids, *device_tables, 3, out, weights, weights_out, *stats, True, None, *quantize
+        )
+        assert out[:rows].tolist() == _route(ids, device_tables, 3, torch.int64).tolist()
+        assert (out[rows:] == -1).all() and torch.equal(weights_out[:rows, :TOP_K], weights)
+        assert (weights_out[rows:, :TOP_K] == 0).all() and (weights_out[:, TOP_K:] == 5).all()
+        reference.record(ids, *expected)
+        assert torch.equal(stats.forwards, expected.forwards)
+        assert torch.equal(stats.rows.view(torch.int32), expected.rows.view(torch.int32))
+    torch.ops.trtllm.fp4_quantize_into(x, scale, *fp4[2:], False)
+    assert torch.equal(fp4[0], fp4[2]) and torch.equal(fp4[1], fp4[3])
     # Without weights the buffer holds exactly the ids' elements (a bucket needs the weights).
     plain = torch.empty(rows, TOP_K, dtype=torch.int32, device="cuda")
     torch.ops.trtllm.adaptive_eplb_route_into(ids, *device_tables, 3, plain)

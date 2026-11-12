@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/adaptiveEplbKernels.h"
+#include "tensorrt_llm/thop/moe/cuteDsl/megaMoeStageInputsOp.h"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -53,10 +54,11 @@ void checkVector(at::Tensor const& tensor, at::ScalarType dtype, at::Tensor cons
 
 template <typename IdT, typename OutT>
 void route(at::Tensor const& ids, int64_t epRank, kernels::AdaptiveEplbRouteTables const& tables, at::Tensor& out,
-    kernels::AdaptiveEplbStaging const& staging, kernels::AdaptiveEplbStats const& stats)
+    kernels::AdaptiveEplbStaging const& staging, kernels::AdaptiveEplbStats const& stats,
+    kernels::MegaMoeQuantize const* quantize)
 {
     kernels::adaptiveEplbRoute(ids.data_ptr<IdT>(), ids.numel(), static_cast<int>(epRank), tables, out.data_ptr<OutT>(),
-        staging, stats, at::cuda::getCurrentCUDAStream(ids.get_device()));
+        staging, stats, at::cuda::getCurrentCUDAStream(ids.get_device()), quantize);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -77,7 +79,8 @@ kernels::AdaptiveEplbRouteTables checkTables(at::Tensor const& ids, at::Tensor c
 }
 
 void routeInto(at::Tensor const& ids, kernels::AdaptiveEplbRouteTables const& tables, int64_t epRank, at::Tensor& out,
-    kernels::AdaptiveEplbStaging const& staging, kernels::AdaptiveEplbStats const& stats)
+    kernels::AdaptiveEplbStaging const& staging, kernels::AdaptiveEplbStats const& stats,
+    kernels::MegaMoeQuantize const* quantize)
 {
     TORCH_CHECK(out.scalar_type() == at::kInt || out.scalar_type() == at::kLong, "out must be int32 or int64");
     auto const contiguousIds = ids.contiguous();
@@ -85,13 +88,13 @@ void routeInto(at::Tensor const& ids, kernels::AdaptiveEplbRouteTables const& ta
     bool const wideOut = out.scalar_type() == at::kLong;
     if (wideIds)
     {
-        wideOut ? route<int64_t, int64_t>(contiguousIds, epRank, tables, out, staging, stats)
-                : route<int64_t, int32_t>(contiguousIds, epRank, tables, out, staging, stats);
+        wideOut ? route<int64_t, int64_t>(contiguousIds, epRank, tables, out, staging, stats, quantize)
+                : route<int64_t, int32_t>(contiguousIds, epRank, tables, out, staging, stats, quantize);
     }
     else
     {
-        wideOut ? route<int32_t, int64_t>(contiguousIds, epRank, tables, out, staging, stats)
-                : route<int32_t, int32_t>(contiguousIds, epRank, tables, out, staging, stats);
+        wideOut ? route<int32_t, int64_t>(contiguousIds, epRank, tables, out, staging, stats, quantize)
+                : route<int32_t, int32_t>(contiguousIds, epRank, tables, out, staging, stats, quantize);
     }
 }
 
@@ -128,12 +131,14 @@ void record(at::Tensor const& ids, kernels::AdaptiveEplbStats const& stats, int 
 //! ([tokens, top_k] float32 gate weights) and weights_out ([rows, >= top_k] float32, unit column stride), out is a
 //! bucket of rows >= tokens rows whose elements after the ids get slot -1 and weight 0; without them, out has exactly
 //! the ids' elements. With rows, forwards and enabled, the launch adds the ids to the statistics as
-//! adaptive_eplb_record does, with live_row_word only the ids of the forward's live rows.
+//! adaptive_eplb_record does, with live_row_word only the ids of the forward's live rows. With x, x_global_scale,
+//! x_fp4 and x_sf, the same launch also quantizes x into x_fp4 and x_sf as megamoe_stage_inputs does.
 void adaptiveEplbRouteInto(at::Tensor const& ids, at::Tensor const& counts, at::Tensor const& starts,
     at::Tensor const& slots, at::Tensor const& cumulativeShares, int64_t epRank, at::Tensor& out,
     std::optional<at::Tensor> const& weights, std::optional<at::Tensor> weightsOut, std::optional<at::Tensor> rows,
     std::optional<at::Tensor> forwards, std::optional<at::Tensor> const& enabled, bool first,
-    std::optional<at::Tensor> const& liveRowWord)
+    std::optional<at::Tensor> const& liveRowWord, std::optional<at::Tensor> const& x,
+    std::optional<at::Tensor> const& xGlobalScale, std::optional<at::Tensor> xFp4, std::optional<at::Tensor> xSf)
 {
     auto const tables = checkTables(ids, counts, starts, slots, cumulativeShares, epRank);
     TORCH_CHECK(out.is_contiguous() && out.device() == ids.device() && out.numel() >= ids.numel(),
@@ -167,7 +172,15 @@ void adaptiveEplbRouteInto(at::Tensor const& ids, at::Tensor const& counts, at::
         TORCH_CHECK(rows->numel() == tables.numExperts, "rows must have one entry per expert of the tables (",
             tables.numExperts, "), got ", rows->numel());
     }
-    routeInto(ids, tables, epRank, out, staging, stats);
+    TORCH_CHECK(x.has_value() == xGlobalScale.has_value() && x.has_value() == xFp4.has_value()
+            && x.has_value() == xSf.has_value() && (!x.has_value() || x->device() == ids.device()),
+        "x, x_global_scale, x_fp4 and x_sf go together, on the device of the expert ids");
+    std::optional<kernels::MegaMoeQuantize> quantize;
+    if (x.has_value())
+    {
+        quantize = megaMoeQuantizeOf(*x, *xGlobalScale, *xFp4, *xSf);
+    }
+    routeInto(ids, tables, epRank, out, staging, stats, quantize ? &*quantize : nullptr);
 }
 
 //! Add expert ids to a layer's statistics while enabled[0] is set: every call adds its per-expert counts to rows,
@@ -199,7 +212,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "adaptive_eplb_route_into(Tensor ids, Tensor counts, Tensor starts, Tensor slots, Tensor cumulative_shares, "
         "int ep_rank, Tensor(a!) out, Tensor? weights=None, Tensor(b!)? weights_out=None, Tensor(c!)? rows=None, "
-        "Tensor(d!)? forwards=None, Tensor? enabled=None, bool first=True, Tensor? live_row_word=None) -> ()");
+        "Tensor(d!)? forwards=None, Tensor? enabled=None, bool first=True, Tensor? live_row_word=None, Tensor? x=None, "
+        "Tensor? x_global_scale=None, Tensor(e!)? x_fp4=None, Tensor(f!)? x_sf=None) -> ()");
     m.def(
         "adaptive_eplb_record(Tensor ids, Tensor(a!) rows, Tensor(b!) forwards, Tensor enabled, "
         "bool first=True, Tensor? live_row_word=None) -> ()");
