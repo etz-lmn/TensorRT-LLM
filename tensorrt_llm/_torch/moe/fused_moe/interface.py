@@ -739,16 +739,18 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         finally:
             self._load_balancer_overlap_fn = None
 
-    def _load_balancer_route(
-            self,
-            token_selected_experts: torch.Tensor,
-            use_dp: bool,
-            token_final_scales: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _load_balancer_route(self,
+                             token_selected_experts: torch.Tensor,
+                             use_dp: bool,
+                             token_final_scales: Optional[torch.Tensor] = None,
+                             quantize: Optional[tuple] = None) -> torch.Tensor:
         """Route tokens and enqueue a per-layer dynamic replica plan when enabled.
 
         ``token_final_scales`` lets a balancer that stages routes for the
         backend write the gate weights beside the slots; a balancer that does
-        not take them is called without them.
+        not take them is called without them. ``quantize`` (a backend's
+        ``(x, global_scale, x_fp4, x_sf)``) is quantized in the route's launch
+        by such a balancer.
         """
         if not self.layer_load_balancer:
             return token_selected_experts
@@ -756,6 +758,8 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         kwargs = {}
         if token_final_scales is not None and self.layer_load_balancer.stages_routes:
             kwargs["token_final_scales"] = token_final_scales
+        if quantize is not None:
+            kwargs["quantize"] = quantize
         overlap_fn = self._load_balancer_overlap_fn
         if overlap_fn is not None:
             self._load_balancer_overlap_fn = None

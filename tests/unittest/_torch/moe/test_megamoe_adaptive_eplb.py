@@ -104,23 +104,13 @@ def test_a_calibration_prices_any_gpu_and_its_identity_resolves_tactics_without_
     assert IMPL.decode_calibration_identity(backend, [32])["tactics"] == {"32": "autotune"}
 
 
-def test_route_staging_hands_out_the_routes_and_weights_of_the_staging():
-    """``route_staging`` hands out the index and weight staging of the bucket that
-    ``_staging_of_next_run`` finds for the routes' ``top_k``, and nothing where it finds none."""
-    idx, weights = torch.full((4, 2), -1, dtype=torch.int32), torch.zeros(4, 2)
-    bufs = SimpleNamespace(topk_idx_local=idx, topk_weights=weights)
+def test_route_staging_hands_out_nothing_where_the_next_run_stages_nothing():
+    """``route_staging`` hands out the staging ``_staging_of_next_run`` finds for the routes' rows and
+    ``top_k`` (test_adaptive_eplb_live_rows, on the device), and nothing where it finds none."""
     asked = []
-
-    def staging_of_next_run(rows, top_k):
-        asked.append((rows, top_k))
-        return (bufs, 4) if top_k == 2 else None
-
-    backend = SimpleNamespace(_staging_of_next_run=staging_of_next_run)
-    got = IMPL.route_staging(backend, 3, 2)
-    assert got.topk_idx is idx and got.topk_weights is weights and got.bucket == 4
-    assert backend._handed_out_route_staging == idx.data_ptr()
-    assert IMPL.route_staging(backend, 3, 6) is None
-    assert asked == [(3, 2), (3, 6)]
+    backend = SimpleNamespace(_staging_of_next_run=lambda *rows_top_k: asked.append(rows_top_k))
+    assert IMPL.route_staging(backend, 3, 6) is None and asked == [(3, 6)]
+    assert not hasattr(backend, "_handed_out_route_staging")
 
 
 def test_staged_routes_are_taken_only_after_a_route_staging_hand_out():

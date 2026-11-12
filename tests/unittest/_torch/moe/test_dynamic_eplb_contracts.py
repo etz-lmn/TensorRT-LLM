@@ -1876,7 +1876,12 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
         "ceil_div": lambda a, b: -(-a // b),
     }
     _extract_function(source, "_fp4_quantize_has_sm_budget", namespace)
-    impl = _extract_class(source, "TrtllmCutedslMegaMoeNvfp4Impl", {"quantize_input"}, namespace)
+    impl = _extract_class(
+        source,
+        "TrtllmCutedslMegaMoeNvfp4Impl",
+        {"quantize_input", "_activation_to_quantize"},
+        namespace,
+    )
     owner = impl()
     owner.fc31_input_scale = "scale"
     owner._staging_of_next_run = lambda num_tokens: None  # a forward that run_moe does not stage
@@ -2390,7 +2395,7 @@ class _ChunkRoutes:
         self.name = name
 
 
-@pytest.mark.parametrize("mode", ["per_layer_dynamic", "standard", "off"])
+@pytest.mark.parametrize("mode", ["per_layer_dynamic", "standard", "off", "deferred"])
 def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     source = _TORCH_ROOT / "moe/fused_moe/moe_scheduler.py"
     trace = []
@@ -2406,6 +2411,10 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             labels.append(num_slots)
             trace.append(("statistic", routes.name))
 
+        @staticmethod
+        def get():
+            return None
+
     def maybe_collect_or_replay_slots(num_slots, routes):
         labels.append(num_slots)
         trace.append(("calibrator", routes.name))
@@ -2414,8 +2423,10 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     namespace = {
         "ExpertStatistic": ExpertStatistic,
         "get_calibrator": lambda: SimpleNamespace(
-            maybe_collect_or_replay_slots=maybe_collect_or_replay_slots
+            maybe_collect_or_replay_slots=maybe_collect_or_replay_slots,
+            mode=SimpleNamespace(name="NONE"),
         ),
+        "functools": functools,
         "get_active_route_capture": lambda: None,
         "torch": SimpleNamespace(int32="int32", float32="float32"),
         "Fp4QuantizedTensor": type("Fp4QuantizedTensor", (), {}),
@@ -2423,6 +2434,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     }
     _extract_function(source, "_record_routes", namespace)
     _extract_function(source, "_leading_rows", namespace)
+    _extract_function(source, "_routes_recorded", namespace)
     scheduler_cls = _extract_class(source, "FusedCommMoEScheduler", {"_forward_chunk"}, namespace)
 
     plan = SimpleNamespace(reserved_sms=4)
@@ -2430,17 +2442,20 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         None
         if mode == "off"
         else SimpleNamespace(
-            produces_replica_plan=mode != "standard",
+            produces_replica_plan=mode == "per_layer_dynamic",
             require_replica_plan=lambda: plan,
+            stages_routes=True,
         )
     )
 
-    def route(routes, use_dp, token_final_scales=None):
-        trace.append(("route", routes.name))
+    def route(routes, use_dp, token_final_scales=None, **quantize):
+        trace.append(("route", routes.name, *quantize.values()))
         return _ChunkRoutes("physical" if mode == "per_layer_dynamic" else "slots")
 
     def run_moe(ctx):
         trace.append(("run_moe", ctx.token_selected_experts.name, ctx.replica_plan))
+        if ctx.route is not None:  # the route the backend launches with its input staging
+            trace.append(("staged", ctx.x_sf, ctx.route(quantize="q").name))
         return "out"
 
     moe = SimpleNamespace(
@@ -2471,6 +2486,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             quantize_input=lambda x, **kwargs: trace.append(("quantize", kwargs)) or ("x", "sf"),
             set_adaptive_launch_tokens=lambda tokens: trace.append(("bucket", tokens)),
             run_moe=run_moe,
+            supports_fused_prepare=lambda: mode == "deferred",
         ),
     )
     scheduler = scheduler_cls()
@@ -2513,6 +2529,22 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             ("calibrator", "slots"),
             ("quantize", {}),
             ("run_moe", "replayed slots", None),
+            "start_set_cpu",
+            "done_set_cpu",
+        ]
+    elif mode == "deferred":
+        # A balancer that stages routes, under a backend that stages its inputs in one launch:
+        # run_moe launches the route, with the quantization, and gets the activation unquantized.
+        expected = [
+            "start_wait_gpu",
+            ("bucket", 6),
+            "done_wait_gpu",
+            ("update_statistic", "logical"),
+            ("statistic", "logical"),
+            ("calibrator", "logical"),
+            ("run_moe", "replayed logical", None),
+            ("route", "logical", "q"),
+            ("staged", None, "slots"),
             "start_set_cpu",
             "done_set_cpu",
         ]
