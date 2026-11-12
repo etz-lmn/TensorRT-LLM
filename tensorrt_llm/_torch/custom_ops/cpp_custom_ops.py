@@ -672,6 +672,12 @@ def _register_fake():
           weights_out: torch.Tensor) -> None:
         return None
 
+    @torch.library.register_fake("trtllm::megamoe_stage_inputs")
+    def _(x: torch.Tensor, global_scale: torch.Tensor, x_fp4: torch.Tensor,
+          x_sf: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor,
+          ids_out: torch.Tensor, weights_out: torch.Tensor) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::fp4_quantize_with_reorder_residual")
     def _(
         X: torch.Tensor,
