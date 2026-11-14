@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """``megamoe_stage_routes`` writes a MegaMoE bucket's route staging byte for byte as torch copies
-and fills do: the routes widened into rows ``[0, n)``, -1 and 0 in the rows after them. A launch
-without rows, such as the priming of the other buckets while tuning, stages -1 and 0 in every row.
+and fills do: the routes widened into rows ``[0, n)``, -1 and 0 in the rows after them;
+``megamoe_stage_inputs`` writes the same bytes and, in the same launch, the activation's NVFP4 bytes
+as ``fp4_quantize.into`` does. A launch without rows, such as the priming of the other buckets while
+tuning, stages -1 and 0 in every row.
 With the forward's live-row word, only the word's live rows get their routes, on the CPU and on the
 device alike. The staging refuses routes whose row count is not the launch's token count."""
 
@@ -38,7 +40,12 @@ def _garbage(shape, dtype, generator, device):
     [(torch.int32, torch.int64), (torch.int32, torch.int32), (torch.int64, torch.int64)],
 )
 @pytest.mark.parametrize("rows", [0, 1, 7, ROWS])
-def test_stage_routes_matches_torch_copies_and_fills(device, id_dtype, out_dtype, rows):
+# Hidden sizes of 896 and 260 vectors of eight: two runs of 512 per row, the second short, and one
+# run shorter than a block; 97 activation rows per route row stride past the resident blocks.
+@pytest.mark.parametrize("hidden", [None, 7168, 2080])
+def test_stage_routes_matches_torch_copies_and_fills(device, id_dtype, out_dtype, rows, hidden):
+    if hidden and device == "cpu":
+        pytest.skip("megamoe_stage_inputs runs on the device only")
     gen = torch.Generator().manual_seed(rows)
     info = torch.iinfo(torch.int32)
     ids = torch.randint(-1, 384, (rows, TOP_K), dtype=id_dtype, generator=gen)
@@ -54,7 +61,18 @@ def test_stage_routes_matches_torch_copies_and_fills(device, id_dtype, out_dtype
     want_ids[rows:].fill_(-1)
     want_weights[rows:].zero_()
 
-    torch.ops.trtllm.megamoe_stage_routes(ids, weights, ids_out, weights_out)
+    if hidden is None:
+        torch.ops.trtllm.megamoe_stage_routes(ids, weights, ids_out, weights_out)
+    else:
+        x = (torch.randn(rows * 97, hidden, generator=gen) * 3).to(torch.bfloat16).to(device)
+        x[::3, 16:32] = 0  # a group of zeros: scale factor 0
+        scale = torch.tensor([448 * 6 / 7.5], device=device)
+        fp4 = _garbage((x.shape[0], hidden // 2), torch.uint8, gen, device)
+        sf = _garbage((x.shape[0], hidden // 16), torch.uint8, gen, device)
+        want_fp4, want_sf = fp4.clone(), sf.clone()
+        torch.ops.trtllm.fp4_quantize.into(x, scale, want_fp4, want_sf, False)
+        torch.ops.trtllm.megamoe_stage_inputs(x, scale, fp4, sf, ids, weights, ids_out, weights_out)
+        assert torch.equal(fp4, want_fp4) and torch.equal(sf, want_sf)
 
     assert torch.equal(ids_out.view(torch.uint8), want_ids.view(torch.uint8))
     assert torch.equal(weights_out.view(torch.uint8), want_weights.view(torch.uint8))
@@ -165,6 +183,93 @@ def test_staging_drops_the_rows_the_forward_word_drops():
     assert torch.equal(bufs.topk_idx_local[:2], ids[:2].long())
     assert (bufs.topk_idx_local[2:] == -1).all()
     assert bufs.topk_weights[:2].eq(1).all() and not bufs.topk_weights[2:].any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("rows,bucket", [(0, 16), (5, 16), (16, 16), (37, 64)])
+@pytest.mark.parametrize("drops_padding_rows", [False, True])
+def test_bf16_inputs_stage_in_one_launch_as_in_two(monkeypatch, rows, bucket, drops_padding_rows):
+    """run_moe's fused prepare (``_stage_bf16_inputs``) leaves a bucket's staging byte for byte as
+    quantize_input and ``_stage_inputs`` leave it, under the forward's word where the bucket drops
+    the padding rows, replayed from a CUDA graph over new inputs."""
+    gen = torch.Generator().manual_seed(rows)
+    shapes = dict(activation=(3584, torch.uint8), activation_sf=(448, torch.uint8))
+    shapes.update(topk_idx_local=(TOP_K, torch.int64), topk_weights=(TOP_K, torch.float32))
+    fused = SimpleNamespace(
+        **{k: _garbage((bucket, n), t, gen, "cuda") for k, (n, t) in shapes.items()}
+    )
+    separate = SimpleNamespace(**{k: v.clone() for k, v in vars(fused).items()})
+    word = torch.tensor([live_rows.encode(1, 4)], dtype=torch.int32, device="cuda")
+    monkeypatch.setattr(live_rows, "current_word", lambda device: word)
+    scale = torch.tensor([448 * 6 / 7.5], device="cuda")
+    moe = SimpleNamespace(
+        fc31_input_scale=scale,
+        _active_launch_max_tokens=bucket,
+        _padding_drop_buckets={bucket} if drops_padding_rows else set(),
+        _select_launch_max_tokens=lambda hint: hint,
+        _staging_of_next_run=lambda n, device: fused,
+    )
+    moe._activation_to_quantize = MegaMoECuteDsl._activation_to_quantize.__get__(moe)
+    x = torch.zeros(rows, 7168, dtype=torch.bfloat16, device="cuda")
+    ids = torch.zeros(rows, TOP_K, dtype=torch.int32, device="cuda")
+    weights = torch.zeros(rows, TOP_K, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = MegaMoECuteDsl._stage_bf16_inputs(moe, x, ids, weights)
+    assert [t.data_ptr() for t in got] == [t.data_ptr() for t in vars(fused).values()][:3]
+    assert moe._quantized_into == (fused.activation.data_ptr(), rows)
+    assert moe._routes_staged_into == (fused.topk_idx_local.data_ptr(), rows)
+    for _ in range(2):
+        x.copy_(torch.randn(rows, 7168, generator=gen) * 3)
+        ids.copy_(torch.randint(-1, 384, (rows, TOP_K), generator=gen))
+        weights.copy_(torch.rand(rows, TOP_K, generator=gen))
+        graph.replay()
+        if rows:
+            torch.ops.trtllm.fp4_quantize.into(
+                x, scale, separate.activation[:rows], separate.activation_sf[:rows], False
+            )
+        torch.ops.trtllm.megamoe_stage_routes(
+            ids,
+            weights,
+            separate.topk_idx_local,
+            separate.topk_weights,
+            word if drops_padding_rows else None,
+        )
+        for name, want in vars(separate).items():
+            assert torch.equal(getattr(fused, name).view(torch.uint8), want.view(torch.uint8)), name
+
+
+@pytest.mark.cpu_only
+def test_bf16_inputs_quantize_apart_where_the_next_run_stages_nothing(monkeypatch):
+    """Without a staging (inputs read in place, tactic autotuning, SF rows that need padding) the fused
+    prepare quantizes with quantize_input and leaves the routes to ``_stage_inputs``; a layer whose
+    balancer plans replicas keeps quantize_input, which leaves SMs to the plan's HALO-Q/TMA kernel."""
+    looked = []
+    moe = SimpleNamespace(
+        _staging_of_next_run=lambda rows, device: looked.append(rows),
+        quantize_input=lambda x: ("fp4", "sf"),
+    )
+    ids = torch.zeros(4, TOP_K, dtype=torch.int32)
+    for hidden, lookups in ((7168, [4]), (2080, [4])):  # 2080 / 16 = 130 SF bytes, padded to 132
+        got = MegaMoECuteDsl._stage_bf16_inputs(moe, torch.zeros(4, hidden), ids, None)
+        assert got == ("fp4", "sf", ids) and looked == lookups
+    monkeypatch.setattr(torch.ops.trtllm, "megamoe_stage_inputs", object(), raising=False)
+    # No balancer or static EPLB: fused; a replica plan or dynamic EPLB's statistics: quantize_input.
+    for plans, dynamic, fused in (
+        (None, None, True),
+        (False, False, True),
+        (True, False, False),
+        (False, True, False),
+    ):
+        balancer = None
+        if plans is not None:
+            balancer = SimpleNamespace(
+                produces_replica_plan=plans, is_dynamic_routing=lambda d=dynamic: d
+            )
+        assert (
+            MegaMoECuteDsl.supports_fused_prepare(SimpleNamespace(layer_load_balancer=balancer))
+            is fused
+        )
 
 
 @pytest.mark.cpu_only

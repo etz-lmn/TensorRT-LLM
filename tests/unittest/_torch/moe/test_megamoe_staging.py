@@ -79,6 +79,7 @@ def test_run_moe_launches_from_the_staging_only_the_rows_quantize_input_put_ther
     backend = SimpleNamespace(
         _active_launch_max_tokens=None,
         _quantized_into=None,
+        _routes_staged_into=None,
         ep_size=1,
         ep_rank=0,
         tactic_autotune=False,
@@ -92,12 +93,12 @@ def test_run_moe_launches_from_the_staging_only_the_rows_quantize_input_put_ther
     backend._may_read_inputs_in_place = types.MethodType(IMPL._may_read_inputs_in_place, backend)
     routes = torch.zeros(3, 2, dtype=torch.int64)
 
-    def run(x: torch.Tensor, x_sf: torch.Tensor) -> str:
+    def run(x: torch.Tensor, x_sf: torch.Tensor, topk_idx: torch.Tensor = routes) -> str:
         return IMPL._run_moe(
             backend,
             x=x,
             x_sf=x_sf,
-            topk_idx=routes,
+            topk_idx=topk_idx,
             topk_weights=routes.float(),
             weight_view=None,
             num_tokens=x.shape[0],
@@ -114,6 +115,17 @@ def test_run_moe_launches_from_the_staging_only_the_rows_quantize_input_put_ther
     backend._quantized_into = (act.data_ptr(), 3)
     assert run(*staged) == "out" and stage_activation == [False]
     assert run(*fresh) == "out" and stage_activation == [False, True]
+    # Routes the fused prepare staged with the activation are not staged again; staged elsewhere, raise.
+    staged_routes = bufs.topk_idx_local[:3]
+    for rows, ok in ((3, True), (2, False)):
+        backend._quantized_into = (act.data_ptr(), 3)
+        backend._routes_staged_into = (staged_routes.data_ptr(), rows)
+        if ok:
+            assert run(*staged, staged_routes) == "out" and stage_activation == [False, True]
+        else:
+            with pytest.raises(RuntimeError, match="routes staged"):
+                run(*staged, staged_routes)
+        assert backend._routes_staged_into is None
     for record, inputs in (
         ((act.data_ptr(), 3), fresh),  # quantized into this staging, launched from elsewhere
         ((act.data_ptr(), 2), staged),  # another row count
@@ -147,6 +159,7 @@ def test_run_moe_stages_with_the_forward_word_only_where_the_kernel_masks_droppe
     backend = SimpleNamespace(
         _active_launch_max_tokens=None,
         _quantized_into=None,
+        _routes_staged_into=None,
         ep_size=1,
         ep_rank=0,
         tactic_autotune=False,

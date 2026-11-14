@@ -22,6 +22,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/moe/cuteDsl/megaMoeStageRoutes.h"
+#include "tensorrt_llm/thop/moe/cuteDsl/megaMoeStageInputsOp.h"
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -39,6 +40,28 @@ namespace torch_ext
 
 namespace
 {
+
+void checkStaging(at::Tensor const& ids, at::Tensor const& weights, at::Tensor const& idsOut,
+    at::Tensor const& weightsOut, std::optional<at::Tensor> const& liveRowWord)
+{
+    auto const isId = [](at::Tensor const& t) { return t.scalar_type() == at::kInt || t.scalar_type() == at::kLong; };
+    TORCH_CHECK(isId(ids) && isId(idsOut), "ids and ids_out must be int32 or int64");
+    TORCH_CHECK(weights.scalar_type() == at::kFloat && weightsOut.scalar_type() == at::kFloat,
+        "weights and weights_out must be float32");
+    TORCH_CHECK(idsOut.dim() == 2 && idsOut.is_contiguous() && weightsOut.sizes() == idsOut.sizes()
+            && weightsOut.is_contiguous(),
+        "ids_out and weights_out must be contiguous [rows, top_k] buffers");
+    TORCH_CHECK(ids.dim() == 2 && ids.size(1) == idsOut.size(1) && ids.size(0) <= idsOut.size(0)
+            && weights.sizes() == ids.sizes() && ids.is_contiguous() && weights.is_contiguous(),
+        "ids and weights must be contiguous [n, top_k] with n at most the rows of ids_out");
+    TORCH_CHECK(ids.device() == idsOut.device() && weights.device() == idsOut.device()
+            && weightsOut.device() == idsOut.device(),
+        "all tensors must be on one device");
+    TORCH_CHECK(!liveRowWord.has_value()
+            || (liveRowWord->scalar_type() == at::kInt && liveRowWord->numel() == 1
+                && liveRowWord->device() == idsOut.device()),
+        "live_row_word must be one int32 on the outputs' device");
+}
 
 template <typename IdT, typename OutT>
 void launchStageRoutes(at::Tensor const& ids, at::Tensor const& weights, int32_t const* liveRowWord, at::Tensor& idsOut,
@@ -59,23 +82,7 @@ void launchStageRoutes(at::Tensor const& ids, at::Tensor const& weights, int32_t
 void megaMoeStageRoutes(at::Tensor const& ids, at::Tensor const& weights, at::Tensor& idsOut, at::Tensor& weightsOut,
     std::optional<at::Tensor> const& liveRowWord)
 {
-    auto const isId = [](at::Tensor const& t) { return t.scalar_type() == at::kInt || t.scalar_type() == at::kLong; };
-    TORCH_CHECK(isId(ids) && isId(idsOut), "ids and ids_out must be int32 or int64");
-    TORCH_CHECK(weights.scalar_type() == at::kFloat && weightsOut.scalar_type() == at::kFloat,
-        "weights and weights_out must be float32");
-    TORCH_CHECK(idsOut.dim() == 2 && idsOut.is_contiguous() && weightsOut.sizes() == idsOut.sizes()
-            && weightsOut.is_contiguous(),
-        "ids_out and weights_out must be contiguous [rows, top_k] buffers");
-    TORCH_CHECK(ids.dim() == 2 && ids.size(1) == idsOut.size(1) && ids.size(0) <= idsOut.size(0)
-            && weights.sizes() == ids.sizes() && ids.is_contiguous() && weights.is_contiguous(),
-        "ids and weights must be contiguous [n, top_k] with n at most the rows of ids_out");
-    TORCH_CHECK(ids.device() == idsOut.device() && weights.device() == idsOut.device()
-            && weightsOut.device() == idsOut.device(),
-        "all tensors must be on one device");
-    TORCH_CHECK(!liveRowWord.has_value()
-            || (liveRowWord->scalar_type() == at::kInt && liveRowWord->numel() == 1
-                && liveRowWord->device() == idsOut.device()),
-        "live_row_word must be one int32 on the outputs' device");
+    checkStaging(ids, weights, idsOut, weightsOut, liveRowWord);
     auto const n = ids.size(0);
     auto const rows = idsOut.size(0);
     if (!idsOut.is_cuda())
@@ -103,12 +110,43 @@ void megaMoeStageRoutes(at::Tensor const& ids, at::Tensor const& weights, at::Te
     }
 }
 
+// Quantize the activation and stage the routes under the same device live-row word.
+void megaMoeStageInputs(at::Tensor const& x, at::Tensor const& globalScale, at::Tensor& xFp4, at::Tensor& xSf,
+    at::Tensor const& ids, at::Tensor const& weights, at::Tensor& idsOut, at::Tensor& weightsOut,
+    std::optional<at::Tensor> const& liveRowWord)
+{
+    checkStaging(ids, weights, idsOut, weightsOut, liveRowWord);
+    TORCH_CHECK(idsOut.device() == x.device(), "the staging must be on x's device");
+    auto const quantize = megaMoeQuantizeOf(x, globalScale, xFp4, xSf);
+    c10::cuda::CUDAGuard const deviceGuard(x.device());
+    int32_t const* word = liveRowWord.has_value() ? liveRowWord->data_ptr<int32_t>() : nullptr;
+    auto launch = [&]<typename IdT, typename OutT>()
+    {
+        kernels::megaMoeStageInputs<IdT, OutT>(quantize, ids.data_ptr<IdT>(), weights.data_ptr<float>(), ids.size(0),
+            word, idsOut.data_ptr<OutT>(), weightsOut.data_ptr<float>(), weightsOut.stride(0), idsOut.size(0),
+            static_cast<int>(idsOut.size(1)), at::cuda::getCurrentCUDAStream(x.get_device()));
+    };
+    bool const wideIds = ids.scalar_type() == at::kLong;
+    if (idsOut.scalar_type() == at::kLong)
+    {
+        wideIds ? launch.template operator()<int64_t, int64_t>() : launch.template operator()<int32_t, int64_t>();
+    }
+    else
+    {
+        wideIds ? launch.template operator()<int64_t, int32_t>() : launch.template operator()<int32_t, int32_t>();
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def(
+        "megamoe_stage_inputs(Tensor x, Tensor global_scale, Tensor(a!) x_fp4, Tensor(b!) x_sf, Tensor ids, Tensor "
+        "weights, Tensor(c!) ids_out, Tensor(d!) weights_out, Tensor? live_row_word=None) -> ()");
     m.def(
         "megamoe_stage_routes(Tensor ids, Tensor weights, Tensor(a!) ids_out, Tensor(b!) weights_out, "
         "Tensor? live_row_word=None) -> ()");
@@ -121,5 +159,6 @@ TORCH_LIBRARY_IMPL(trtllm, CPU, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("megamoe_stage_inputs", &tensorrt_llm::torch_ext::megaMoeStageInputs);
     m.impl("megamoe_stage_routes", &tensorrt_llm::torch_ext::megaMoeStageRoutes);
 }

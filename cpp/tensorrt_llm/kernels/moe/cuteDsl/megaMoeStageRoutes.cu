@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/kernels/moe/cuteDsl/megaMoeStageInputs.cuh"
 #include "tensorrt_llm/kernels/moe/cuteDsl/megaMoeStageRoutes.h"
 
 #include <algorithm>
@@ -61,9 +62,24 @@ void megaMoeStageRoutes(IdT const* ids, float const* weights, int64_t n, int32_t
         <<<blocks, kThreads, 0, stream>>>(ids, weights, n, liveRowWord, topK, idsOut, weightsOut, elements);
 }
 
+template <typename IdT, typename OutT>
+void megaMoeStageInputs(MegaMoeQuantize const& quantize, IdT const* ids, float const* weights, int64_t n,
+    int32_t const* liveRowWord, OutT* idsOut, float* weightsOut, int64_t weightsRowStride, int64_t rows, int topK,
+    cudaStream_t stream)
+{
+    int64_t const elements = rows * topK;
+    auto const blocks
+        = static_cast<int>(std::min((elements + kMegaMoeStageThreads - 1) / kMegaMoeStageThreads, kMaxBlocks));
+    MegaMoeStageWriter<IdT, OutT> const writer{
+        ids, weights, n, liveRowWord, idsOut, weightsOut, weightsRowStride, elements, topK, blocks};
+    launchMegaMoeStageInputs(quantize, writer, 0, stream);
+}
+
 #define INSTANTIATE_MEGAMOE_STAGE_ROUTES(IdT, OutT)                                                                    \
     template void megaMoeStageRoutes<IdT, OutT>(                                                                       \
-        IdT const*, float const*, int64_t, int32_t const*, OutT*, float*, int64_t, int, cudaStream_t)
+        IdT const*, float const*, int64_t, int32_t const*, OutT*, float*, int64_t, int, cudaStream_t);                 \
+    template void megaMoeStageInputs<IdT, OutT>(MegaMoeQuantize const&, IdT const*, float const*, int64_t,             \
+        int32_t const*, OutT*, float*, int64_t, int64_t, int, cudaStream_t)
 
 INSTANTIATE_MEGAMOE_STAGE_ROUTES(int32_t, int32_t);
 INSTANTIATE_MEGAMOE_STAGE_ROUTES(int32_t, int64_t);

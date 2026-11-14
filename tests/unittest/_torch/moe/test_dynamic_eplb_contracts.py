@@ -1875,7 +1875,12 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
         "ceil_div": lambda a, b: -(-a // b),
     }
     _extract_function(source, "_fp4_quantize_has_sm_budget", namespace)
-    impl = _extract_class(source, "TrtllmCutedslMegaMoeNvfp4Impl", {"quantize_input"}, namespace)
+    impl = _extract_class(
+        source,
+        "TrtllmCutedslMegaMoeNvfp4Impl",
+        {"quantize_input", "_activation_to_quantize"},
+        namespace,
+    )
     owner = impl()
     owner.fc31_input_scale = "scale"
     # A forward that run_moe does not stage.
