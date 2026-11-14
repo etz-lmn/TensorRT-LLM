@@ -50,6 +50,9 @@ class MoEStaticCapability:
     # Whether the backend consumes a per-forward helper-slot plan whose live
     # weights may be published concurrently with shared-expert computation.
     supports_per_layer_dynamic_eplb: bool = False
+    # Whether the backend provides the methods adaptive EPLB moves and prices
+    # its slot weights with (adaptive_eplb.transport.AdaptiveEplbBackend).
+    supports_adaptive_eplb: bool = False
     # Legacy gate: the ``assert moe_cls in [...]`` bias allow-list in
     # ``create_moe_backend``. Per-expert FC bias from the checkpoint, added
     # before the activation functor runs -- not an activation constant.
@@ -554,6 +557,10 @@ class MoEResolutionReport:
     # ``MoERejection.legacy_backend`` names of what the request named: its
     # backend family, or the pin's matches. Fallback candidates are excluded.
     requested_impls: frozenset[str] = frozenset()
+    # Why the layer runs as plain EP outside the registered load balancer, when
+    # it does: no implementation that serves it supports the balancer's mode.
+    # ``deployment`` is then the deployment without the balancer.
+    load_balancer_off: Optional[str] = None
 
     @property
     def alternatives(self) -> Tuple[str, ...]:
@@ -602,6 +609,7 @@ class MoEResolutionReport:
         return {
             "winner": self.winner,
             "requested": self.requested,
+            "load_balancer_off": self.load_balancer_off,
             "selected_by": self.selected_by,
             "env_fingerprint": self.env_fingerprint,
             "eligible": list(self.eligible),
@@ -648,6 +656,8 @@ class MoEResolutionReport:
             # Named in the same line as the winner, because this is the list an
             # operator retries one by one when the default is not fast enough.
             head += f"; also eligible: {', '.join(self.alternatives)}"
+        if self.load_balancer_off is not None:
+            head += f"; plain EP outside the load balancer: {self.load_balancer_off}"
         if not self.rejected:
             return head
         turned_down = ", ".join(
@@ -807,6 +817,11 @@ class MoERunContext:
     prerouted: Optional[PreroutedRouting] = None
     # produced by per-layer dynamic EPLB; None for standard EPLB and OFF.
     replica_plan: Optional[MoEReplicaPlan] = None
+    # produced by a load balancer whose route the impl launches with its own input staging
+    # (``supports_fused_prepare``): token_selected_experts are then expert IDs, and
+    # ``route(quantize=None)`` returns the slots, quantizing in the same launch when given
+    # ``(x, global_scale, x_fp4, x_sf)``.
+    route: Optional[Callable[..., torch.Tensor]] = None
     # produced by routing when the impl's ``try_route_with_sort`` routed this
     # forward: the ``moe_sort`` tables of ``token_selected_experts``.
     sort_tables: Optional[MoESortTables] = None
