@@ -15,6 +15,88 @@ pytestmark = pytest.mark.cpu_only
 IMPL = mm.TrtllmCutedslMegaMoeNvfp4Impl
 
 
+def test_staging_view_identity_rechecks_rebound_storage():
+    staging = torch.zeros(8, 4, dtype=torch.uint8)
+    view = staging[:2]
+    assert mm._is_staging_view(view, staging, 2)
+    view.set_(torch.empty_like(view))
+    assert not mm._is_staging_view(view, staging, 2)
+
+
+def test_empty_preparation_preserves_staging_identity_and_launches_peer_work(monkeypatch):
+    bucket, hidden, top_k = 8, 64, 2
+    bufs = mm._MegaMoeBuffers(
+        activation=torch.zeros(bucket, hidden // 2, dtype=torch.uint8),
+        activation_sf=torch.zeros(bucket, hidden // 16, dtype=torch.uint8),
+        topk_weights=torch.ones(bucket, top_k),
+        combine_output=torch.zeros(bucket, hidden),
+        shared_workspace=torch.zeros(1),
+        peer_offsets=(0, 0),
+        topk_idx_local=torch.zeros(bucket, top_k, dtype=torch.int64),
+    )
+    launches = []
+    staged = []
+    backend = SimpleNamespace(
+        _active_launch_max_tokens=None,
+        _quantized_into=None,
+        _routes_staged_into=None,
+        ep_size=2,
+        ep_rank=0,
+        tactic_autotune=False,
+        _genphase_direct_input_buckets=set(),
+        _padding_drop_buckets=set(),
+        fc31_input_scale=torch.ones(1),
+        _select_launch_max_tokens=lambda hint: bucket,
+        _staging_of_next_run=lambda rows, device: bufs,
+        _acquire_buffers=lambda **kw: bufs,
+        _stage_inputs=lambda **kw: staged.append(kw),
+        _launch_megamoe_kernel=lambda **kw: launches.append(kw) or "out",
+    )
+    backend._activation_to_quantize = types.MethodType(IMPL._activation_to_quantize, backend)
+    backend._may_read_inputs_in_place = types.MethodType(IMPL._may_read_inputs_in_place, backend)
+    monkeypatch.setattr(mm, "_MEGAMOE_PRIME_LADDER", False)
+    monkeypatch.setattr(torch.ops.trtllm, "megamoe_stage_inputs", lambda *args: None)
+    x = torch.empty(0, hidden, dtype=torch.bfloat16)
+    ids = torch.empty(0, top_k, dtype=torch.int64)
+    weights = torch.empty(0, top_k)
+
+    backend._routes_staged = types.MethodType(IMPL._routes_staged, backend)
+
+    def prepare():
+        return IMPL._stage_bf16_inputs(backend, x, ids, weights, None)
+
+    def run(inputs):
+        return IMPL._run_moe(
+            backend,
+            x=inputs[0],
+            x_sf=inputs[1],
+            topk_idx=inputs[2],
+            topk_weights=weights,
+            weight_view=None,
+            num_tokens=0,
+            top_k=top_k,
+            hidden=hidden,
+            device=x.device,
+            output_dtype=x.dtype,
+        )
+
+    prepared = prepare()
+    assert all(t.data_ptr() == 0 for t in prepared)
+    assert run(prepared) == "out"
+    assert len(launches) == 1 and launches[0]["world_size"] == 2
+    assert launches[0]["num_tokens"] == 0 and not staged
+    for index in range(3):
+        unrelated = list(prepare())
+        unrelated[index] = torch.empty_like(unrelated[index])
+        with pytest.raises((RuntimeError, ValueError), match="quantize_input|staging"):
+            run(unrelated)
+    wrong_offset = list(prepare())
+    wrong_offset[0] = bufs.activation[1:1]
+    with pytest.raises(RuntimeError, match="quantize_input"):
+        run(wrong_offset)
+    assert len(launches) == 1
+
+
 def test_the_staging_of_the_next_run_is_handed_out_only_for_a_run_that_stages():
     """``_staging_of_next_run`` (where ``quantize_input`` writes) hands out a bucket's staging only
     for a forward that ``run_moe`` would stage."""

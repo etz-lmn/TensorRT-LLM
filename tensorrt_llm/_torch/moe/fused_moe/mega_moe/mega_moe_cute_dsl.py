@@ -287,6 +287,18 @@ def _as_fp8_sf(t: torch.Tensor) -> torch.Tensor:
     return t if t.dtype == torch.float8_e4m3fn else t.view(torch.float8_e4m3fn)
 
 
+def _is_staging_view(view: torch.Tensor, staging: torch.Tensor, rows: int) -> bool:
+    """The bucket owns the complete row view, including an empty view with a zero data pointer."""
+    return (
+        view.shape == (rows, *staging.shape[1:])
+        and view.stride() == staging.stride()
+        and view.dtype == staging.dtype
+        and view.device == staging.device
+        and view.storage_offset() == staging.storage_offset()
+        and view.untyped_storage().data_ptr() == staging.untyped_storage().data_ptr()
+    )
+
+
 @functools.cache
 def _fp4_quantize_has_sm_budget() -> bool:
     if hasattr(torch.ops.trtllm.fp4_quantize, "sm_budget"):
@@ -896,15 +908,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
         The launch then reads both from the staging, so routes found there without that hand-out
         (gate weights possibly stale) and routes a replica plan would rewrite are refused."""
-        staged = (
-            topk_idx.data_ptr() == bufs.topk_idx_local.data_ptr()
-            and topk_idx.dtype == bufs.topk_idx_local.dtype
-            and topk_idx.shape == (num_tokens, top_k)
-            and topk_idx.is_contiguous()
+        staged = _is_staging_view(topk_idx, bufs.topk_idx_local, num_tokens) and topk_idx.shape == (
+            num_tokens,
+            top_k,
         )
         handed_out = getattr(self, "_handed_out_route_staging", None)
         self._handed_out_route_staging = None
         if not staged:
+            if handed_out is not None:
+                raise ValueError("routes from route_staging must retain the bucket's row-view identity")
             return False
         if handed_out != bufs.topk_idx_local.data_ptr():
             raise ValueError(
@@ -1550,7 +1562,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         bufs = staged
         x_fp4, x_sf = bufs.activation[:num_tokens], bufs.activation_sf[:num_tokens]
         quantize = (self._activation_to_quantize(x), self.fc31_input_scale, x_fp4, x_sf)
-        self._quantized_into = (x_fp4.data_ptr(), num_tokens)
+        self._quantized_into = (bufs.activation.data_ptr(), num_tokens)
         if route is not None:
             return x_fp4, x_sf, route(quantize=quantize)
         torch.ops.trtllm.megamoe_stage_inputs(
@@ -2303,12 +2315,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         routes_staged = self._routes_staged(bufs, topk_idx, num_tokens, top_k, replica_plan)
         # quantize_input already quantized into this bucket's staging: x and x_sf are its
         # leading rows, so there is nothing to copy.
-        activation_staged = (
-            x.data_ptr() == bufs.activation.data_ptr()
-            and x_sf.data_ptr() == bufs.activation_sf.data_ptr()
+        activation_staged = _is_staging_view(x, bufs.activation, num_tokens) and _is_staging_view(
+            x_sf, bufs.activation_sf, num_tokens
         )
         # Both sides decide the bucket: a mismatch would copy the rows again, or launch stale ones.
-        if quantized_into != ((x.data_ptr(), num_tokens) if activation_staged else None):
+        if quantized_into != ((bufs.activation.data_ptr(), num_tokens) if activation_staged else None):
             raise RuntimeError(
                 f"MegaMoECuteDsl: quantize_input quantized (staging address, rows) "
                 f"{quantized_into}, but run_moe launches {num_tokens} rows at {x.data_ptr():#x} "

@@ -243,11 +243,11 @@ def test_bf16_inputs_stage_in_one_launch_as_in_two(rows, bucket, monkeypatch):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         got = MegaMoECuteDsl._stage_bf16_inputs(moe, x, ids, weights, None)
-    assert [t.data_ptr() for t in got] == [
-        fused.activation.data_ptr(),
-        fused.activation_sf.data_ptr(),
-        fused.topk_idx_local.data_ptr(),
-    ]
+    for view, full in zip(got, (fused.activation, fused.activation_sf, fused.topk_idx_local)):
+        assert view.untyped_storage().data_ptr() == full.untyped_storage().data_ptr()
+        assert view.storage_offset() == full.storage_offset()
+        assert view.shape == (rows, *full.shape[1:]) and view.stride() == full.stride()
+        assert view.dtype == full.dtype and view.device == full.device
     assert moe._handed_out_route_staging == fused.topk_idx_local.data_ptr()
     for value in (live_rows.NO_ROWS, live_rows.ALL_ROWS):
         word.fill_(value)
