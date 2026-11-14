@@ -916,7 +916,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._handed_out_route_staging = None
         if not staged:
             if handed_out is not None:
-                raise ValueError("routes from route_staging must retain the bucket's row-view identity")
+                raise ValueError(
+                    "routes from route_staging must retain the bucket's row-view identity"
+                )
             return False
         if handed_out != bufs.topk_idx_local.data_ptr():
             raise ValueError(
