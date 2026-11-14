@@ -15,6 +15,14 @@ pytestmark = pytest.mark.cpu_only
 IMPL = mm.TrtllmCutedslMegaMoeNvfp4Impl
 
 
+def test_staging_view_identity_rechecks_rebound_storage():
+    staging = torch.zeros(8, 4, dtype=torch.uint8)
+    view = staging[:2]
+    assert mm._is_staging_view(view, staging, 2)
+    view.set_(torch.empty_like(view))
+    assert not mm._is_staging_view(view, staging, 2)
+
+
 def test_empty_preparation_preserves_staging_identity_and_launches_peer_work(monkeypatch):
     bucket, hidden, top_k = 8, 64, 2
     bufs = mm._MegaMoeBuffers(

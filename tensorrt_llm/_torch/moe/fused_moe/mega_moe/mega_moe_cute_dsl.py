@@ -286,7 +286,6 @@ def _as_fp8_sf(t: torch.Tensor) -> torch.Tensor:
     return t if t.dtype == torch.float8_e4m3fn else t.view(torch.float8_e4m3fn)
 
 
-@functools.cache
 def _is_staging_view(view: torch.Tensor, staging: torch.Tensor, rows: int) -> bool:
     """The bucket owns the complete row view, including an empty view with a zero data pointer."""
     return (
@@ -299,6 +298,7 @@ def _is_staging_view(view: torch.Tensor, staging: torch.Tensor, rows: int) -> bo
     )
 
 
+@functools.cache
 def _fp4_quantize_has_sm_budget() -> bool:
     if hasattr(torch.ops.trtllm.fp4_quantize, "sm_budget"):
         return True
