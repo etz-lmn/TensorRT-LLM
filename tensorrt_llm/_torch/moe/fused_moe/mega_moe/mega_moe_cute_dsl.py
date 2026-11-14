@@ -287,6 +287,18 @@ def _as_fp8_sf(t: torch.Tensor) -> torch.Tensor:
 
 
 @functools.cache
+def _is_staging_view(view: torch.Tensor, staging: torch.Tensor, rows: int) -> bool:
+    """The bucket owns the complete row view, including an empty view with a zero data pointer."""
+    return (
+        view.shape == (rows, *staging.shape[1:])
+        and view.stride() == staging.stride()
+        and view.dtype == staging.dtype
+        and view.device == staging.device
+        and view.storage_offset() == staging.storage_offset()
+        and view.untyped_storage().data_ptr() == staging.untyped_storage().data_ptr()
+    )
+
+
 def _fp4_quantize_has_sm_budget() -> bool:
     if hasattr(torch.ops.trtllm.fp4_quantize, "sm_budget"):
         return True
@@ -2095,12 +2107,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         )
         # quantize_input already quantized into this bucket's staging: x and x_sf are its
         # leading rows, so there is nothing to copy.
-        activation_staged = (
-            x.data_ptr() == bufs.activation.data_ptr()
-            and x_sf.data_ptr() == bufs.activation_sf.data_ptr()
+        activation_staged = _is_staging_view(x, bufs.activation, num_tokens) and _is_staging_view(
+            x_sf, bufs.activation_sf, num_tokens
         )
         # Both sides decide the bucket: a mismatch would copy the rows again, or launch stale ones.
-        if quantized_into != ((x.data_ptr(), num_tokens) if activation_staged else None):
+        if quantized_into != ((bufs.activation.data_ptr(), num_tokens) if activation_staged else None):
             raise RuntimeError(
                 f"MegaMoECuteDsl: quantize_input quantized (staging address, rows) "
                 f"{quantized_into}, but run_moe launches {num_tokens} rows at {x.data_ptr():#x} "
@@ -2111,9 +2122,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # _stage_bf16_inputs staged this bucket's routes with the activation: the routes are its rows.
         routes_staged = routes_staged_into is not None
         staging_rows = (bufs.topk_idx_local.data_ptr(), num_tokens)
-        if routes_staged and not routes_staged_into == staging_rows == (
-            topk_idx.data_ptr(),
-            num_tokens,
+        if routes_staged and (
+            routes_staged_into != staging_rows
+            or not _is_staging_view(topk_idx, bufs.topk_idx_local, num_tokens)
         ):
             raise RuntimeError(
                 f"MegaMoECuteDsl: routes staged at (address, rows) {routes_staged_into}, but run_moe "
