@@ -2111,7 +2111,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             x_sf, bufs.activation_sf, num_tokens
         )
         # Both sides decide the bucket: a mismatch would copy the rows again, or launch stale ones.
-        if quantized_into != ((bufs.activation.data_ptr(), num_tokens) if activation_staged else None):
+        if quantized_into != (
+            (bufs.activation.data_ptr(), num_tokens) if activation_staged else None
+        ):
             raise RuntimeError(
                 f"MegaMoECuteDsl: quantize_input quantized (staging address, rows) "
                 f"{quantized_into}, but run_moe launches {num_tokens} rows at {x.data_ptr():#x} "
