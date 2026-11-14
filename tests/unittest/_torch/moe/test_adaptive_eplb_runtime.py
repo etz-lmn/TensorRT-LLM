@@ -24,7 +24,8 @@ from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
     TimeModel,
     statistics_buffers,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import generation_progress
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, generation_progress
+from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.llmapi.llm_args import MoeAdaptiveLoadBalancerConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -69,8 +70,7 @@ class FakeLayer:
 
 
 class FakeTransport:
-    """A 0.25 ms batch completing ``delay`` calls after the runtime's call that issued it;
-    ``waiting()`` jobs still wait for the clock."""
+    """A 0.25 ms copy batch waiting until its issuing call plus ``delay``."""
 
     def __init__(self, clock: list[int], delay: int = 1) -> None:
         self.clock, self.delay, self.batches, self.due = clock, delay, [], []
@@ -144,16 +144,12 @@ class FakeDecision:
 
 
 class Events:
-    """The runtime's logged events of one rank (in place of its ``_event``): the decision records,
-    completed by the later events."""
+    """Collect one rank's decisions and their later completion events."""
 
     def __init__(self, rank: int) -> None:
         self.rank = rank
-        self.records = []
-        self.by_window = {}
-        self.kinds = []
-        self.stats = []
-        self.open_calls = {}
+        self.records, self.kinds, self.stats = [], [], []
+        self.by_window, self.open_calls = {}, {}
 
     def __call__(self, event: str, **data) -> None:
         self.kinds.append(event)
@@ -225,8 +221,7 @@ def settle(ranks) -> None:
 
 
 def run(ranks, clock, calls: int, requests=((), ())) -> None:
-    """Calls as the executor makes them, each seeing its batch (every rank's ``requests``) first.
-    The clock reaches a call once every boundary ran it: a copy completes at its due call."""
+    """Execute per-rank batches and advance the clock after every boundary."""
     for _ in range(calls):
         for runtime, batch in zip(ranks, requests):
             if runtime.wants_request_progress:
@@ -253,8 +248,7 @@ REAL_PLAN, REAL_CHOOSE = rt.plan_layout, rt.choose_layers_to_install
 
 
 def spy(monkeypatch, seen: dict) -> None:
-    """Record what the planner, the share solver, the layer choice and the window length are
-    given; every window after the first lasts ``FORWARDS`` forwards."""
+    """Capture decision inputs and use ``FORWARDS`` after the first window."""
 
     def plan(load, *args):
         seen.setdefault("load", []).append(np.array(load))
@@ -280,8 +274,7 @@ def spy(monkeypatch, seen: dict) -> None:
 
 
 def spied_ranks(monkeypatch, timed: bool = False, first=None):
-    """Both ranks with in-process deciders once their first window (counting ``first``: every
-    rank's rows and forwards) has passed, and ``seen``; ``timed``: a copy group was timed."""
+    """Observe two in-process deciders after their first statistics window."""
     seen = {}
     clock = [0]
     spy(monkeypatch, seen)
@@ -303,24 +296,65 @@ def manager() -> AdaptiveMoeLoadBalancer:
     return AdaptiveMoeLoadBalancer(ep_rank=0, ep_size=R, config=config, mapping=None)
 
 
-def request(max_new_tokens, decoding_iter, accepted_draft_tokens, dummy=False):
-    return SimpleNamespace(
-        is_attention_dp_dummy=dummy,
-        is_cuda_graph_dummy=False,
-        py_max_new_tokens=max_new_tokens,
-        py_decoding_iter=decoding_iter,
-        py_num_accepted_draft_tokens=accepted_draft_tokens,
+def request(max_new_tokens, decoding_iter, accepted_draft_tokens, dummy=False, beams=1):
+    req = LlmRequest(
+        request_id=1,
+        max_new_tokens=max_new_tokens,
+        input_tokens=[7] * 5,
+        sampling_config=SamplingConfig(beam_width=beams),
+        is_streaming=False,
     )
+    for _ in range(decoding_iter * (1 + accepted_draft_tokens)):
+        req.add_new_tokens([9] * beams)
+    req.py_decoding_iter, req.py_num_accepted_draft_tokens = decoding_iter, accepted_draft_tokens
+    req.is_attention_dp_dummy = dummy
+    return req
+
+
+@pytest.mark.parametrize("history", [(1, 4), (4, 1), (1,), (2, 2)])
+def test_progress_uses_confirmed_tokens_across_beams_and_recompute(history):
+    req = request(20, 0, 0)
+    for count in history:
+        for _ in range(count):
+            req.add_new_token(9, 0)
+        req.py_decoding_iter += 1
+        req.py_num_accepted_draft_tokens = count - 1
+    left = 20 - sum(history)
+    assert generation_progress([req], 0, 1) == (left, 1, history[-1])
+    req, left = request(20, 3, 0, beams=2), 17
+    req.add_new_token(11, 1)
+    assert generation_progress([req], 0, 1) == (left - 1, 1, 1)
+    for _ in range(left - 1):
+        req.add_new_token(11, 1)
+    assert generation_progress([req], 0, 1) == (0, 1, 1)
+    req.add_new_token(11, 1)
+    assert generation_progress([req], 0, 1) == (0, 1, 1)
+    req.reset_for_recompute(64)
+    assert (req.py_orig_prompt_len, req.py_max_new_tokens) == (5, 20)
+    assert generation_progress([req], 0, 1) == (20, 1, 1)
+    req.is_cuda_graph_dummy = True
+    assert generation_progress([req], 0, 1) == (0, 0, 0)
+    req.is_cuda_graph_dummy = False
+    req.is_attention_dp_dummy = True
+    assert generation_progress([req], 0, 1) == (0, 0, 0)
+    req.is_attention_dp_dummy = False
+    assert generation_progress([req], 1, 1) == (0, 0, 0)
+    req = request(20, 0, 0)
+    for _ in range(5):
+        req.add_new_token(9, 0)
+    req.reset_for_recompute(64)
+    assert (req.py_orig_prompt_len, req.py_max_new_tokens) == (10, 15)
+    req.add_new_token(9, 0)  # The first token imported by a PD handoff is already confirmed.
+    req.py_decoding_iter = 1
+    assert generation_progress([req], 0, 1) == (14, 1, 1)
 
 
 def window_inputs(monkeypatch, forwards=(FORWARDS,) * R):
-    """The second window's decision on every rank's random rows over its ``forwards``."""
     seen, clock, decisions, ranks = spied_ranks(monkeypatch)
     rows = np.random.default_rng(7).integers(0, 64, (R, L, E)).astype(np.float32)
     progress = ([(120, 10, 1), (70, 10, 1), (1, 1, 0, True)], [(75, 15, 2)])
     for runtime, counts, count in zip(ranks, rows, forwards):
         set_statistics(runtime, counts, count)
-    # The batch of the call that closes the window: the gather reads its progress at once.
     run(ranks, clock, FORWARDS - 1)
     assert all(runtime.wants_request_progress for runtime in ranks)
     run(ranks, clock, 2, progress)
@@ -328,14 +362,11 @@ def window_inputs(monkeypatch, forwards=(FORWARDS,) * R):
 
 
 def test_a_window_counts_every_ranks_rows_over_its_own_forwards(host_cuda, monkeypatch):
-    """The planner and the share solver get every rank's rows over its own forwards, summed. A
-    rank whose device counted one forward more (a step without a boundary) moves only that count:
-    not the window's calls, the steps left or the decision."""
+    """Normalize each rank by its own forwards without changing the request budget."""
     base, _, _, base_ranks = window_inputs(monkeypatch)
     seen, rows, _, ranks = window_inputs(monkeypatch, (FORWARDS, FORWARDS + 1))
     expected = rows[0].astype(np.float64) / FORWARDS + rows[1].astype(np.float64) / (FORWARDS + 1)
-    # Every layer planned and solved (new, installed) on both ranks, whose worker threads decide
-    # at once: their calls interleave.
+    # Both ranks plan and solve each layer; their worker calls can interleave.
     for name, per_layer in (("load", R), ("rows", 2 * R)):
         assert sorted(map(list, seen[name])) == sorted(map(list, [*expected] * per_layer))
     last = [runtime._event.records[-1] for runtime in (*ranks, base_ranks[0])]
@@ -346,9 +377,7 @@ def test_a_window_counts_every_ranks_rows_over_its_own_forwards(host_cuda, monke
 
 
 def test_the_first_window_lasts_one_call_and_sizes_the_next(host_cuda, monkeypatch):
-    """The first window lasts one call and sets the length of the next ones from its rows per
-    forward, which the schedule hands to every rank's runtime; it is decided only when it holds
-    the rows of a window, ``ROWS_PER_EXPERT`` per expert."""
+    """Size future windows from rows per forward; decide only after enough rows."""
     for per_rank, planned in ((rt.ROWS_PER_EXPERT // R - 1, 0), (rt.ROWS_PER_EXPERT // R, R * L)):
         rows = np.full((R, L, E), per_rank, dtype=np.float32)
         seen, _, _, ranks = spied_ranks(monkeypatch, first=(rows, (1,) * R))
@@ -413,11 +442,7 @@ def script(rank, table_of_layer_1=2):
 def test_tables_apply_after_every_rank_copied_and_the_window_opens_as_scheduled(
     host_cuda, delays, open_after
 ):
-    """Rank 1's copies finish ``delays[1]`` calls after the decision: both ranks apply the new
-    tables at the same call, the one after the latest completion, before the next window is
-    scheduled. The window event hands over the gathered statistics. The schedule is read before
-    windows open: the next window opens at its call, also when that is the call its schedule
-    arrives (``open_after`` 1), not a call later."""
+    """Apply after the last copy; read schedules before opening their windows."""
     clock = [0]
     decisions = [FakeDecision(rank, script(rank), open_after=open_after) for rank in range(R)]
     ranks = make_ranks(decisions, clock, copy_delays=delays)
@@ -451,8 +476,7 @@ def test_a_publish_copies_only_the_layers_it_changes(host_cuda):
 
 
 def test_an_update_applies_before_a_window_that_opens_at_the_same_call(host_cuda):
-    """The copies' completion and the next window's schedule are read at one call, after both the
-    apply call and the open call: the tables apply first, so the window counts under them."""
+    """Apply tables before a window opening at that same call."""
     runtime = make_ranks([FakeDecision(rank) for rank in range(R)], [0])[0]
     kinds, opened, open_window = [], [], runtime._open_window
     runtime._event = lambda event, **data: kinds.append(event)
@@ -468,9 +492,7 @@ def test_an_update_applies_before_a_window_that_opens_at_the_same_call(host_cuda
 
 
 def test_ranks_that_decided_differently_stop_before_applying(host_cuda):
-    """The digest covers the tables and the moves, not a rank's own copies. Ranks that decided a
-    window differently stop adaptive EPLB, not the server: no table applies, and later calls only
-    drop the worker's messages."""
+    """Digest disagreements stop adaptive updates without applying any tables."""
     update = script(1)(0)
     same_decision_other_rank = script(0)(0)
     other_table = script(1, 3)(0)
@@ -493,8 +515,7 @@ def test_ranks_that_decided_differently_stop_before_applying(host_cuda):
 
 
 def test_a_failed_worker_stops_adaptive_eplb_and_keeps_the_tables(host_cuda):
-    """An error on the worker thread (a decision process that exited, a failed copy) stops adaptive
-    EPLB at the next boundary instead of raising in the main thread; the tables in use stay."""
+    """A worker failure stops adaptive updates at the next boundary, preserving tables."""
     clock = [0]
     ranks = make_ranks([FakeDecision(rank) for rank in range(R)], clock)
     runtime = ranks[0]
@@ -510,9 +531,7 @@ def test_a_failed_worker_stops_adaptive_eplb_and_keeps_the_tables(host_cuda):
 
 
 def test_two_ranks_move_an_expert_and_apply(host_cuda, monkeypatch):
-    """Real deciders on both ranks: a window that replicates the two hot experts gives every rank
-    its own copy items, the same digest, and new tables on both. A window gathered while an
-    earlier update's tables are still on record is sent under its own number."""
+    """Two real deciders agree on tables and digests, with rank-specific copy items."""
     _, clock, decisions, ranks = spied_ranks(monkeypatch, timed=True)
     hot = np.tile([400.0, 400.0] + [1.0] * (E - 2), (L, 1)).astype(np.float32)
     for runtime in ranks:
@@ -521,7 +540,6 @@ def test_two_ranks_move_an_expert_and_apply(host_cuda, monkeypatch):
     decided = [runtime._event.by_window[1] for runtime in ranks]
     assert all(record["moved"] == [0, 1] for record in decided)
     assert decided[0]["apply_call"] == decided[1]["apply_call"]
-    # Experts 0 and 1 are rank 0's homes: rank 1 copies them in one batch, rank 0 copies nothing.
     assert ranks[0].transport.batches == [[]]
     (batch,) = ranks[1].transport.batches
     assert sorted(batch) == [
@@ -557,9 +575,7 @@ def test_no_boundary_runs_while_a_graph_is_captured(monkeypatch):
 
 
 def window_stats(stats: np.ndarray, hot=(0, 1), live=-1, remaining=1e5, requests=4) -> np.ndarray:
-    """Every rank's window: its ``hot`` experts take 400 rows per layer, the others 1, over 8
-    forwards; every layer runs the install of window ``live`` (-1: none yet); ``remaining``
-    tokens remain over ``requests`` requests at 8 accepted per step."""
+    """Count 400 hot/1 cold rows per rank over 8 forwards, with 8 accepted tokens per step."""
     stats[:, : L * E] = np.tile(np.where(np.isin(np.arange(E), hot), 400.0, 1.0), L)
     stats[:, L * E : L * (E + 1)] = 8
     stats[:, L * (E + 1) : L * (E + 2)] = live
@@ -576,9 +592,7 @@ def measured_decider(copy_ms=None, model=MODEL) -> rt._Decider:
 
 
 def after_window_0(ms=1.0, **window) -> rt._Decider:
-    """A decider of copies timed at 0.5 ms at start-up after window 0 (``window`` of
-    :func:`window_stats`): GPU 0's experts 0 and 1 are hot, both layers take replicas, and
-    every rank copied them by call 10 in ``ms``."""
+    """Replicate hot experts 0/1 at a 0.5 ms prior, then record both copies done at call 10."""
     decider = measured_decider(0.5)
     window_stats(decider.stats, **window)
     assert decider.decide(0).moved == [0, 1]
@@ -590,8 +604,7 @@ def test_updates_copy_once_and_a_cost_jump_does_not_hold_back_the_correction(mon
     monkeypatch.setattr(rt, "solve_shares", even_split)
     decider = measured_decider(5.0)  # copies of 5 ms per layer, all timed so
     # Window 0 moves both layers in one copy; window 1 plans no layer whose install is not live.
-    # Window 1: GPU 1's experts turn hot before the install is live and the cost jumps; read as a
-    # steady drift, the correction's gain would be gone within a dozen steps and repay no copy.
+    # A cost jump before the install is live must not be mistaken for steady gain decay.
     for w, (h, live, moved) in enumerate(((0, -1, [0, 1]), (4, -1, []), (4, 0, [0, 1]))):
         window_stats(decider.stats, (h, h + 1), live)
         update = decider.decide(w)
@@ -623,8 +636,7 @@ def test_a_candidate_must_gain_on_the_previous_window_too(monkeypatch):
     assert window(0, 6).tables == {}  # GPU 1 is the busiest: the copy would load it further
     assert window(1, 2).tables == {} and max(seen["gains"][-1].values()) < 0  # loses on window 0
     assert sorted(window(2, 2).tables) == [0, 1]  # gains on both windows: installed
-    # Even rows while that install is not live, then expert 6 hot with it live: copying expert 6 to
-    # GPU 0 gains most on this window, but on the previous one the home layout beats it: home.
+    # Expert 6 favors a copy now, but home beats it on the previous window: choose home.
     candidate[:] = np.where(np.arange(R * LOCAL) == 4, 6, HOME)
     assert window(3, *range(E)).tables == {}
     window_stats(decider.stats, range(E), live=2)[:, 6 : L * E : E] = 1600
@@ -636,8 +648,7 @@ def test_a_candidate_must_gain_on_the_previous_window_too(monkeypatch):
 def test_layers_go_home_without_a_copy_once_their_rows_even_out(monkeypatch):
     monkeypatch.setattr(rt, "solve_shares", even_split)
     decider = after_window_0()
-    # Even rows, installs live: a replica adds a weight stream to its GPU and offloads none, so
-    # both layers retire theirs without a copy, and the next window plans none again.
+    # Even rows make installed replicas cost extra: retire them without a copy.
     for w in (1, 2):
         window_stats(decider.stats, range(E), live=w - 1)
         update = decider.decide(w)
@@ -649,8 +660,7 @@ def test_layers_go_home_without_a_copy_once_their_rows_even_out(monkeypatch):
 def test_a_draining_batch_prices_the_rows_one_window_ahead(monkeypatch):
     monkeypatch.setattr(rt, "solve_shares", even_split)
     decider = after_window_0(requests=40)
-    # The same rows, installs live, but the batch fell from 80 requests to 4 by the close: one
-    # window ahead at that rate, a replica's weight stream costs more than the rows it takes.
+    # A fall from 80 to 4 requests forecasts too few rows to repay replica weight streams.
     window_stats(decider.stats, live=0, requests=2)
     update = decider.decide(1)
     assert sorted(update.tables) == [0, 1] and update.moved == [] and (decider.layout == HOME).all()
@@ -659,8 +669,7 @@ def test_a_draining_batch_prices_the_rows_one_window_ahead(monkeypatch):
 def test_shares_solved_again_on_the_installed_layouts_are_published_without_a_copy(monkeypatch):
     decider = after_window_0()  # the share op itself, by rows
     old, installed = decider.shares.copy(), decider.layout.copy()
-    # Installs live, GPU 1's expert 4 warm, one step left: the plan (a replica of expert 4) repays
-    # no copy, but the installed replicas split otherwise.
+    # One step left cannot repay copying warm expert 4; refresh the installed shares.
     candidate = np.where(np.arange(R * LOCAL) == 4, 4, HOME)
     monkeypatch.setattr(rt, "plan_layout", lambda *args: SimpleNamespace(layout=candidate))
     window_stats(decider.stats, live=0, remaining=8)[:, 4 : L * E : E] = 200
@@ -713,8 +722,7 @@ def test_shutdown_agrees_over_the_ep_group_then_stops_the_process_and_the_copies
 
 @pytest.mark.parametrize("rank_0_failed", [False, True], ids=["rank_0_stopped", "rank_0_failed"])
 def test_shutdown_completes_an_all_gather_that_only_some_ranks_posted(host_cuda, rank_0_failed):
-    """Rank 1's worker waits in the all-gather of window 0's install, which rank 0 never posts:
-    rank 0 stopped first, or its worker failed. Rank 0's shutdown runs it, and both workers end."""
+    """Shutdown completes the all-gather where rank 1 waits for stopped rank 0."""
     clock = [0]
     decisions = [FakeDecision(rank) for rank in range(R)]
     if rank_0_failed:
@@ -789,10 +797,7 @@ open(exiting, "w").close()
 
 @pytest.mark.parametrize("peer_joins", ["1", "0"], ids=["peer_joins", "peer_never_joins"])
 def test_a_runtime_left_open_ends_its_worker_before_the_interpreter_finalizes(tmp_path, peer_joins):
-    """A rank that exits without a balancer shutdown, its worker inside an all-gather that a peer
-    completes while the rank exits, or never: the worker must end before the interpreter
-    finalizes, where a thread returning from the collective would abort the process, and the
-    decision process must end with it."""
+    """End workers and decision processes before exit, including unfinished collectives."""
     script = tmp_path / "exit.py"
     script.write_text(_EXIT_SCRIPT)
     args = [str(tmp_path / "store"), str(tmp_path / "exiting"), peer_joins]
