@@ -188,6 +188,29 @@ class MoEScheduler(ABC):
     def __init__(self, moe: "ConfigurableMoE") -> None:
         self.moe = moe
 
+    def _route_quant_eligible(
+        self, routing_aux: Optional[torch.Tensor], *, staged_routes: bool = False
+    ) -> bool:
+        moe = self.moe
+        return (
+            routing_aux is None
+            and not moe.apply_router_weight_on_input
+            and not moe._using_dynamic_load_balancer()
+            and bool(getattr(moe.layer_load_balancer, "stages_routes", False)) == staged_routes
+            and moe.backend.fused_route_quant_enabled
+            and not moe._load_balancer_uses_replica_plan()
+        )
+
+    def _partials_route(
+        self, routing_aux: Optional[torch.Tensor]
+    ) -> Optional[Callable[[RouterLogitPartials], Tuple[torch.Tensor, torch.Tensor]]]:
+        """A route-only consumer leaves adaptive mapping, quantization and statistics deferred."""
+        if self._route_quant_eligible(routing_aux, staged_routes=True):
+            if self.moe.backend.takes_router_logit_partials():
+                route = getattr(self.moe.backend, "route_from_logit_partials", None)
+                return route if callable(route) else None
+        return None
+
     def _try_fused_route_quant(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -200,13 +223,7 @@ class MoEScheduler(ABC):
         balancer or a cleared ``fused_route_quant_enabled`` needs the separate launches. A backend
         that ``counts_routes`` also adds the picks to the warmup placement's ``route_counters``."""
         moe = self.moe
-        if (
-            routing_aux is not None
-            or moe.apply_router_weight_on_input
-            or moe._using_dynamic_load_balancer()
-            or getattr(moe.layer_load_balancer, "stages_routes", False)
-            or not moe.backend.fused_route_quant_enabled
-        ):
+        if not self._route_quant_eligible(routing_aux):
             return None
         if isinstance(x, Fp4QuantizedTensor):
             if route_counters is not None:
@@ -1410,18 +1427,12 @@ class FusedCommMoEScheduler(MoEScheduler):
     """
 
     def routes_from_logit_partials(self, routing_aux: Optional[torch.Tensor]) -> bool:
-        """The fused launch routes this forward whenever ``_try_fused_route_quant`` admits it: no
-        routing aux, router weight on the input, dynamic balancer or per-layer dynamic replica
-        plan, and a backend that fuses."""
+        """Accept partials only for a matching fused or adaptive route-only consumer; routing aux,
+        input weighting, host migration and replica plans need full logits."""
         moe = self.moe
         return (
-            routing_aux is None
-            and not moe.apply_router_weight_on_input
-            and not moe._using_dynamic_load_balancer()
-            and not moe._load_balancer_uses_replica_plan()
-            and moe.backend.fused_route_quant_enabled
-            and moe.backend.takes_router_logit_partials()
-        )
+            self._route_quant_eligible(routing_aux) and moe.backend.takes_router_logit_partials()
+        ) or self._partials_route(routing_aux) is not None
 
     def forward(
         self,
@@ -1792,18 +1803,24 @@ class FusedCommMoEScheduler(MoEScheduler):
             if num_tokens > 0 and not uses_replica_plan
             else None
         )
+        partial_routes = None
         if (
             num_tokens > 0
             and fused_result is None
             and isinstance(router_logits_chunk_real, RouterLogitPartials)
         ):
-            raise RuntimeError(
-                "router logit partials reached a routing path that does not sum them"
-            )
+            route_partials = self._partials_route(routing_aux)
+            if route_partials is None:
+                raise RuntimeError(
+                    "router logit partials reached a routing path that does not sum them"
+                )
+            partial_routes = route_partials(router_logits_chunk_real)
         if num_tokens > 0:
             if fused_result is not None:
                 token_selected_experts = fused_result.token_selected_experts
                 token_final_scales = fused_result.token_final_scales
+            elif partial_routes is not None:
+                token_selected_experts, token_final_scales = partial_routes
             elif routing_aux is None:
                 token_selected_experts, token_final_scales = moe.routing_method.apply(
                     router_logits_chunk_real, input_ids_chunk_real

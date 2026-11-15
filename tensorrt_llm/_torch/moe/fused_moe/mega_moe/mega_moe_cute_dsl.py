@@ -127,7 +127,7 @@ from .shared_expert import (
 )
 
 if IS_CUTLASS_DSL_AVAILABLE:
-    from ....moe.kernels.blackwell.dsv4_route_quant import dsv4_route_nvfp4_quant
+    from ....moe.kernels.blackwell.dsv4_route_quant import dsv4_route, dsv4_route_nvfp4_quant
 
 __all__ = [
     "MegaMoECuteDsl",
@@ -1634,6 +1634,21 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
     def takes_router_logit_partials(self) -> bool:
         return self._route_quant_fuses()
+
+    def route_from_logit_partials(
+        self,
+        router_logits: Union[torch.Tensor, "RouterLogitPartials"],  # noqa: F821
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sum partial logits in the route kernel; leave adaptive input staging to run_moe."""
+        ids, weights, _ = dsv4_route(
+            router_logits,
+            self.routing_method.e_score_correction_bias,
+            self.routing_method.top_k,
+            self.routing_method.routed_scaling_factor,
+            torch.float32,
+            self.hidden_size,
+        )
+        return ids, weights
 
     def try_fused_route_quant(
         self,
