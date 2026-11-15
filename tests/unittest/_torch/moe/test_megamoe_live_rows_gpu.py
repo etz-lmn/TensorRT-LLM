@@ -26,7 +26,9 @@ import os
 import pickle
 import sys
 import traceback
+from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -101,24 +103,96 @@ def _init_worker(custom_paths: list) -> None:
             sys.path.append(custom_path)
 
 
-def _published_counts(fused_moe: torch.nn.Module, rank: int, rows: int) -> torch.Tensor:
-    """This rank's per-expert counts as its router published them to every peer (itself too)."""
-    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
+@contextmanager
+def _forward_kernels(runner_class):
+    """Observe the descriptor returned to each actual runner forward, then restore the method."""
+    kernels = []
+    original = runner_class._resolve_kernel_descriptor
 
+    def resolve(runner, *args, **kwargs):
+        result = original(runner, *args, **kwargs)
+        kernels.append(result[0])
+        return result
+
+    with patch.object(runner_class, "_resolve_kernel_descriptor", resolve):
+        yield kernels
+
+
+def _published_counts(
+    fused_moe: torch.nn.Module, rank: int, rows: int, kernels: list
+) -> torch.Tensor:
+    """This rank's per-expert counts as its router published them to every peer (itself too)."""
     backend = fused_moe.backend
     max_tokens = backend._select_launch_max_tokens(rows)
     buffers = [b for key, b in backend._launch_buffers.items() if key[0] == max_tokens and key[-1]]
-    kernels = [
-        kernel
-        for _, kernel in op.Sm100MegaMoENvfp4Runner.kernel_cache.values()
-        if kernel.max_tokens_per_rank == max_tokens
-    ]
     assert len(buffers) == 1 and len(kernels) == 1, (len(buffers), len(kernels))
-    router = kernels[0].token_comm._router
-    offset = kernels[0]._device_workspace.offset(router.sizes_by_rank_region)
+    (kernel,) = kernels
+    assert kernel.max_tokens_per_rank == max_tokens
+    router = kernel.token_comm._router
+    offset = kernel._device_workspace.offset(router.sizes_by_rank_region)
     width = router.expert_count_padded
     matrix = buffers[0].shared_workspace[offset : offset + _WORLD * width * 4]
     return matrix.view(torch.int32).view(_WORLD, width)[rank, : router.expert_count].cpu().clone()
+
+
+@pytest.mark.cpu_only
+def test_published_counts_uses_the_forward_descriptor_not_cached_variants(monkeypatch):
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
+
+    width, experts, rank, bucket = 4, 3, 2, 16
+    router = SimpleNamespace(
+        sizes_by_rank_region=object(), expert_count_padded=width, expert_count=experts
+    )
+    kernel = SimpleNamespace(
+        max_tokens_per_rank=bucket,
+        use_pdl=True,
+        token_comm=SimpleNamespace(_router=router),
+        _device_workspace=SimpleNamespace(offset=lambda region: 0),
+    )
+
+    class Runner:
+        kernel_cache = {("selected",): (object(), kernel)}
+
+        def _resolve_kernel_descriptor(self, tactic, *, allow_fallback):
+            return kernel, tactic
+
+        def forward(self):
+            return self._resolve_kernel_descriptor((1,), allow_fallback=True)
+
+    compiler = SimpleNamespace(compile=lambda *args, **kwargs: object())
+    monkeypatch.setattr(op, "_cute_launch_helpers", lambda: (None, None, None, compiler))
+    runner = Runner()
+    op.Sm100MegaMoENvfp4Runner._eager_compiled(runner, ("selected",), kernel, {})
+    assert len(Runner.kernel_cache) == 2
+    monkeypatch.setattr(op.Sm100MegaMoENvfp4Runner, "kernel_cache", Runner.kernel_cache)
+    eager_kernel = Runner.kernel_cache[(("selected",), "eager")][1]
+    assert not eager_kernel.use_pdl and eager_kernel is not kernel
+    assert eager_kernel.token_comm is kernel.token_comm
+    assert eager_kernel._device_workspace is kernel._device_workspace
+    # An unrelated cached descriptor must not substitute for the forward's returned descriptor.
+    unused = SimpleNamespace(max_tokens_per_rank=bucket)
+    Runner.kernel_cache = {"unused": (object(), unused), "selected": (object(), kernel)}
+    workspace = torch.arange(_WORLD * width, dtype=torch.int32).view(torch.uint8)
+    backend = SimpleNamespace(
+        _select_launch_max_tokens=lambda rows: bucket,
+        _launch_buffers={(bucket, True): SimpleNamespace(shared_workspace=workspace)},
+    )
+    moe = SimpleNamespace(backend=backend)
+    original = Runner._resolve_kernel_descriptor
+    with _forward_kernels(Runner) as selected:
+        assert runner.forward()[0] is kernel
+    assert Runner._resolve_kernel_descriptor is original
+    expected = torch.arange(rank * width, rank * width + experts, dtype=torch.int32)
+    assert torch.equal(_published_counts(moe, rank, bucket, selected), expected)
+    with _forward_kernels(Runner) as twice:
+        runner.forward()
+        runner.forward()
+    with pytest.raises(AssertionError):
+        _published_counts(moe, rank, bucket, twice)
+    with pytest.raises(RuntimeError), _forward_kernels(Runner):
+        raise RuntimeError("worker failure")
+    assert Runner._resolve_kernel_descriptor is original
+    assert callable(cloudpickle.loads(cloudpickle.dumps(_drop_worker)))
 
 
 def _drop_worker(real_requests_by_rank: tuple, combine_format: str) -> None:
@@ -217,12 +291,18 @@ def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str) -> None
 
             def forward(value: int) -> tuple:
                 word.write(value)
-                with torch.inference_mode(), model_extra_attrs(attrs):
+                from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
+
+                with (
+                    torch.inference_mode(),
+                    model_extra_attrs(attrs),
+                    _forward_kernels(op.Sm100MegaMoENvfp4Runner) as kernels,
+                ):
                     output = fused_moe.forward(
                         x, router_logits, all_rank_num_tokens=[rows] * _WORLD
                     ).clone()
                 torch.cuda.synchronize()
-                return output, _published_counts(fused_moe, rank, rows)
+                return output, _published_counts(fused_moe, rank, rows, kernels)
 
             real = real_requests_by_rank[rank]
             requests = [SimpleNamespace(is_dummy=index >= real) for index in range(_REQUESTS)]
