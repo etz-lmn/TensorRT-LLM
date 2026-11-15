@@ -818,7 +818,6 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         return self.layer_load_balancer.route(token_selected_experts, use_dp,
                                               **kwargs)
 
-
     def _load_balancer_uses_replica_plan(self) -> bool:
         """Whether routing is produced by the per-layer dynamic device planner."""
         return bool(self.layer_load_balancer
