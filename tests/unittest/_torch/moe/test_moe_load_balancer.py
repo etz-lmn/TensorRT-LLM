@@ -497,6 +497,8 @@ def mock_runtime() -> Iterator[MagicMock]:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("updates", [0, 2])
+# The runtime and communication endpoints are mocked; retain real local rank arithmetic.
+@patch("tensorrt_llm.mapping.mpi_disabled", new=lambda: False)
 def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
         updates: int, mock_runtime: MagicMock) -> None:
     from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import \

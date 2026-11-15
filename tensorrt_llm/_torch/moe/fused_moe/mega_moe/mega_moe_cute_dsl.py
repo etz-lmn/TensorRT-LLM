@@ -2515,10 +2515,17 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and prestaged[0] is bufs.topk_idx_local
             and all(a is b for a, b in zip((topk_idx, topk_weights, x, x_sf), prestaged[1:]))
         )
-        if replica_plan is None and (topk_idx.dtype != torch.int32 or not topk_idx.is_contiguous()):
-            topk_idx = topk_idx.to(torch.int32).contiguous()
-        if self._slot_of_expert is not None and not inputs_staged:
-            topk_idx = self.slots_of_experts(topk_idx)
+        # Validate the handed-out slot view before any conversion can discard its identity.
+        routes_staged = inputs_staged or self._routes_staged(
+            bufs, topk_idx, num_tokens, top_k, replica_plan
+        )
+        if not routes_staged:
+            if replica_plan is None and (
+                topk_idx.dtype != torch.int32 or not topk_idx.is_contiguous()
+            ):
+                topk_idx = topk_idx.to(torch.int32).contiguous()
+            if self._slot_of_expert is not None:
+                topk_idx = self.slots_of_experts(topk_idx)
         use_direct_inputs = (
             not inputs_staged
             and self._may_read_inputs_in_place(num_tokens, launch_max_T)
@@ -2539,12 +2546,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and topk_weights.is_contiguous()
             and topk_idx.data_ptr() % 16 == 0
             and topk_weights.data_ptr() % 16 == 0
-        )
-        # Routes a load balancer wrote into this bucket's staging (route_staging): their gate
-        # weights, the rows of padding requests and the tail are written as the route staging
-        # writes them, so only the activation is left to stage.
-        routes_staged = inputs_staged or self._routes_staged(
-            bufs, topk_idx, num_tokens, top_k, replica_plan
         )
         # quantize_input already quantized into this bucket's staging: x and x_sf are its
         # leading rows, so there is nothing to copy.

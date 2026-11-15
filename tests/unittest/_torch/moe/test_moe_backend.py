@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
-from unittest.mock import ANY, MagicMock, Mock
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -3750,6 +3750,8 @@ def test_strict_megamoe_cutedsl_request_reports_rejection_detail() -> None:
         )
 
 
+# These CPU contracts need rank arithmetic, not a live DeviceMesh/process group.
+@patch("tensorrt_llm.mapping.mpi_disabled", new=lambda: False)
 def _fused_comm_scheduler(
     *,
     rank: int,
