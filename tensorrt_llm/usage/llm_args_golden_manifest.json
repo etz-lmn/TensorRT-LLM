@@ -1187,6 +1187,7 @@
     },
     {
       "allowed_values": [
+        "adaptive",
         "standard",
         "per_layer_dynamic"
       ],
