@@ -450,7 +450,7 @@ def test_deepseek_v4_mtp_layers_take_the_routed_moe_layout_of_the_mtp_block(
     layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
         types.SimpleNamespace(num_hidden_layers=num_hidden_layers, num_nextn_predict_layers=1),
         str(tmp_path),
-        "MEGAMOE_CUTEDSL",
+        MoESelection(backend="MEGAMOE_CUTEDSL").request(),
         None,
         _mtp_one_model_spec_config(num_nextn_predict_layers),
     )
@@ -484,7 +484,7 @@ def test_deepseek_v4_mtp_blocks_take_their_own_routed_moe_layout(
     layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
         types.SimpleNamespace(num_hidden_layers=num_hidden_layers, num_nextn_predict_layers=2),
         str(tmp_path),
-        "MEGAMOE_CUTEDSL",
+        MoESelection(backend="MEGAMOE_CUTEDSL").request(),
         None,
         _mtp_one_model_spec_config(2),
     )
@@ -504,7 +504,7 @@ def test_deepseek_v4_mtp_layer_without_its_own_block_keeps_the_layers0_layout(
     layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
         types.SimpleNamespace(num_hidden_layers=2, num_nextn_predict_layers=1),
         str(tmp_path),
-        "MEGAMOE_CUTEDSL",
+        MoESelection(backend="MEGAMOE_CUTEDSL").request(),
         None,
         _mtp_one_model_spec_config(1),
     )
@@ -566,7 +566,7 @@ def test_deepseek_v4_routed_moe_probe_reads_only_the_layers0_and_mtp_shards(
     layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
         types.SimpleNamespace(num_hidden_layers=8, num_nextn_predict_layers=1),
         str(tmp_path),
-        "MEGAMOE_CUTEDSL",
+        MoESelection(backend="MEGAMOE_CUTEDSL").request(),
         None,
         _mtp_one_model_spec_config(1),
     )
@@ -592,7 +592,7 @@ def test_deepseek_v4_mtp_block_in_another_dtype_is_named(
     call = lambda: ModelConfig._set_deepseek_v4_routed_moe_quant_config(  # noqa: E731
         types.SimpleNamespace(num_hidden_layers=1, num_nextn_predict_layers=1),
         str(tmp_path),
-        "MEGAMOE_CUTEDSL",
+        MoESelection(backend="MEGAMOE_CUTEDSL").request(),
         None,
         _mtp_one_model_spec_config(1),
         require_layout=require_layout,
