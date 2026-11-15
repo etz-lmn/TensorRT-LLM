@@ -327,6 +327,9 @@ class MoeLayerLoadBalancer(Protocol):
     def get_repeat_count(self) -> int:
         ...
 
+    def is_static_routing(self) -> bool:
+        ...
+
     def is_dynamic_routing(self) -> bool:
         ...
 

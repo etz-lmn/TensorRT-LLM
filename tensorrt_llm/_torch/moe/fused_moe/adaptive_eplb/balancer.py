@@ -208,9 +208,7 @@ NO_LAYER = "no MoE layer runs on an implementation that supports adaptive EPLB"
 
 
 class AdaptiveMoeLayerLoadBalancer:
-    """Handle of one MoE layer (a :class:`~..moe_load_balancer.MoeLayerLoadBalancer`): records its
-    routes and maps experts to slots on the device, inside CUDA graphs. Its slot weights move whole
-    after loading, so none of the host weight hooks of standard EPLB apply."""
+    """Graph-safe layer routes and statistics, without standard host migration hooks."""
 
     produces_replica_plan = False
     stages_routes = True
@@ -239,6 +237,9 @@ class AdaptiveMoeLayerLoadBalancer:
     def get_repeat_count(self) -> int:
         return self.repeated_count
 
+    def is_static_routing(self) -> bool:
+        return False
+
     def is_dynamic_routing(self) -> bool:
         """False: no host statistics, host weight migration or stage hooks."""
         return False
@@ -251,7 +252,6 @@ class AdaptiveMoeLayerLoadBalancer:
         return False
 
     def get_load_expert_ids(self) -> list[int]:
-        """The experts this rank loads from the checkpoint: its home experts."""
         local = self.expert_count // self.manager.ep_size
         start = self.manager.ep_rank * local
         return list(range(start, start + local))
