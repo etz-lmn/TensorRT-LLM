@@ -670,5 +670,72 @@ def test_a_fused_moe_launch_waits_for_the_statistic_allreduce(
     assert trace == ["wait:statistic"]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize('ep_size', [1, 4, 32])
+@pytest.mark.parametrize(
+    'mode', ['none', 'static', 'online', 'adaptive', 'per_layer_dynamic'])
+def test_slot_table_initialization_uses_the_layer_routing_contract(
+        monkeypatch, ep_size, mode):
+    from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer as lb
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe import \
+        mega_moe_cute_dsl as mm
+    IMPL = mm.TrtllmCutedslMegaMoeNvfp4Impl
+    manager = SimpleNamespace(ep_size=ep_size, ep_rank=0)
+    if mode in ('static', 'online'):
+        impl = SimpleNamespace(get_pointer=lambda: 1, get_layer_id=lambda: 0)
+        comm = SimpleNamespace(Get_rank=lambda: 0, Get_size=lambda: ep_size)
+        monkeypatch.setattr(lb, 'HostMoeTensorSharer', lambda *args: None)
+        monkeypatch.setattr(torch.cuda, 'Event', lambda: object())
+        handle = lb.SingleLayerMoeLoadBalancer(impl,
+                                               comm,
+                                               32,
+                                               updates_enabled=mode == 'online',
+                                               aux_stream=object())
+    elif mode == 'adaptive':
+        from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.balancer import \
+            AdaptiveMoeLayerLoadBalancer
+        handle = AdaptiveMoeLayerLoadBalancer(
+            manager,
+            layer_idx=0,
+            expert_count=32,
+            slot_count_per_rank=32 // ep_size + 1)
+    elif mode == 'per_layer_dynamic':
+        from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.layer import \
+            PerLayerDynamicMoeLayerLoadBalancer
+        handle = PerLayerDynamicMoeLayerLoadBalancer(
+            manager,
+            layer_idx=0,
+            expert_count=32,
+            top_k=2,
+            compute_slots_per_rank=32 // ep_size + 1)
+    else:
+        handle = None
+    calls, table = ([], object())
+
+    class DeviceEndpoint:
+
+        def to(self, device):
+            calls.append(device.type)
+            return table
+
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
+    backend = SimpleNamespace(layer_load_balancer=handle,
+                              ep_size=ep_size,
+                              num_experts=32,
+                              num_slots=32 + ep_size,
+                              initial_global_assignments=list(range(32)),
+                              _routing_table=lambda ids: DeviceEndpoint())
+    backend._slot_of_expert = IMPL._make_slot_table(backend)
+    static_mapping = mode == 'static' and ep_size > 1
+    assert backend._slot_of_expert is (table if static_mapping else None)
+    assert IMPL.maps_expert_slots.fget(backend) is static_mapping
+    assert calls == (['cuda'] if static_mapping else [])
+    if handle is not None:
+        assert handle.is_static_routing() is (mode == 'static')
+        assert handle.is_dynamic_routing() is (mode == 'online')
+    if mode == 'adaptive':
+        assert handle.records_statistics() and handle.stages_routes
+
+
 if __name__ == '__main__':
     unittest.main()
