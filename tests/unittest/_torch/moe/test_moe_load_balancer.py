@@ -670,8 +670,6 @@ def test_a_fused_moe_launch_waits_for_the_statistic_allreduce(
     assert trace == ["wait:statistic"]
 
 
-
-
 @pytest.mark.cpu_only
 @pytest.mark.parametrize('ep_size', [1, 4, 32])
 @pytest.mark.parametrize('mode',
