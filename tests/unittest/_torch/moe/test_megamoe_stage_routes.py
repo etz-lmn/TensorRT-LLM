@@ -233,8 +233,12 @@ def test_bf16_inputs_stage_in_one_launch_as_in_two(rows, bucket, monkeypatch):
         fc31_input_scale=scale,
         _staging_of_next_run=lambda n, device: fused,
         _padding_drop_buckets={bucket},
+        _shared_expert=None,
+        _slot_of_expert=None,
+        _prestaged=None,
     )
     moe._activation_to_quantize = MegaMoECuteDsl._activation_to_quantize.__get__(moe)
+    moe._shared_activation_target = MegaMoECuteDsl._shared_activation_target.__get__(moe)
     x = torch.zeros(rows, 7168, dtype=torch.bfloat16, device="cuda")
     ids = torch.zeros(rows, TOP_K, dtype=torch.int32, device="cuda")
     weights = torch.zeros(rows, TOP_K, device="cuda")
