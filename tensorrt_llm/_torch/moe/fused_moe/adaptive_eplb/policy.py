@@ -1,12 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Decision policy of adaptive EPLB: the time model, the layout planner and the install decisions,
-and the operands of the ops that apply them (route tables, shares, statistics buffers).
-
-The functions compute in a fixed order on inputs that all EP ranks share, so every rank reaches the
-same decision. A layout is the expert of every slot (rank-major, ``-1`` when free); a slot's share is
-the fraction of its expert's rows (routed tokens) it receives; ``[L, ...]`` arrays have a row per layer.
-The module imports numpy only: the operands import torch where they call the ops.
+"""Deterministic decisions on shared rank inputs; layout[slot] is its expert (-1 means free).
+Shares split routed rows among replicas; [L, ...] arrays hold layers. Only op operands import torch.
 """
 
 from __future__ import annotations
@@ -16,6 +11,7 @@ import heapq
 import itertools
 import math
 import statistics
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, NamedTuple, cast
@@ -55,17 +51,11 @@ class ExpertGeometry:
 
 @dataclass(frozen=True)
 class TimeModel:
-    """Microseconds of one decode step of one MoE layer on one GPU, given by the MoE backend.
-
-    A GPU's time is ``scale`` times the sum of: ``per_active_slot_us`` for every slot that receives
-    rows (streaming its weights), ``per_extra_tile_us`` for every tile of ``tile_rows`` rows a slot
-    needs beyond its first, ``per_row_us`` for every row, and ``hot_slot_extra_tile_us`` for every
-    tile beyond the first of the GPU's busiest slot. A layer takes its busiest GPU's time, and
-    ``route_us`` more while it holds a replica: the route op's path that spreads an expert's rows.
-    With ``time_shares``, :func:`solve_shares` minimizes the busiest GPU's time, not its rows.
-    ``scales`` holds ``(rows, scale, per_active_slot_us, route_us, time_shares)`` per calibrated
-    CUDA graph bucket, ascending by the rows a GPU's tokens route per forward in it (:meth:`at`);
-    empty, the fields hold at every size.
+    """Decode microseconds: scale multiplies active slots, extra tiles, rows and hot-slot tiles.
+    Extra tiles are beyond the first tile_rows rows; a layer takes its slowest GPU plus route_us
+    when replicated. time_shares minimizes that GPU time rather than rows.
+    scales lists ascending (rows, scale, per_active_slot_us, route_us, time_shares) graph buckets;
+    rows counts routed assignments per GPU/forward. Empty scales uses these fields at every size.
     """
 
     per_active_slot_us: float
@@ -124,9 +114,8 @@ def slot_rows(load: np.ndarray, layout: np.ndarray, shares: np.ndarray) -> np.nd
 
 
 def active_slots(geometry: ExpertGeometry) -> int:
-    """Slots a planned layout may occupy: every GPU keeps as many non-home slots free as it holds
-    replicas, so one install can replace all of a GPU's replicas (new replicas are copied into free
-    slots while the old ones still serve routes)."""
+    """Keep as many non-home slots free as replicas on each GPU, allowing one replacement install
+    while existing replicas still serve routes."""
     spare = geometry.local_slots - geometry.local_experts
     return geometry.num_slots - geometry.ep_size * (spare // 2)
 
@@ -145,12 +134,8 @@ def plan_layout(
     current_layout: np.ndarray,
     total_active_slots: int,
 ) -> Plan:
-    """Plan the next layout of one layer from its ``[num_experts]`` rows.
-
-    Every expert keeps its home slot, and each further slot up to ``total_active_slots`` goes to the
-    expert with the most rows per copy. Replicas go, most rows first, to the least loaded GPU that
-    does not hold the expert yet. New replicas only take slots that ``current_layout`` leaves free,
-    and an installed replica that stays on its GPU keeps its slot.
+    """Keep home slots; assign active slots to the largest rows/copy and least loaded eligible GPU.
+    New replicas use free current slots; replicas staying on their GPU retain their slots.
     """
     num_experts = geometry.num_experts
     rows = np.asarray(load, dtype=np.float64).tolist()
@@ -301,12 +286,8 @@ def _fit_free_slots(
 def _keep_replica_slots(
     installed: _ExpertSlots, proposed: _ExpertSlots, is_home: list[bool], geometry: ExpertGeometry
 ) -> _ExpertSlots:
-    """Move every replica of ``proposed`` to the slot of an installed replica of the same expert on
-    the same GPU, when there is one.
-
-    Any other replica keeps its slot if that slot is free, else takes the GPU's lowest free non-home
-    slot.
-    """
+    """Reuse an expert's installed same-GPU replica slots; otherwise keep a free proposed slot,
+    or take the lowest free non-home slot on that GPU."""
     local = geometry.local_slots
     installed_replicas: dict[tuple[int, int], list[int]] = {}  # (expert, GPU) -> replica slots
     for expert, slots in enumerate(installed):
@@ -377,6 +358,8 @@ def evaluate_gains(
     new_shares: np.ndarray,
     model: TimeModel,
     geometry: ExpertGeometry,
+    summary: dict | None = None,
+    label: str = "candidate",
 ) -> np.ndarray:
     """The gain of ``new_layout`` at ``new_shares`` over ``layout`` at ``shares`` of each layer, in
     ms per decode step, for ``load``; an install applies a layout and its shares together."""
@@ -387,15 +370,19 @@ def evaluate_gains(
         moe = model.layer_time_us(slot_rows(load, layout, shares), geometry.ep_size)
         return moe + model.route_us * ((layout >= 0).sum(1) > geometry.num_experts)
 
-    return (time_us(layout, shares) - time_us(new_layout, new_shares)) / 1e3
+    before, after = time_us(layout, shares), time_us(new_layout, new_shares)
+    if summary is not None:
+        snapshot_summary(
+            summary, **{label: dict(before_us=before.tolist(), after_us=after.tolist())}
+        )
+    return (before - after) / 1e3
 
 
 def choose_layers_to_install(
     gains: dict[int, float], steps_left: float | None, copy_ms: dict[int, float]
 ) -> list[int]:
-    """Layers to install, largest gain first, whose gain (ms per step) over the steps left repays
-    their copy (``copy_ms`` per layer). The drift of the rows sets the interval between evaluations
-    (:class:`EvaluationScheduler`), not the worth of an install."""
+    """Install descending gains (ms/step) that repay copy_ms over remaining steps.
+    Drift controls evaluation cadence, not installation value."""
     if steps_left is None:
         return []
     order = sorted(gains.items(), key=lambda kv: (-kv[1], kv[0]))
@@ -405,10 +392,7 @@ def choose_layers_to_install(
 def agreed_timings(
     per_rank: Sequence[Sequence[tuple[int, int, float]]],
 ) -> list[tuple[int, int, float]]:
-    """``(group, layers, ms)`` of the install groups that every rank timed, at the slowest rank's ms.
-
-    Raises ``ValueError`` when ranks disagree on a group's layers.
-    """
+    """Return common (group, layers, slowest-rank ms); reject disagreement on layer counts."""
     by_rank = [{int(g): (int(n), float(ms)) for g, n, ms in rows} for rows in per_rank]
     if not by_rank:
         return []
@@ -449,14 +433,22 @@ class EvaluationPlan(NamedTuple):
     open_after: int
 
 
-class EvaluationScheduler:
-    """Chooses the number of calls between evaluations.
+def snapshot_summary(summary: dict | None, **values: object) -> None:
+    """Copy computed diagnostics; capture_ns excludes IPC and observer work."""
+    if summary is not None:
+        start = time.perf_counter_ns()
+        summary.update(
+            {
+                key: value.tolist() if isinstance(value, np.ndarray) else value
+                for key, value in values.items()
+            }
+        )
+        summary["capture_ns"] = summary.get("capture_ns", 0) + time.perf_counter_ns() - start
 
-    An evaluation has a fixed cost, and between evaluations the installed layouts fit the rows a
-    little worse every call; an interval of ``sqrt(2 * fixed cost / growth per call)`` calls
-    minimizes their sum per call. The growth is read from two windows of the same layers: their
-    time above the same rows spread evenly, under the current layouts. Growth below
-    :meth:`min_resolvable_rate` is not counted.
+
+class EvaluationScheduler:
+    """Balance evaluation fixed cost against drift using sqrt(2 * fixed cost / growth per call).
+    Read same-layer, load-normalized excess cost across windows; ignore unresolved growth.
     """
 
     def __init__(self, model: TimeModel, geometry: ExpertGeometry) -> None:
@@ -513,13 +505,10 @@ class EvaluationScheduler:
         install_timings: Sequence[tuple[int, int, float]],
         growth: CostGrowth | None,
         steps_left: float | None,
+        summary: dict | None = None,
     ) -> EvaluationPlan:
-        """The plan from the evaluation whose route tables apply at ``call`` to the next one.
-
-        The window was gathered at ``gather_call`` and the next window takes ``next_window_calls``.
-        ``stats_copy_ms`` (the statistics copies of past windows) and ``install_timings`` give the
-        fixed cost of an evaluation, ``growth`` is this window's :meth:`read_cost` and
-        ``steps_left`` the decode steps the running requests still have.
+        """Plan after apply call, allowing gather lag and next_window_calls.
+        Use observed stats/install costs and growth, capped by remaining decode steps.
         """
         calls_since_gather = int(call) - int(gather_call)
         min_interval = 1 + int(next_window_calls) + calls_since_gather
@@ -529,12 +518,28 @@ class EvaluationScheduler:
                 self._last_positive_rate = growth.rate
         rate = None if growth is None else self._last_positive_rate
         interval = min_interval
+        fixed = None
+        stats_copy_fixed = install_fixed = None
         if copies and rate is not None:
-            fixed = statistics.median(copies) + (fixed_install_ms(install_timings) or 0.0)
+            stats_copy_fixed = statistics.median(copies)
+            install_fixed = fixed_install_ms(install_timings)
+            fixed = stats_copy_fixed + (install_fixed or 0.0)
             interval = max(min_interval, math.ceil(math.sqrt(2.0 * fixed / rate)))
         if steps_left is not None:
             interval = min(interval, max(min_interval, int(math.ceil(steps_left))))
         open_after = max(1, interval - int(next_window_calls) - calls_since_gather)
+        snapshot_summary(
+            summary,
+            fixed_ms=fixed,
+            stats_copy_fixed_ms=stats_copy_fixed,
+            install_fixed_ms=install_fixed,
+            rate_ms_per_call=rate,
+            min_interval=min_interval,
+            growth=None
+            if growth is None
+            else dict(rate=growth.rate, layers=growth.layers, interval=growth.interval),
+            steps_left=steps_left,
+        )
         return EvaluationPlan(interval, open_after)
 
 
@@ -609,9 +614,8 @@ def build_route_tables(
 
 
 def statistics_buffers(layers: int, num_experts: int, device: torch.device | str) -> dict:
-    """Every layer's statistics in one contiguous ``storage`` of bytes, so that a window opens with
-    one zeroing and closes with one copy: ``rows`` ``[L, E]`` float32 (the rows routed to every
-    expert, exact below 2^24), then ``forwards`` ``[L, 1]`` int64 from the next 8-byte boundary."""
+    """One zero/copy per window: rows[L,E] float32 (exact below 2^24), followed at an 8-byte boundary
+    by forwards[L,1] int64 in a contiguous byte storage."""
     import torch
 
     rows_bytes = layers * num_experts * 4
