@@ -16,9 +16,11 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from collections import deque
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from typing import TYPE_CHECKING
@@ -512,6 +514,55 @@ class _WorkerThread(threading.Thread):
             self.jobs.task_done()
 
 
+class _ApplyProfile:
+    """Diagnostic clocks only; residuals include bookkeeping, never subtract from the gate."""
+
+    def __init__(self, runtime, call, window):
+        self.wall = time.perf_counter_ns()
+        self.cpu = time.thread_time_ns()
+        self.timeline = getattr(getattr(runtime, "_geneplb_readout", None), "timeline", None)
+        self.record = dict(
+            phase="apply_segments",
+            edge="event",
+            window=window,
+            call=call,
+            thread=threading.get_native_id(),
+            segments=[],
+            failed=False,
+            storage=getattr(runtime, "_apply_profile_metadata", None),
+        )
+
+    @contextmanager
+    def section(self, name):
+        wall = time.perf_counter_ns()
+        cpu = time.thread_time_ns()
+        try:
+            yield
+        except BaseException:
+            self.record["failed"] = True
+            raise
+        finally:
+            end_cpu = time.thread_time_ns()
+            end_wall = time.perf_counter_ns()
+            self.record["segments"].append(
+                dict(name=name, wall_ns=end_wall - wall, thread_cpu_ns=end_cpu - cpu)
+            )
+
+    def finish(self):
+        self.record["ns"] = time.perf_counter_ns()
+        self.record["total_wall_ns"] = self.record["ns"] - self.wall
+        self.record["total_thread_cpu_ns"] = time.thread_time_ns() - self.cpu
+        for kind in ("wall", "thread_cpu"):
+            self.record[f"bookkeeping_{kind}_ns"] = self.record[f"total_{kind}_ns"] - sum(
+                item[f"{kind}_ns"] for item in self.record["segments"]
+            )
+        sink_wall, sink_cpu = time.perf_counter_ns(), time.thread_time_ns()
+        if self.timeline is not None:
+            self.timeline.records.append(self.record)
+        self.record["sink_thread_cpu_ns"] = time.thread_time_ns() - sink_cpu
+        self.record["sink_wall_ns"] = time.perf_counter_ns() - sink_wall
+
+
 class AdaptiveRuntime:
     """One rank's windows: gather statistics/ROW from every rank, then apply one update at a time.
     Statistics copies finish before gather; tables apply before the next window opens.
@@ -579,6 +630,20 @@ class AdaptiveRuntime:
         self._host_tables = torch.empty_like(tables, device="cpu", pin_memory=pin)
         self._host_tables.copy_(tables)
         self._host_tables_np = self._host_tables.numpy()  # the host mirror, written row by row
+        self._apply_profile_metadata = dict(
+            prefer_pinned=prefer_pinned(),
+            pin_requested=pin,
+            tensors={
+                name: dict(
+                    device=str(tensor.device),
+                    dtype=str(tensor.dtype),
+                    shape=list(tensor.shape),
+                    stride=list(tensor.stride()),
+                    is_pinned=tensor.is_pinned(),
+                )
+                for name, tensor in (("host", self._host_tables), ("device", self.tables))
+            },
+        )
         self._stats_copy_begin = torch.cuda.Event(enable_timing=True)
         self._stats_copy_end = torch.cuda.Event(enable_timing=True)
         self._copy_begin = torch.cuda.Event(enable_timing=True, blocking=True)
@@ -779,20 +844,37 @@ class AdaptiveRuntime:
         Subsequent forwards use the installed tables."""
         # The previous copy from the pinned host tables finished before the window after it closed.
         assert not self._apply_events, "the previous route tables' copy is still in flight"
-        host_tables = self._host_tables_np
-        for layer, tables in update.tables.items():
-            host_tables[layer] = tables
-            self.applied_window[layer] = update.window
-        if self._apply_event_pairs:
-            begin, end = self._apply_event_pairs.popleft()
-        else:
-            begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        begin.record()
-        if update.tables:
-            first, stop = min(update.tables), max(update.tables) + 1
-            self.tables[first:stop].copy_(self._host_tables[first:stop], non_blocking=True)
-            self.installs += 1
-            self.installed_layers += len(update.tables)
-        end.record()
-        self._apply_events.append((update.window, len(update.tables), begin, end))
-        self._event("applied", window=update.window, call=call, layers=sorted(update.tables))
+        profile = _ApplyProfile(self, call, update.window)
+        try:
+            with profile.section("clock_probe"):
+                pass
+            with profile.section("host"):
+                host_tables = self._host_tables_np
+                for layer, tables in update.tables.items():
+                    host_tables[layer] = tables
+                    self.applied_window[layer] = update.window
+            with profile.section("event_pool"):
+                if self._apply_event_pairs:
+                    begin, end = self._apply_event_pairs.popleft()
+                else:
+                    begin, end = (
+                        torch.cuda.Event(enable_timing=True),
+                        torch.cuda.Event(enable_timing=True),
+                    )
+            with profile.section("begin_record"):
+                begin.record()
+            with profile.section("h2d"):
+                if update.tables:
+                    first, stop = min(update.tables), max(update.tables) + 1
+                    self.tables[first:stop].copy_(self._host_tables[first:stop], non_blocking=True)
+                    self.installs += 1
+                    self.installed_layers += len(update.tables)
+            with profile.section("end_record"):
+                end.record()
+            with profile.section("event_callback"):
+                self._apply_events.append((update.window, len(update.tables), begin, end))
+                self._event(
+                    "applied", window=update.window, call=call, layers=sorted(update.tables)
+                )
+        finally:
+            profile.finish()

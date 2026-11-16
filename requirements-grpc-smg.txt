@@ -1,1 +1,0 @@
-smg-grpc-proto>=0.4.2
