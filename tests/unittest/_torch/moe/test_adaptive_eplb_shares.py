@@ -103,6 +103,37 @@ def test_time_shares_stop_a_replica_whose_read_outweighs_its_rows():
     assert by_time[layout == 0].tolist() == [1.0, 0.0]
 
 
+@pytest.mark.parametrize("seed", range(40))
+def test_time_shares_keep_a_rows_feasible_incumbent(seed):
+    rows, layout = _random_case(np.random.default_rng(seed))
+    by_rows = solve_shares(rows, layout, GEOMETRY)
+    by_time = solve_shares(rows, layout, GEOMETRY, replace(MODEL, time_shares=True))
+    assert np.all(np.isfinite(by_time)) and np.all(by_time >= 0.0)
+    assert np.all(by_time[layout < 0] == 0.0)
+    for expert in range(GEOMETRY.num_experts):
+        assert math.fsum(by_time[layout == expert]) == pytest.approx(1.0, abs=1e-9)
+    costs = [
+        MODEL.layer_time_us(slot_rows(rows[None], layout[None], shares[None]), GEOMETRY.ep_size)[0]
+        for shares in (by_rows, by_time)
+    ]
+    assert costs[1] <= costs[0] + 32 * np.finfo(np.float64).eps * max(costs)
+
+
+def test_time_shares_keep_rows_on_a_zero_cost_tie():
+    rows, layout = _random_case(np.random.default_rng(7))
+    zero = replace(
+        MODEL,
+        per_active_slot_us=0.0,
+        per_extra_tile_us=0.0,
+        per_row_us=0.0,
+        hot_slot_extra_tile_us=0.0,
+        time_shares=True,
+    )
+    assert solve_shares(rows, layout, GEOMETRY, zero).tobytes() == solve_shares(
+        rows, layout, GEOMETRY
+    ).tobytes()
+
+
 def test_shares_refuse_invalid_inputs():
     rows, layout = _random_case(np.random.default_rng(3))
     rows[0] = 5.0

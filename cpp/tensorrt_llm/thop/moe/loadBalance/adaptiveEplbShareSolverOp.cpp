@@ -717,6 +717,34 @@ void shedBusiest(std::vector<double> const& load, int64_t const* layout, int num
     }
 }
 
+//! Prices the returned shares slot by slot, including their divide/multiply rounding at tile boundaries.
+double returnedTime(std::vector<double> const& load, int64_t const* layout, int numSlots, int localSlots,
+    TimeCosts const& c, std::vector<double> const& shares)
+{
+    double worst = 0.0;
+    for (int begin = 0; begin < numSlots; begin += localSlots)
+    {
+        int active = 0;
+        double tiles = 0.0;
+        double rows = 0.0;
+        double top = 0.0;
+        for (int s = begin; s < begin + localSlots; ++s)
+        {
+            double const y = layout[s] >= 0 ? load[layout[s]] * shares[s] : 0.0;
+            if (y > 0.0)
+            {
+                double const q = std::ceil(y / c.tileRows);
+                ++active;
+                tiles += std::max(q - 1.0, 0.0);
+                rows += y;
+                top = std::max(top, q);
+            }
+        }
+        worst = std::max(worst, c.read * active + c.tile * tiles + c.row * rows + c.hot * std::max(top - 1.0, 0.0));
+    }
+    return worst;
+}
+
 } // namespace
 
 //! Shares of every slot's expert rows (see the file comment). loadRows: [num_experts] float64 rows per step of every
@@ -778,6 +806,13 @@ at::Tensor adaptiveEplbSolveShares(
     if (costs.has_value())
     {
         shedBusiest(load, layoutPtr, n, ranks, local, c, shares);
+        std::vector<double> rowsShares = rowsBalancedShares(load, slotsOf, ranks, local, n, {});
+        // A tie keeps the rows solution; both candidates are priced after conversion to returned shares.
+        if (!(returnedTime(load, layoutPtr, n, local, c, shares)
+                < returnedTime(load, layoutPtr, n, local, c, rowsShares)))
+        {
+            shares = std::move(rowsShares);
+        }
     }
     at::Tensor out = at::empty({numSlots}, at::TensorOptions().dtype(at::kDouble));
     std::copy(shares.begin(), shares.end(), out.data_ptr<double>());
