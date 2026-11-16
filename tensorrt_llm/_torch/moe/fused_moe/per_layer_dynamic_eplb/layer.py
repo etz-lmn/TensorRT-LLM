@@ -95,6 +95,10 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         """
         return False
 
+    def records_statistics(self) -> bool:
+        """The CUDA planner keeps its own statistics: no statistics hooks."""
+        return False
+
     def need_load_shared_weights(self) -> bool:
         return False
 

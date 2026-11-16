@@ -19,7 +19,12 @@ from tensorrt_llm.logger import logger
 
 from .iteration_stats_json import iteration_stats_row
 from .scheduler.adp_router import RankIterStatsPayload, RankState
-from .scheduler.rank_state import RankKvCacheStats, RankSchedulingCounters, RankSpecDecodingStats
+from .scheduler.rank_state import (
+    RankKvCacheStats,
+    RankMoeLoadBalancerStats,
+    RankSchedulingCounters,
+    RankSpecDecodingStats,
+)
 
 _ITERATION_STATS_SCALAR_FIELDS = (
     "timestamp",
@@ -97,21 +102,25 @@ _SPECDEC_STATS_FORMAT = (
     "{" + ", ".join(f'"{key}": %r' for key in _SPECDEC_STATS_KEYS.values()) + "}"
 )
 # Marks for the parts of a rank row that differ between ranks other than 0, and their row text.
-_IFB_MARK, _KV_MARK, _SPECDEC_MARK, _RANK_MARK = (
+_IFB_MARK, _KV_MARK, _SPECDEC_MARK, _RANK_MARK, _MOE_MARK = (
     "@adp-row-inflight-batching-stats@",
     "@adp-row-kv-cache-stats@",
     "@adp-row-specdec-stats@",
     "@adp-row-attention-dp-rank@",
+    "@adp-row-moe-load-balancer-stats@",
 )
-_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT = (
+_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT, _MOE_TEXT = (
     json.dumps(_IFB_MARK),
     json.dumps(_KV_MARK),
     json.dumps(_SPECDEC_MARK),
     json.dumps(_RANK_MARK),
+    json.dumps(_MOE_MARK),
 )
 _MARK_TEXTS = re.compile(
     "("
-    + "|".join(re.escape(text) for text in (_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT))
+    + "|".join(
+        re.escape(text) for text in (_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT, _MOE_TEXT)
+    )
     + ")"
 )
 
@@ -268,9 +277,16 @@ class ADPIterStatsBuffer:
         host_step_time_ms: Optional[float] = None,
         prev_device_step_time_ms: Optional[float] = None,
         gpu_forward_time_ms: Optional[float] = None,
+        moe_load_balancer_stats: Optional[dict[str, int]] = None,
     ) -> None:
         """Queue local stats; rank 0 also keeps objects needed for fanout."""
         payload = self.make_payload(stats)
+        if moe_load_balancer_stats is not None:
+            payload.moe_load_balancer_stats = RankMoeLoadBalancerStats(
+                moe_load_balancer_stats["windows"],
+                moe_load_balancer_stats["installs"],
+                moe_load_balancer_stats["installedLayers"],
+            )
         iter_id = payload.iter_stats_iter
 
         if iter_id in self._payloads and iter_id not in self._synthetic_iters:
@@ -500,22 +516,35 @@ class ADPIterStatsBuffer:
         speculative-decoding stats and rank: the first is built in full and the others are
         spliced into its text."""
         rows: List[str] = []
-        template = None
+        templates = {}
         for state in states:
+            moe = state.iter_stats.moe_load_balancer_stats
+            moe_stats = None if moe is None else moe.as_dict()
             if state.rank == 0:
                 stats = self._make_rank_iter_stats(rank0_stats, state)
-                row = iteration_stats_row(stats, req_stats, kv_iter_stats, 0, **timings)
+                row = iteration_stats_row(
+                    stats, req_stats, kv_iter_stats, 0, moe_load_balancer_stats=moe_stats, **timings
+                )
                 rows.append(json.dumps(row))
                 continue
+            template = templates.get(moe is not None)
             if template is None:
                 stats = self._make_rank_iter_stats(rank0_stats, state)
-                row = iteration_stats_row(stats, attention_dp_rank=state.rank, **timings)
+                row = iteration_stats_row(
+                    stats,
+                    attention_dp_rank=state.rank,
+                    moe_load_balancer_stats=moe_stats,
+                    **timings,
+                )
                 ifb = row["inflightBatchingStats"]
                 row["inflightBatchingStats"] = _IFB_MARK
                 row["kvCacheStats"] = _KV_MARK
                 row["specDecodingStats"] = _SPECDEC_MARK
                 row["attentionDpRank"] = _RANK_MARK
+                if moe is not None:
+                    row["moeLoadBalancerStats"] = _MOE_MARK
                 template = (_MARK_TEXTS.split(json.dumps(row)), ifb)
+                templates[moe is not None] = template
             pieces, ifb = template
             payload = state.iter_stats
             for name, key in _PAYLOAD_IFB_KEYS.items():
@@ -531,6 +560,7 @@ class ADPIterStatsBuffer:
                     payload.specdec_stats, rank0_stats.specdec_stats
                 ),
                 _RANK_TEXT: str(state.rank),
+                _MOE_TEXT: json.dumps(moe_stats),
             }
             rows.append("".join(fills.get(piece, piece) for piece in pieces))
         return rows

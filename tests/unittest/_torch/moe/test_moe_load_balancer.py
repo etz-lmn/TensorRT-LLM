@@ -672,8 +672,8 @@ def test_a_fused_moe_launch_waits_for_the_statistic_allreduce(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize('ep_size', [1, 4, 32])
-@pytest.mark.parametrize('mode',
-                         ['none', 'static', 'online', 'per_layer_dynamic'])
+@pytest.mark.parametrize(
+    'mode', ['none', 'static', 'online', 'adaptive', 'per_layer_dynamic'])
 def test_slot_table_initialization_uses_the_layer_routing_contract(
         monkeypatch, ep_size, mode):
     from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer as lb
@@ -691,6 +691,14 @@ def test_slot_table_initialization_uses_the_layer_routing_contract(
                                                32,
                                                updates_enabled=mode == 'online',
                                                aux_stream=object())
+    elif mode == 'adaptive':
+        from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.balancer import \
+            AdaptiveMoeLayerLoadBalancer
+        handle = AdaptiveMoeLayerLoadBalancer(
+            manager,
+            layer_idx=0,
+            expert_count=32,
+            slot_count_per_rank=32 // ep_size + 1)
     elif mode == 'per_layer_dynamic':
         from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.layer import \
             PerLayerDynamicMoeLayerLoadBalancer
@@ -725,6 +733,8 @@ def test_slot_table_initialization_uses_the_layer_routing_contract(
     if handle is not None:
         assert handle.is_static_routing() is (mode == 'static')
         assert handle.is_dynamic_routing() is (mode == 'online')
+    if mode == 'adaptive':
+        assert handle.records_statistics() and handle.stages_routes
 
 
 @pytest.mark.parametrize("capturing", [False, True], ids=["eager", "graph"])
