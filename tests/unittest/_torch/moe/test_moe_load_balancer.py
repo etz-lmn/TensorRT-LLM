@@ -729,3 +729,66 @@ def test_slot_table_initialization_uses_the_layer_routing_contract(
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@pytest.mark.parametrize("capturing", [False, True], ids=["eager", "graph"])
+def test_statistic_allreduce_event_orders_changed_data_on_replay(
+        monkeypatch: pytest.MonkeyPatch, capturing: bool) -> None:
+    """The consumer sees this replay's auxiliary-stream result, not the last one."""
+    from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import EventType
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires real CUDA streams and events")
+    main, aux = torch.cuda.Stream(), torch.cuda.Stream()
+    source = torch.zeros(4, dtype=torch.int32, device="cuda")
+    observed = torch.empty_like(source)
+    layer = SingleLayerMoeLoadBalancer.__new__(SingleLayerMoeLoadBalancer)
+    layer.func_called_count = collections.defaultdict(int)
+    layer.func_called_count["done_wait_gpu_stage"] = 1
+    layer.updates_enabled = True
+    layer.aux_stream = aux
+    layer.local_statistic_tensor = torch.empty_like(source)
+    layer.statistic_flag_tensor = torch.empty_like(source)
+    layer.single_layer_load_balancer_ptr = 0
+    layer.event_dict = {EventType.Main: torch.cuda.Event()}
+    layer.statistic_allreduce_event = torch.cuda.Event()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.do_multi_stream",
+        lambda: True)
+    # Replace only statistic/distributed endpoints; stream/event ordering is real.
+    monkeypatch.setattr(torch.ops.trtllm,
+                        "moe_hierarchical_statistic_local_device",
+                        lambda ids, local, *args: local.copy_(ids))
+    monkeypatch.setattr(torch.ops.trtllm, "moe_hierarchical_statistic_update",
+                        lambda reduced, result, ptr: result.copy_(reduced))
+
+    def allreduce(local: torch.Tensor) -> torch.Tensor:
+        # Make an unordered consumer run before the auxiliary result is written.
+        torch.cuda._sleep(1_000_000)
+        return local * 2
+
+    def forward() -> None:
+        layer.update_statistic_with_local_ids(source, True, True, allreduce)
+        layer.wait_for_statistic_allreduce()
+        observed.copy_(layer.statistic_flag_tensor)
+        # Close the capture fork after the consumer, even if its wait regresses.
+        main.wait_stream(aux)
+
+    main.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(main):
+        forward()
+    main.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    if capturing:
+        with torch.cuda.graph(graph, stream=main):
+            forward()
+    for value in (3, 17):
+        with torch.cuda.stream(main):
+            source.fill_(value)
+            layer.statistic_flag_tensor.fill_(-1)
+            if capturing:
+                graph.replay()
+            else:
+                forward()
+        main.synchronize()
+        assert torch.equal(observed, torch.full_like(observed, 2 * value))

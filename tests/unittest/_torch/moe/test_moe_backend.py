@@ -5316,6 +5316,7 @@ def test_megamoe_cutedsl_quantizes_into_the_staging_of_a_hinted_run(
         with torch.inference_mode():
             # The first launch into the bucket builds its staging and copies the rows into it.
             _, copied_fp4, copied_sf, reference = forward()
+            reference = reference.clone()
             backend.set_adaptive_launch_tokens(seq_len)
             bufs = backend._staging_of_next_run(seq_len, x.device)
             assert bufs is not None
