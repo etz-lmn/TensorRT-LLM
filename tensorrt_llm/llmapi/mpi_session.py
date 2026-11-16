@@ -1236,6 +1236,7 @@ class RemoteMpiCommSessionServer():
         async_failed = False
         drain_deadline = None
         stop_deadline = None
+        stop_acknowledged = False
         try:
             while True:
                 for future in pending[:]:
@@ -1300,7 +1301,7 @@ class RemoteMpiCommSessionServer():
                         sync = message.sync
 
                 if stop_deadline is not None:
-                    if not pending and not queued_tasks:
+                    if stop_acknowledged and not pending and not queued_tasks:
                         break
                     if time.monotonic() >= stop_deadline:
                         raise RuntimeError(
@@ -1313,9 +1314,16 @@ class RemoteMpiCommSessionServer():
                 if self.queue.poll(0.1):
                     message = self.queue.get()
                     if message is None:
-                        self.queue.put_noblock(self.SHUTDOWN_ACK, retry=2)
                         if stop_deadline is None:
                             stop_deadline = time.monotonic() + grace
+                        try:
+                            self.queue.put_nowait(self.SHUTDOWN_ACK)
+                        except zmq.Again:
+                            # A reconnecting stop client must still receive an
+                            # ACK before an idle server leaves the receive loop.
+                            pass
+                        else:
+                            stop_acknowledged = True
                     elif stop_deadline is None and not async_failed:
                         queued_tasks.append(message)
         finally:
