@@ -727,10 +727,6 @@ def test_slot_table_initialization_uses_the_layer_routing_contract(
         assert handle.is_dynamic_routing() is (mode == 'online')
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 @pytest.mark.parametrize("capturing", [False, True], ids=["eager", "graph"])
 def test_statistic_allreduce_event_orders_changed_data_on_replay(
         monkeypatch: pytest.MonkeyPatch, capturing: bool) -> None:
@@ -792,3 +788,7 @@ def test_statistic_allreduce_event_orders_changed_data_on_replay(
                 forward()
         main.synchronize()
         assert torch.equal(observed, torch.full_like(observed, 2 * value))
+
+
+if __name__ == '__main__':
+    unittest.main()
