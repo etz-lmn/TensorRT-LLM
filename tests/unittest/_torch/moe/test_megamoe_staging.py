@@ -3,6 +3,7 @@
 """CPU tests of the MegaMoE CuteDSL backend's staging of the next run."""
 
 import types
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -126,6 +127,7 @@ def test_the_staging_of_the_next_run_is_handed_out_only_for_a_run_that_stages():
         ep_size=4,
         _genphase_direct_input_buckets={4},
         dtype=torch.bfloat16,
+        _active_launch_output_dtype=torch.bfloat16,
         hidden_size=4,
         routing_method=SimpleNamespace(experts_per_token=2),
         _local_staging_cache={},
@@ -308,3 +310,139 @@ def test_run_moe_stages_with_the_forward_word_only_where_the_kernel_masks_droppe
         output_dtype=torch.bfloat16,
     )
     assert len(staged) == 1 and staged[0] is (word if drops_padding_rows else None)
+
+
+@pytest.fixture
+def preparation_backend(monkeypatch):
+    """The existing CPU staging harness, with only quantization and launch endpoints replaced."""
+
+    class Quantize:
+        def __call__(self, x, *args, **kwargs):
+            return torch.zeros(len(x), 32, dtype=torch.uint8), torch.zeros(
+                len(x), 4, dtype=torch.uint8
+            )
+
+        def into(self, x, scale, activation, sf, *args):
+            activation.zero_()
+            sf.zero_()
+
+    def stage(x, scale, activation, sf, ids, weights, out_ids, out_weights, *args):
+        activation.zero_()
+        sf.zero_()
+        out_ids[: len(ids)].copy_(ids)
+        out_weights[: len(ids)].copy_(weights)
+
+    monkeypatch.setattr(mm, "_MEGAMOE_PRIME_LADDER", False)
+    monkeypatch.setattr(torch.ops.trtllm, "fp4_quantize", Quantize())
+    monkeypatch.setattr(torch.ops.trtllm, "megamoe_stage_inputs", stage)
+    backend = IMPL.__new__(IMPL)
+    torch.nn.Module.__init__(backend)
+    for name, value in dict(
+        _active_launch_max_tokens=8,
+        _active_launch_output_dtype=torch.bfloat16,
+        _quantized_into=None,
+        _prestaged=None,
+        _handed_out_route_staging=None,
+        _shared_expert=None,
+        _slot_of_expert=None,
+        _replicated=False,
+        _padding_drop_buckets=set(),
+        ep_size=2,
+        ep_rank=0,
+        tactic_autotune=False,
+        _genphase_direct_input_buckets=set(),
+        _maxt_buckets=(8, 16),
+        max_num_tokens=16,
+        _topk_idx_dtype=torch.int64,
+        _weights_created=True,
+        _symm_providers={16: object()},
+        _local_staging_cache={},
+        _launch_buffers={},
+        dtype=torch.bfloat16,
+        hidden_size=64,
+        routing_method=SimpleNamespace(experts_per_token=2),
+        fc31_input_scale=torch.ones(1),
+        fc31_act_scale=None,
+        quant_method=object(),
+        layer_load_balancer=None,
+    ).items():
+        setattr(backend, name, value)
+
+    def build(**kwargs):
+        bucket, dtype = kwargs["launch_max_T"], kwargs["output_dtype"]
+        buffers = mm._MegaMoeBuffers(
+            activation=torch.zeros(bucket, 32, dtype=torch.uint8),
+            activation_sf=torch.zeros(bucket, 4, dtype=torch.uint8),
+            topk_idx_local=torch.zeros(bucket, 2, dtype=torch.int64),
+            topk_weights=torch.zeros(bucket, 2),
+            combine_output=torch.zeros(bucket, 64, dtype=dtype),
+            shared_workspace=torch.zeros(1),
+            peer_offsets=(0, 0),
+        )
+        backend._local_staging_cache[
+            mm._StagingKey(bucket, 2, 64, str(kwargs["device"]), dtype)
+        ] = {}
+        return buffers
+
+    backend._build_buffers = build
+    backend._build_weight_view = lambda: None
+    backend._stage_inputs = lambda **kwargs: None
+    backend._launch_megamoe_kernel = lambda **kwargs: kwargs["combine_output"]
+    backend._acquire_buffers(
+        top_k=2, hidden=64, device=torch.device("cpu"), output_dtype=torch.bfloat16, launch_max_T=8
+    )
+    return backend
+
+
+def test_quantization_prepares_the_requested_output_dtype(preparation_backend):
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoERunContext
+
+    backend = preparation_backend
+    x, ids, weights = (
+        torch.zeros(2, 64, dtype=torch.bfloat16),
+        torch.zeros(2, 2, dtype=torch.int64),
+        torch.ones(2, 2),
+    )
+    activation, sf = backend.quantize_input(x, output_dtype=torch.float16)
+    context = MoERunContext(
+        x=activation,
+        x_sf=sf,
+        token_selected_experts=ids,
+        token_final_scales=weights,
+        output_dtype=torch.float16,
+    )
+    assert backend.run_moe(context).dtype == torch.float16
+    backend.set_adaptive_launch_tokens(8, output_dtype=torch.float16)
+    buffers = backend._staging_of_next_run(len(x), x.device)
+    activation, sf = backend.quantize_input(x)
+    assert activation.data_ptr() == buffers.activation.data_ptr()
+    assert sf.data_ptr() == buffers.activation_sf.data_ptr()
+    context = replace(context, x=activation, x_sf=sf)
+    assert backend.run_moe(context).dtype == torch.float16
+    # A legacy hint without a known output dtype must not promise direct staging.
+    backend.set_adaptive_launch_tokens(8)
+    assert backend._staging_of_next_run(len(x), x.device) is None
+
+
+@pytest.mark.parametrize("first_rows", [0, 2])
+@pytest.mark.parametrize("ep_size", [1, 2])
+def test_preparation_consumes_handout_before_an_uncached_bucket(
+    preparation_backend, first_rows, ep_size
+):
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoERunContext
+
+    backend = preparation_backend
+    backend.ep_size = ep_size
+    backend._slot_of_expert = torch.arange(8, dtype=torch.int32) if ep_size > 1 else None
+    for bucket, rows in ((8, first_rows), (16, 3)):
+        backend.set_adaptive_launch_tokens(bucket)
+        # run_moe knows the output dtype before its own BF16 preparation.
+        context = MoERunContext(
+            x=torch.zeros(rows, 64, dtype=torch.bfloat16),
+            x_sf=None,
+            token_selected_experts=torch.zeros(rows, 2, dtype=torch.int64),
+            token_final_scales=torch.ones(rows, 2),
+            output_dtype=torch.bfloat16,
+        )
+        assert backend.run_moe(context).dtype == torch.bfloat16
+    assert backend._handed_out_route_staging is None
