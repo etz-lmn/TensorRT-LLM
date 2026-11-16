@@ -5225,8 +5225,9 @@ def test_megamoe_cutedsl_nvfp4_awq_matches_cutlass() -> None:
 
 
 @pytest.mark.parametrize("reserved_sms", [0, 8])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_megamoe_cutedsl_quantizes_into_the_staging_of_a_hinted_run(
-    monkeypatch: pytest.MonkeyPatch, reserved_sms: int
+    monkeypatch: pytest.MonkeyPatch, reserved_sms: int, output_dtype: torch.dtype
 ) -> None:
     """With the bucket hint set and the bucket's staging built, ``quantize_input`` quantizes into
     that staging and ``run_moe`` launches from it without copying the activation; the rows and the
@@ -5298,7 +5299,7 @@ def test_megamoe_cutedsl_quantizes_into_the_staging_of_a_hinted_run(
         )
 
         def forward() -> Tuple[Tuple[int, int], torch.Tensor, torch.Tensor, torch.Tensor]:
-            backend.set_adaptive_launch_tokens(seq_len)
+            backend.set_adaptive_launch_tokens(seq_len, output_dtype=output_dtype)
             x_fp4, x_sf = backend.quantize_input(x, reserved_sms=reserved_sms)
             rows = (x_fp4.clone(), x_sf.clone())
             out = run_backend_moe(
@@ -5308,7 +5309,7 @@ def test_megamoe_cutedsl_quantizes_into_the_staging_of_a_hinted_run(
                 x_sf,
                 token_selected_experts,
                 token_final_scales,
-                dtype,
+                output_dtype,
                 router_logits,
             )
             return (x_fp4.data_ptr(), x_sf.data_ptr()), *rows, out
@@ -5316,7 +5317,7 @@ def test_megamoe_cutedsl_quantizes_into_the_staging_of_a_hinted_run(
         with torch.inference_mode():
             # The first launch into the bucket builds its staging and copies the rows into it.
             _, copied_fp4, copied_sf, reference = forward()
-            backend.set_adaptive_launch_tokens(seq_len)
+            backend.set_adaptive_launch_tokens(seq_len, output_dtype=output_dtype)
             bufs = backend._staging_of_next_run(seq_len, x.device)
             assert bufs is not None
             addresses, staged_fp4, staged_sf, output = forward()

@@ -773,6 +773,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Lockstep per-chunk cross-rank max for the NEXT run_moe (set via
         # ``set_adaptive_launch_tokens``); ``None`` -> full bucket.
         self._active_launch_max_tokens: Optional[int] = None
+        self._active_launch_output_dtype: Optional[torch.dtype] = None
         # (bucket ids buffer, ids, weights, x, x_sf) written by the last fused route+quant launch.
         self._prestaged: Optional[Tuple[torch.Tensor, ...]] = None
         # Expert -> slot table of a static placement (built in create_weights), with copies a
@@ -923,7 +924,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             f"reduce the per-rank chunk."
         )
 
-    def set_adaptive_launch_tokens(self, chunk_max_tokens: Optional[int]) -> None:
+    def set_adaptive_launch_tokens(
+        self, chunk_max_tokens: Optional[int], *, output_dtype: Optional[torch.dtype] = None
+    ) -> None:
         """Scheduler hook: record the lockstep per-chunk cross-rank max token
         count for the next ``run_moe``.
 
@@ -932,8 +935,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         and reset by the next ``_run_moe``. Set it before ``quantize_input``:
         with the hint set, ``quantize_input`` may quantize into that bucket's
         staging.
+        Supply ``output_dtype`` for direct preparation; otherwise preparation uses ordinary
+        tensors because the next launch's staging is not yet identified.
         """
         self._active_launch_max_tokens = chunk_max_tokens
+        self._active_launch_output_dtype = output_dtype
+
+    def set_adaptive_launch_output_dtype(self, output_dtype: torch.dtype) -> None:
+        """Bind preparation to the scheduler's resolved output dtype."""
+        self._active_launch_output_dtype = output_dtype
 
     def _may_read_inputs_in_place(self, num_tokens: int, bucket: int) -> bool:
         """Whether a launch of ``num_tokens`` rows into ``bucket`` may read its inputs where they
@@ -1026,12 +1036,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         bucket = self._select_launch_max_tokens(hint)
         if num_tokens > bucket or self._may_read_inputs_in_place(num_tokens, bucket):
             return None
+        output_dtype = getattr(self, "_active_launch_output_dtype", None)
+        if output_dtype is None:
+            return None  # The next launch's output buffer, and hence staging, is not known.
         key = _StagingKey(
             bucket,
             self.routing_method.experts_per_token,
             self.hidden_size,
             str(device),
-            self.dtype or torch.bfloat16,
+            output_dtype,
         )
         if key not in self._local_staging_cache:
             return None
@@ -1557,6 +1570,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         write them directly, else None."""
         if self._active_launch_max_tokens is None or self.tactic_autotune or num_tokens == 0:
             return None
+        output_dtype = getattr(self, "_active_launch_output_dtype", None)
+        if output_dtype is None:
+            return None
         launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
         if num_tokens > launch_max_T or launch_max_T in self._genphase_direct_input_buckets:
             return None
@@ -1575,6 +1591,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         *,
         post_quant_comm: bool = False,
         reserved_sms: int = 0,
+        output_dtype: Optional[torch.dtype] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """BF16 -> NVFP4 packed activation + plain K-major FP8 SF.
@@ -1612,6 +1629,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """
         del post_quant_comm  # MegaMoE owns dispatch / combine in-kernel.
         del kwargs
+        if output_dtype is not None:
+            self._active_launch_output_dtype = output_dtype
         if isinstance(x, Fp4QuantizedTensor):
             raise NotImplementedError(
                 "MegaMoECuteDsl.quantize_input expects BF16 activation; "
@@ -1822,6 +1841,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         output_dtype = ctx.output_dtype
         if output_dtype is None:
             output_dtype = self.dtype or torch.bfloat16
+        self._active_launch_output_dtype = output_dtype
         if x_sf is None and not self.supports_fused_prepare():
             raise ValueError("MegaMoECuteDsl requires x_sf from quantize_input")
 
@@ -2463,6 +2483,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # the full bucket.
         launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
         self._active_launch_max_tokens = None
+        self._active_launch_output_dtype = None
         quantized_into, self._quantized_into = self._quantized_into, None
         if num_tokens > launch_max_T:
             # By construction num_tokens <= max(all_rank_num_tokens) <=
@@ -2483,6 +2504,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                     f"{num_tokens}); route + quantize or quantize_input must precede run_moe."
                 )
         if num_tokens == 0 and self.ep_size == 1:
+            self._prestaged = None
+            self._handed_out_route_staging = None
             return torch.empty((0, hidden), dtype=output_dtype, device=device)
 
         if (
@@ -2516,9 +2539,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and all(a is b for a, b in zip((topk_idx, topk_weights, x, x_sf), prestaged[1:]))
         )
         # Validate the handed-out slot view before any conversion can discard its identity.
-        routes_staged = inputs_staged or self._routes_staged(
-            bufs, topk_idx, num_tokens, top_k, replica_plan
-        )
+        routes_staged = inputs_staged
+        if not inputs_staged or getattr(self, "_handed_out_route_staging", None) is not None:
+            routes_staged = self._routes_staged(bufs, topk_idx, num_tokens, top_k, replica_plan)
         if not routes_staged:
             if replica_plan is None and (
                 topk_idx.dtype != torch.int32 or not topk_idx.is_contiguous()

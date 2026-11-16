@@ -2399,9 +2399,11 @@ class _ChunkRoutes:
 @pytest.mark.parametrize(
     "mode", ["per_layer_dynamic", "standard", "off", "deferred", "deferred_recording"]
 )
-def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
+@pytest.mark.parametrize("has_dtype_hint", [False, True])
+def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, has_dtype_hint):
     source = _TORCH_ROOT / "moe/fused_moe/moe_scheduler.py"
     trace = []
+    forwarded_dtype = []
     labels = []
 
     class ExpertStatistic:
@@ -2498,11 +2500,14 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             fused_route_quant_enabled=False,
             quantize_input=lambda x, **kwargs: trace.append(("quantize", kwargs)) or ("x", "sf"),
             set_adaptive_launch_tokens=lambda tokens: trace.append(("bucket", tokens)),
+            set_adaptive_launch_output_dtype=lambda dtype: forwarded_dtype.append(dtype),
             run_moe=run_moe,
             supports_fused_prepare=lambda: mode in ("deferred", "deferred_recording"),
         ),
     )
     scheduler = scheduler_cls()
+    if not has_dtype_hint:
+        delattr(moe.backend, "set_adaptive_launch_output_dtype")
     scheduler.moe = moe
     x = SimpleNamespace(shape=(4, 16))
 
@@ -2515,6 +2520,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     )
 
     assert out == "out"
+    assert forwarded_dtype == (["bf16"] if has_dtype_hint else [])
     # The bucket hint precedes the route and the quantization, which may write
     # into that bucket's staging.
     if mode == "per_layer_dynamic":

@@ -1777,6 +1777,9 @@ class FusedCommMoEScheduler(MoEScheduler):
         set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
         if set_adaptive is not None:
             set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
+        set_output_dtype = getattr(moe.backend, "set_adaptive_launch_output_dtype", None)
+        if set_output_dtype is not None:
+            set_output_dtype(output_dtype)
 
         # ----- routing -----
         # int32 matches the EPLB stats kernel contract used by the external-comm
