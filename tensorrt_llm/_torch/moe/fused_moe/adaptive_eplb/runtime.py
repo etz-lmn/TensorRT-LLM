@@ -1,21 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime of adaptive EPLB: statistics windows, the decision process and installs.
-
-The main thread advances the runtime once per executor step and never waits; a worker thread runs
-the blocking work (the requests' progress at a close, the all-gathers, the decision process's
-messages, the expert copies). Every rank decides alike in its own decision process. An install
-copies new replicas into free slots, and its route tables take effect from the call after every
-rank's copies finished; ranks whose decisions differ stop the run before that. The decision process
-imports this module with only torch, numpy and this package available, so import other
-``tensorrt_llm`` modules inside functions.
-"""
+"""Nonblocking windows; tables apply only after every rank copies into free slots."""
 
 from __future__ import annotations
 
 import atexit
 import dataclasses
 import hashlib
+import json
 import math
 import mmap
 import os
@@ -44,6 +36,7 @@ from .policy import (
     choose_layers_to_install,
     evaluate_gains,
     plan_layout,
+    snapshot_summary,
     solve_shares,
 )
 
@@ -56,10 +49,7 @@ if TYPE_CHECKING:
 
 _DECISION_MAIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "decision_main.py")
 ROWS_PER_EXPERT = 512
-"""int: Rows a statistics window collects per expert, so that an expert's rows per forward carry a
-relative standard error of about 1 / sqrt(512) = 4.4 % at any batch size or draft length: a window
-lasts as many forwards as the previous window's rows per forward need to reach it. The first window
-lasts one forward; with fewer rows than that it only measures the rows per forward."""
+"""Per-expert target: relative sampling error about 1/sqrt(512); the first window measures one forward."""
 CLOSE_WAIT_S = 30.0
 """float: Seconds a close waits for the worker thread, again after telling it to leave."""
 GATHER_SLICE_S = 1.0
@@ -73,17 +63,10 @@ FIELDS = (
     "applied_layers",
     "applied_ms",
 )
-"""tuple: The values at the end of a rank's window statistics, the float32 array the ranks
-all-gather, which holds ``rows [L, E] | forwards [L] | applied window [L] | FIELDS``.
-
-``remaining``, ``requests`` and ``accepted`` sum the tokens the generation requests still have to
-produce, the requests, and the tokens they accept per step. ``stats_copy_ms`` is the GPU time of
-copying the statistics; ``applied``, ``applied_layers`` and ``applied_ms`` are the window, layer
-count and GPU time of the last route tables applied.
-"""
+"""All-gather float32 tail after rows[L,E], forwards[L], applied-window[L]: remaining output tokens,
+requests, accepted tokens/step, stats D2H GPU ms, and last applied window/layer count/GPU ms."""
 ROW = ("copied_call", "moved", "copy_ms", "digest")
-"""tuple: The float64 values a rank all-gathers after its copies of an update ran: the call they
-finished in, the layers it moved, their copy time and the update's digest."""
+"""Float64 copy-completion all-gather: completed call, moved layers, copy ms, digest."""
 
 
 def window_forwards(rows_per_forward: float, experts: int) -> int:
@@ -97,9 +80,7 @@ def window_stats_size(layers: int, experts: int) -> int:
 
 @dataclass(frozen=True)
 class DecisionConfig:
-    """Inputs of the decision process; ``home_layouts`` is ``[L, num_slots]`` int64 and
-    ``copy_ms`` the copy time per replica measured at start-up, which stays among the install
-    timings the copies are priced by."""
+    """Home layouts [L, slots] and startup copy ms/replica, retained among the timed samples."""
 
     geometry: ExpertGeometry
     model: TimeModel
@@ -112,12 +93,7 @@ class DecisionConfig:
 
 @dataclass
 class LayoutUpdate:
-    """The decision of one window.
-
-    It holds the new route tables of the chosen layers, the layers whose layout changes
-    (``moved``, copied as one timed batch) and the expert copies this rank makes for them
-    (``copy_items``). ``digest`` lets the ranks check that they all decided the same.
-    """
+    """One window's tables, moved layers, per-rank copies and shared agreement digest."""
 
     window: int
     copy_items: dict[int, list[tuple[int, int, int]]] = field(default_factory=dict)
@@ -158,6 +134,50 @@ class _Decider:
     """State of the decision process: the committed layouts and every timing of the run."""
 
     def __init__(self, config: DecisionConfig, stats: np.ndarray) -> None:
+        self.measure_decisions = os.environ.get("GENEPLB_DECISION_SUMMARY") == "1"
+        objective = os.environ.get("GENEPLB_EXPERIMENT_SHARE_OBJECTIVE")
+        if objective not in (None, "rows", "time", "builtin-time") or (
+            objective is not None and not self.measure_decisions
+        ):
+            raise ValueError(
+                "Share-objective experiment requires explicit rows/time and decision summary"
+            )
+        identity = os.environ.get("GENEPLB_EXPERIMENT_BUILTIN_MODEL_IDENTITY")
+        if identity is not None or objective == "builtin-time":
+            fields = (
+                "per_active_slot_us",
+                "per_extra_tile_us",
+                "per_row_us",
+                "hot_slot_extra_tile_us",
+                "scale",
+                "route_us",
+                "tile_rows",
+            )
+            actual = {key: getattr(config.model, key) for key in fields}
+            if (
+                objective not in ("rows", "builtin-time")
+                or config.model.scales
+                or config.model.time_shares
+                or identity != json.dumps(actual, sort_keys=True, separators=(",", ":"))
+            ):
+                raise ValueError("Builtin share experiment model identity differs")
+        if objective == "builtin-time":
+            config = dataclasses.replace(
+                config, model=dataclasses.replace(config.model, time_shares=True)
+            )
+        elif objective == "rows":
+            config = dataclasses.replace(
+                config,
+                model=dataclasses.replace(
+                    config.model,
+                    time_shares=False,
+                    scales=tuple((*entry[:-1], False) for entry in config.model.scales),
+                ),
+            )
+        elif objective == "time" and (
+            not config.model.time_shares or any(not entry[-1] for entry in config.model.scales)
+        ):
+            raise ValueError("Time-objective experiment requires an already priced time model")
         self.config = config
         self.stats = stats
         self.layout = np.array(config.home_layouts, dtype=np.int64)
@@ -191,6 +211,8 @@ class _Decider:
         close, growth, steps_left, got = self.awaiting_copy.pop(window)
         self.copy_samples += [(apply_call, ms / got) for _, n, ms in agreed_timings(per_rank) if n]
         self.forwards = self.next_forwards or self.forwards
+        summary = {} if self.measure_decisions else None
+        snapshot_summary(summary, copy_feedback=rows, max_receiver_copies=got)
         plan = self.evaluations.plan(
             apply_call,
             close,
@@ -199,9 +221,11 @@ class _Decider:
             [(group, *timing) for group, timing in sorted(self.install_timings.items())],
             growth,
             steps_left,
+            summary=summary,
         )
         self.open_call = apply_call + plan.open_after
-        return ("schedule", window + 1, self.open_call, apply_call, plan, self.forwards)
+        message = ("schedule", window + 1, self.open_call, apply_call, plan, self.forwards)
+        return (*message, summary) if summary is not None else message
 
     def decide(self, window: int) -> LayoutUpdate:
         cfg = self.config
@@ -219,6 +243,11 @@ class _Decider:
         if (tail["stats_copy_ms"] > 0).all():
             self.stats_copies.append(float(tail["stats_copy_ms"].max()))
         update = LayoutUpdate(window)
+        summary = (
+            {"status": "invalid_forward", "share_solve": None} if self.measure_decisions else None
+        )
+        if summary is not None:
+            update.summary = {"window": window, "diagnostics": summary}
         self.awaiting_copy[window] = (close, None, None, 0)  # until the window gives a decision
         forwards = stats[:, layers * experts : layers * (experts + 1)].astype(np.float64)
         if forwards.min() < 1:  # a rank counted no forward of some layer: this window gives no rows
@@ -232,12 +261,20 @@ class _Decider:
         if per_forward > 0.0:
             self.next_forwards = window_forwards(per_forward, experts)
         if sizing:
+            if summary is not None:
+                summary["status"] = "initial_sizing"
             return update
         total = {name: float(values.astype(np.float64).sum()) for name, values in tail.items()}
         steps_left = None
         if min(total["accepted"], total["requests"]) > 0:
             per_step = total["accepted"] / total["requests"]  # tokens a request accepts per step
             steps_left = total["remaining"] / per_step / total["requests"]
+        snapshot_summary(
+            summary,
+            steps_left=steps_left,
+            planned_open_call=self.open_call,
+            progress_totals={key: total[key] for key in ("remaining", "requests", "accepted")},
+        )
         # A batch that changed between two closes more than it ever did (a steady batch never does, a
         # draining one keeps doing so) is priced where the new layouts serve it: the requests at this
         # close carried a window ahead at that rate, over their mean across the window.
@@ -252,7 +289,28 @@ class _Decider:
         applied_window = stats[:, layers * (experts + 1) : layers * (experts + 2)].min(0)
         planned = np.flatnonzero(self.committed <= applied_window)
         # The busiest rank's rows per forward size the CUDA graph bucket the steps pad to.
-        model = cfg.model.at(float((routed.sum(2) / forwards).mean(1).max()))
+        query_rows = float((routed.sum(2) / forwards).mean(1).max())
+        model = cfg.model.at(query_rows)
+        if summary is not None:
+            completed = {"rows": 0, "time": 0}
+            names = (
+                "per_active_slot_us",
+                "per_extra_tile_us",
+                "per_row_us",
+                "hot_slot_extra_tile_us",
+                "scale",
+                "route_us",
+                "tile_rows",
+            )
+            summary.update(
+                status="evaluated",
+                share_solve=dict(
+                    query_rows=query_rows,
+                    time_shares=bool(model.time_shares),
+                    model={n: getattr(model, n) for n in names},
+                    completed_calls=completed,
+                ),
+            )
         self.evaluations.model = model
         new_layout = np.empty((len(planned), slots), dtype=np.int64)
         new_shares, resolved = np.empty((2, len(planned), slots))
@@ -263,7 +321,11 @@ class _Decider:
             plan = plan_layout(rows[layer], geometry, home[i], installed[i], self.active)
             new_layout[i] = plan.layout
             new_shares[i] = solve_shares(rows[layer], new_layout[i], geometry, model)
+            if summary is not None:
+                completed["time" if model.time_shares else "rows"] += 1
             resolved[i] = solve_shares(rows[layer], installed[i], geometry, model)
+            if summary is not None:
+                completed["time" if model.time_shares else "rows"] += 1
             # The latest kept window that neither the installed layout (planned on the window the
             # layer was committed in) nor the new one (planned on this window) was planned on, at
             # this window's batch; a layer without one keeps only this window's gains.
@@ -273,11 +335,17 @@ class _Decider:
         # Shares solved again on the installed layouts replace the old ones where they gain on both
         # windows: the layers that do not install get them without a copy, the candidates gain on them.
         refresh = np.full(len(planned), True)
-        for load in (rows[planned], previous_load):
+        for label, load in zip(("refresh_now", "refresh_before"), (rows[planned], previous_load)):
             old = (load, installed, self.shares[planned])
-            refresh &= evaluate_gains(*old, installed, resolved, model, geometry) > 0.0
+            refresh_gain = evaluate_gains(
+                *old, installed, resolved, model, geometry, summary, label
+            )
+            snapshot_summary(summary, **{label + "_ms": refresh_gain})
+            refresh &= refresh_gain > 0.0
         current = (rows[planned], installed, np.where(refresh[:, None], resolved, old[2]))
-        gains = evaluate_gains(*current, new_layout, new_shares, model, geometry)
+        gains = evaluate_gains(
+            *current, new_layout, new_shares, model, geometry, summary, "candidate_now"
+        )
         # A layer's copy: its busiest receiving GPU's replicas at the lower median of the copy times per
         # replica within the steps left (one slow copy prices nothing out; the start-up one counts).
         fresh = (new_layout >= 0) & (new_layout != installed)
@@ -287,24 +355,50 @@ class _Decider:
         # The home layout is a candidate too: retiring the replicas copies nothing, so the plan stays
         # only where it gains more than the home layout, net of a layer's copy over the steps left.
         home_shares = (home >= 0).astype(np.float64)
-        home_gains = evaluate_gains(*current, home, home_shares, model, geometry)
+        home_gains = evaluate_gains(
+            *current, home, home_shares, model, geometry, summary, "home_now"
+        )
         left, copy = steps_left or 0.0, (per_replica or 0.0) * copied.max(1, initial=0)
+        snapshot_summary(
+            summary,
+            candidate_now_ms=gains,
+            home_now_ms=home_gains,
+            per_replica_ms=per_replica,
+            copy_ms=copy,
+        )
         to_home = (home_gains > 0.0) & (home_gains * left >= gains * left - copy)
         # Both candidates must also gain on that window, and the plan beat the home layout there.
         earlier = (previous_load, *current[1:])
-        plan_gains = evaluate_gains(*earlier, new_layout, new_shares, model, geometry)
-        back_gains = evaluate_gains(*earlier, home, home_shares, model, geometry)
+        plan_gains = evaluate_gains(
+            *earlier, new_layout, new_shares, model, geometry, summary, "candidate_before"
+        )
+        back_gains = evaluate_gains(
+            *earlier, home, home_shares, model, geometry, summary, "home_before"
+        )
         to_home |= (home_gains > 0.0) & (back_gains * left >= plan_gains * left - copy)
+        snapshot_summary(summary, candidate_before_ms=plan_gains, home_before_ms=back_gains)
         gains, home_gains = np.minimum(gains, plan_gains), np.minimum(home_gains, back_gains)
+        snapshot_summary(summary, candidate_gain_ms=gains, home_gain_ms=home_gains)
         new_layout[to_home], new_shares[to_home] = home[to_home], home_shares[to_home]
         gains[to_home] = home_gains[to_home]
         gain = dict(zip(planned.tolist(), gains.tolist()))
         retire = [layer for layer in planned[to_home].tolist() if gain.pop(layer) * left > 0.0]
         chosen = choose_layers_to_install(gain, steps_left, dict(zip(planned.tolist(), copy)))
+        snapshot_summary(summary, payback_eligible=chosen.copy())
         if per_replica is None:
             # No copy has been timed yet: install the best layer alone to time one.
             chosen = chosen[:1]
         chosen += retire  # a retirement copies nothing: it pays as soon as it gains
+        snapshot_summary(
+            summary,
+            layers=planned,
+            refresh=refresh,
+            to_home=to_home,
+            admission_gain_ms=gains,
+            chosen=chosen,
+            retire=retire,
+            copy_price_missing=per_replica is None,
+        )
         growth = self.evaluations.read_cost(
             range(layers), rows, self.layout, self.shares, self.open_call
         )
@@ -351,12 +445,7 @@ def serve(conn: Connection) -> None:
 
 
 class DecisionProcess:
-    """The decision process of one rank: a fresh interpreter without MPI or a GPU.
-
-    It shares ``stats`` (``[ep_size, window_stats_size]`` float32, which the all-gather fills) with
-    this process and runs ``decision_main.py``, which imports numpy, torch and this module but not
-    ``tensorrt_llm``, and loads the torch op libraries this process loaded.
-    """
+    """One rank's fresh interpreter without MPI/GPU; shares gathered stats and loads our ops."""
 
     def __init__(self, config: DecisionConfig) -> None:
         size = window_stats_size(len(config.home_layouts), config.geometry.num_experts)
@@ -399,10 +488,7 @@ class DecisionProcess:
 
 
 class _WorkerThread(threading.Thread):
-    """Runs blocking jobs in order; results go to ``inbox``, a failure is raised by the main thread.
-
-    ``jobs.join()`` waits until every posted job ran.
-    """
+    """Ordered blocking jobs; inbox carries results/errors, and jobs.join waits for completion."""
 
     def __init__(self) -> None:
         super().__init__(name="adaptive-eplb-worker", daemon=True)
@@ -427,21 +513,9 @@ class _WorkerThread(threading.Thread):
 
 
 class AdaptiveRuntime:
-    """Statistics windows, decisions and installs of all balanced layers of one rank.
-
-    ``gather(send, rows, leave)`` all-gathers ``send`` (the window statistics of this rank, or a
-    float64 :data:`ROW`) into ``rows``, one per EP rank, until ``leave`` is set; ``tables`` are the
-    layers' ``[L, 2 * (experts + slots)]`` route tables and ``statistics`` their
-    :func:`~.policy.statistics_buffers`.
-
-    One update is in flight at a time: its route tables apply before the next window opens, and the
-    worker waits for the statistics copy of that window's close before it gathers it. The pinned
-    host tables, the applied windows and the copies into free slots rely on that order.
-
-    A failure (the worker thread's, the decision process's, or ranks that decided a window
-    differently) stops the runtime instead of the server: it is logged once, no further window
-    opens and no further update applies, and the route tables in use stay. They stay valid, as an
-    update copies experts only into slots those tables do not route to.
+    """One rank's windows: gather statistics/ROW from every rank, then apply one update at a time.
+    Statistics copies finish before gather; tables apply before the next window opens.
+    Errors stop further windows/installs, retaining valid tables and the server; copies use free slots.
     """
 
     def __init__(
@@ -534,8 +608,7 @@ class AdaptiveRuntime:
         self.decision.close()
 
     def counters(self) -> dict[str, int]:
-        """The windows closed, the installs applied (updates with new route tables) and the layers
-        they installed, since the runtime started."""
+        """Counts of closed windows, applied route-table updates and installed layers."""
         return dict(
             windows=self.closed_windows,
             installs=self.installs,
@@ -543,11 +616,8 @@ class AdaptiveRuntime:
         )
 
     def add_request_progress(self, num_requests: int, progress: GenerationProgress) -> None:
-        """Keep the progress of a step's ``num_requests`` generation requests, asked for by
-        :attr:`wants_request_progress` from the call before a window closes. ``progress(start,
-        stop)`` gives the tokens the requests ``[start, stop)`` still have to produce, how many of
-        them are requests and the tokens they accept per step; the worker thread reads the latest
-        one kept when the window closes."""
+        """Keep the latest pre-close progress callback: remaining tokens, requests and accepted/step
+        for requests [start, stop); the worker reads it after close."""
         self._progress = (num_requests, progress)
         self.wants_request_progress = False
 
@@ -585,7 +655,7 @@ class AdaptiveRuntime:
         while worker.inbox:
             message = worker.inbox.popleft()
             if message[0] == "schedule":
-                _, self.window, self.open_at, apply_call, plan, self.window_forwards = message
+                _, self.window, self.open_at, apply_call, plan, self.window_forwards = message[:6]
                 self._event(
                     "scheduled",
                     window=self.window,
@@ -593,6 +663,7 @@ class AdaptiveRuntime:
                     next_open=self.open_at,
                     plan=plan,
                     forwards=self.window_forwards,
+                    summary=message[6] if len(message) > 6 else None,
                 )
             elif message[0] == "copied":
                 self._copies_done(*message[1:])
@@ -605,6 +676,7 @@ class AdaptiveRuntime:
                     moved=update.moved,
                     tables=update.tables,
                     copy_items=update.copy_items,
+                    **({"summary": update.summary} if hasattr(update, "summary") else {}),
                 )
                 worker.post(lambda update=update: self._install(update))
                 self.gathers_posted += 1
@@ -622,8 +694,7 @@ class AdaptiveRuntime:
             self.wants_request_progress = True
 
     def _event(self, event: str, **data: object) -> None:
-        """Log an event of the windows, decisions and installs at debug level: its scalars and
-        layer lists (tables, copies and statistics are not printed)."""
+        """Log window/decision/install scalars and layer lists, excluding tables, copies and stats."""
         from tensorrt_llm.logger import logger
 
         shown = {k: v for k, v in data.items() if not isinstance(v, (dict, np.ndarray))}
@@ -704,9 +775,8 @@ class AdaptiveRuntime:
         return ("copied", update, rows.numpy())
 
     def _apply_tables(self, call: int, update: LayoutUpdate) -> None:
-        """Install the update's route tables with one timed copy of the span of layers it changes
-        (the other layers in it hold the same tables already; none for an update without tables);
-        later forwards route by them."""
+        """Time one copy of the changed layer span, keeping other tables in it; no copy if empty.
+        Subsequent forwards use the installed tables."""
         # The previous copy from the pinned host tables finished before the window after it closed.
         assert not self._apply_events, "the previous route tables' copy is still in flight"
         host_tables = self._host_tables_np
