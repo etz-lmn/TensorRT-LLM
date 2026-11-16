@@ -2397,7 +2397,7 @@ class _ChunkRoutes:
 
 
 @pytest.mark.parametrize(
-    "mode", ["per_layer_dynamic", "standard", "off", "deferred", "deferred_recording"]
+    "mode", ["per_layer_dynamic", "standard", "off", "deferred", "deferred_recording", "partials"]
 )
 @pytest.mark.parametrize("has_dtype_hint", [False, True])
 def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, has_dtype_hint):
@@ -2405,6 +2405,12 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
     trace = []
     forwarded_dtype = []
     labels = []
+    partials = mode == "partials"
+    if partials:
+        mode = "deferred"
+
+    class Partials:
+        parts = SimpleNamespace(shape=(2, 4, 24))
 
     class ExpertStatistic:
         @staticmethod
@@ -2435,16 +2441,24 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
         "get_active_route_capture": lambda: None,
         "torch": SimpleNamespace(int32="int32", float32="float32"),
         "Fp4QuantizedTensor": type("Fp4QuantizedTensor", (), {}),
-        "RouterLogitPartials": type("RouterLogitPartials", (), {}),
+        "RouterLogitPartials": Partials,
         "MoERunContext": lambda **kwargs: SimpleNamespace(**kwargs),
     }
     _extract_function(source, "_record_routes", namespace)
     _extract_function(source, "_leading_rows", namespace)
     _extract_function(source, "_routes_recorded", namespace)
     _extract_function(source, "_num_rows", namespace)
-    _extract_class(source, "MoEScheduler", {"_try_fused_route_quant"}, namespace)
+    base_methods = {"_try_fused_route_quant", "_route_quant_eligible", "_partials_route"}
+    available = {
+        n.name for n in ast.walk(ast.parse(source.read_text())) if isinstance(n, ast.FunctionDef)
+    }
+    _extract_class(source, "MoEScheduler", base_methods & available, namespace)
     scheduler_cls = _extract_class(
-        source, "FusedCommMoEScheduler", {"_forward_chunk"}, namespace, bases=("MoEScheduler",)
+        source,
+        "FusedCommMoEScheduler",
+        {"_forward_chunk", "routes_from_logit_partials"},
+        namespace,
+        bases=("MoEScheduler",),
     )
 
     plan = SimpleNamespace(reserved_sms=4)
@@ -2497,7 +2511,8 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
         _warmup_placement_route_counters=lambda row_offset: None,
         _load_balancer_count_warmup=lambda *args: None,
         backend=SimpleNamespace(
-            fused_route_quant_enabled=False,
+            fused_route_quant_enabled=partials,
+            takes_router_logit_partials=lambda: True,
             quantize_input=lambda x, **kwargs: trace.append(("quantize", kwargs)) or ("x", "sf"),
             set_adaptive_launch_tokens=lambda tokens: trace.append(("bucket", tokens)),
             set_adaptive_launch_output_dtype=lambda dtype: forwarded_dtype.append(dtype),
@@ -2509,15 +2524,67 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
     if not has_dtype_hint:
         delattr(moe.backend, "set_adaptive_launch_output_dtype")
     scheduler.moe = moe
-    x = SimpleNamespace(shape=(4, 16))
+    x = SimpleNamespace(shape=(4, 16), dtype="bf16")
+    if partials:
 
-    out = scheduler._forward_chunk(
-        x,
-        SimpleNamespace(shape=(4, 24)),
-        output_dtype="bf16",
-        all_rank_num_tokens=[4, 6],
-        do_finalize=True,
-    )
+        def route_only(logits, *args):
+            assert isinstance(logits, Partials)
+            trace.append("sum_partials_route")
+            return _ChunkRoutes("logical"), SimpleNamespace(dtype="float32"), None
+
+        backend_source = _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py"
+        if "def route_from_logit_partials(" in backend_source.read_text():
+            impl = _extract_class(
+                backend_source,
+                "TrtllmCutedslMegaMoeNvfp4Impl",
+                {"route_from_logit_partials"},
+                {"dsv4_route": route_only, "torch": namespace["torch"]},
+            )()
+            impl.routing_method = SimpleNamespace(
+                e_score_correction_bias=None, top_k=6, routed_scaling_factor=2.5
+            )
+            impl.hidden_size = 16
+            moe.backend.route_from_logit_partials = impl.route_from_logit_partials
+        interface = _extract_class(
+            _TORCH_ROOT / "moe/fused_moe/interface.py",
+            "MoE",
+            {"_warmup_placement_route_counters", "_load_balancer_count_warmup"},
+            {},
+        )()
+        interface._warmup_placement_index = None
+        moe._warmup_placement_route_counters = interface._warmup_placement_route_counters
+        moe._load_balancer_count_warmup = interface._load_balancer_count_warmup
+
+        class Experts:
+            routes_from_logit_partials = scheduler.routes_from_logit_partials
+
+            def __call__(self, x, logits, **kwargs):
+                kwargs.pop("use_dp_padding")
+                return scheduler._forward_chunk(x, logits, **kwargs)
+
+        requested = []
+
+        def gate(x, partials=False):
+            requested.append(partials)
+            return Partials() if partials else SimpleNamespace(shape=(4, 24))
+
+        producer = _extract_class(
+            _TORCH_ROOT / "models/modeling_deepseekv4.py",
+            "DeepseekV4MoE",
+            {"compute_routed_output"},
+            {},
+        )()
+        producer.use_dp, producer.experts, producer.gate = False, Experts(), gate
+        out = producer.compute_routed_output(x, None, None, [4, 6], True)
+        assert requested == [True]
+    else:
+        out = scheduler._forward_chunk(
+            x,
+            SimpleNamespace(shape=(4, 24)),
+            output_dtype="bf16",
+            all_rank_num_tokens=[4, 6],
+            do_finalize=True,
+        )
 
     assert out == "out"
     assert forwarded_dtype == (["bf16"] if has_dtype_hint else [])
@@ -2560,6 +2627,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
         expected = [
             "start_wait_gpu",
             ("bucket", 6),
+            *(["sum_partials_route"] if partials else []),
             "done_wait_gpu",
             ("update_statistic", "logical"),
             "wait_statistic",
@@ -2975,3 +3043,168 @@ def test_live_plane_binding_restores_per_expert_scalar_defaults():
         [("fc31_alpha", 1.0), ("fc2_alpha", 1.0), ("fc1_norm_const", 1.0)]
     )
     assert all(getattr(module, name).data is alias for name, alias in zip(names, aliases))
+
+
+def test_adp_moe_rows_use_owner_snapshot_and_preserve_missing():
+    """Fanout must not copy rank zero's MoE counts to other owners or idle ranks."""
+    import importlib.util
+    import json
+    import re
+
+    path = _TORCH_ROOT / "pyexecutor/scheduler/rank_state.py"
+    spec = importlib.util.spec_from_file_location("_test_adp_moe_rank_state", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        source = _TORCH_ROOT / "pyexecutor/adp_iter_stats.py"
+        tree = ast.parse(source.read_text())
+        ns = dict(vars(module), json=json, re=re)
+        constants = [n for n in tree.body if isinstance(n, ast.Assign)]
+        exec(compile(ast.Module(body=constants, type_ignores=[]), str(source), "exec"), ns)
+        for name in ("_kv_cache_stats_text", "_specdec_stats_text"):
+            _extract_function(source, name, ns)
+        _extract_function(
+            _TORCH_ROOT / "pyexecutor/iteration_stats_json.py", "iteration_stats_row", ns
+        )
+        ns["append_kv_cache_iteration_stats"] = lambda row, stats: None
+        buffer = _extract_class(source, "ADPIterStatsBuffer", {"_rank_rows"}, ns)()
+        stats = SimpleNamespace(
+            to_json_str=lambda: json.dumps(
+                dict(inflightBatchingStats={}, kvCacheStats=None, specDecodingStats=None)
+            )
+        )
+        buffer._make_rank_iter_stats = lambda original, state: stats
+        states = [module.RankState(rank=rank) for rank in range(4)]
+        for state in states[:3]:
+            state.iter_stats.moe_load_balancer_stats = module.RankMoeLoadBalancerStats(
+                state.rank + 1, state.rank * 2, state.rank * 3
+            )
+        rows = [
+            json.loads(row)
+            for row in buffer._rank_rows(
+                SimpleNamespace(specdec_stats=None), states, None, None, {}
+            )
+        ]
+        for rank in range(3):
+            assert rows[rank]["moeLoadBalancerStats"] == dict(
+                windows=rank + 1, installs=rank * 2, installedLayers=rank * 3
+            )
+        assert "moeLoadBalancerStats" not in rows[3]
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize(
+    "blocked",
+    [None, "aux", "input_weight", "dynamic", "replica", "disabled", "backend", "consumer"],
+)
+def test_partial_logits_capability_matches_the_consumer(staged, blocked):
+    source = _TORCH_ROOT / "moe/fused_moe/moe_scheduler.py"
+    ns = {"Fp4QuantizedTensor": type("Fp4QuantizedTensor", (), {})}
+    _extract_class(
+        source,
+        "MoEScheduler",
+        {"_try_fused_route_quant", "_route_quant_eligible", "_partials_route"},
+        ns,
+    )
+    cls = _extract_class(
+        source, "FusedCommMoEScheduler", {"routes_from_logit_partials"}, ns, bases=("MoEScheduler",)
+    )
+    seen = []
+    backend = SimpleNamespace(
+        fused_route_quant_enabled=blocked != "disabled",
+        takes_router_logit_partials=lambda: blocked != "backend",
+        try_fused_route_quant=lambda *args: seen.append("fused") or "fused",
+    )
+    if blocked != "consumer":
+        backend.route_from_logit_partials = lambda logits: seen.append("route_only") or "route_only"
+    scheduler = cls()
+    scheduler.moe = SimpleNamespace(
+        backend=backend,
+        apply_router_weight_on_input=blocked == "input_weight",
+        _using_dynamic_load_balancer=lambda: blocked == "dynamic",
+        _load_balancer_uses_replica_plan=lambda: blocked == "replica",
+        layer_load_balancer=SimpleNamespace(stages_routes=staged),
+    )
+    aux = object() if blocked == "aux" else None
+    expected = blocked is None or (blocked == "consumer" and not staged)
+    assert scheduler.routes_from_logit_partials(aux) == expected
+    fused = scheduler._try_fused_route_quant(None, None, aux)
+    assert (fused is not None) == (
+        not staged and blocked not in {"aux", "input_weight", "dynamic", "replica", "disabled"}
+    )
+    route_only = scheduler._partials_route(aux)
+    assert (route_only is not None) == (staged and expected)
+    if route_only:
+        assert route_only(None) == "route_only"
+    assert "fused" not in seen if staged else "route_only" not in seen
+
+
+@pytest.mark.parametrize("splits", [None, 0, 1, 2, 4, 8])
+def test_route_only_wrapper_passes_partial_splits_to_the_existing_kernel(monkeypatch, splits):
+    class Tensor:
+        dtype, device = "fp32", "cpu"
+
+        def __init__(self, shape):
+            self.shape = shape
+
+        def dim(self):
+            return len(self.shape)
+
+        def stride(self, axis):
+            return 1 if axis == len(self.shape) - 1 else self.shape[-1]
+
+        def __getitem__(self, index):
+            return Tensor(self.shape[1:])
+
+    torch = SimpleNamespace(
+        Tensor=Tensor, float32="fp32", int32="i32", empty=lambda shape, **kw: Tensor(shape)
+    )
+    partial_module = ModuleType("tensorrt_llm._torch.custom_ops.router_logit_partials")
+    partial_module.RouterLogitPartials = _extract_class(
+        _TORCH_ROOT / "custom_ops/router_logit_partials.py",
+        "RouterLogitPartials",
+        None,
+        {"torch": torch},
+    )
+    monkeypatch.setitem(sys.modules, partial_module.__name__, partial_module)
+    calls = []
+
+    def compile_kernel(*args, **kwargs):
+        calls.append(kwargs)
+        return lambda *args: calls.append(args[0])
+
+    ns = dict(
+        torch=torch,
+        _compile=compile_kernel,
+        _local_range=lambda *args: (0, 24),
+        _cta_scoring=lambda *args: False,
+        TRTLLM_ENABLE_PDL=False,
+        ROUTING_TABLE_TILES=(128,),
+    )
+    route = _extract_function(
+        _TORCH_ROOT / "moe/kernels/blackwell/dsv4_route_quant.py", "dsv4_route", ns
+    )
+    tensor = Tensor((4, 24) if splits is None else (splits, 4, 24))
+    logits = tensor if splits is None else partial_module.RouterLogitPartials(tensor)
+    if splits == 0:
+        with pytest.raises(ValueError, match="at least one"):
+            route(logits, None, 6, 2.5, "fp32", 16)
+        assert not calls
+        return
+    ids, weights, tables = route(logits, None, 6, 2.5, "fp32", 16)
+    assert ids.shape == weights.shape == (4, 6) and tables is None
+    assert calls[0]["splits"] == (splits or 1) and calls[0]["quant"] is False
+    assert calls[1].shape == ((4, 24) if splits in (None, 1) else tensor.shape)
+    if splits != 1:
+        assert calls[1] is tensor
+    with pytest.raises(ValueError, match="takes"):
+        route(Tensor((2, 4, 24)), None, 6, 2.5, "fp32", 16)
+    with pytest.raises(TypeError, match="takes"):
+        route(object(), None, 6, 2.5, "fp32", 16)
+    if splits is not None:
+        tensor.stride = lambda axis: 1
+        with pytest.raises(ValueError, match="contiguous"):
+            route(logits, None, 6, 2.5, "fp32", 16)

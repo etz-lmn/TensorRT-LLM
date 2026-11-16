@@ -725,7 +725,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             is_last_call: Whether this is the last call for the same weights
             ignore_allreduce: Whether to ignore allreduce, if True, only update local statistics, need call _load_balancer_get_local_statistic_tensor to get the local statistic tensor and then do external allgather and then call _load_balancer_update_statistic_with_gathered_statistic to update the global statistics. NVLINKTwoSided supports this.
         """
-        if self._using_dynamic_load_balancer():
+        if self._load_balancer_records_statistics():
             if ignore_allreduce:
                 self.layer_load_balancer.update_local_statistic(
                     token_selected_experts,
@@ -817,6 +817,11 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             kwargs["overlap_fn"] = overlap_fn
         return self.layer_load_balancer.route(token_selected_experts, use_dp,
                                               **kwargs)
+
+    def _load_balancer_records_statistics(self) -> bool:
+        """Whether the layer's load balancer records the routed experts."""
+        return bool(self.layer_load_balancer
+                    and self.layer_load_balancer.records_statistics())
 
     def _load_balancer_uses_replica_plan(self) -> bool:
         """Whether routing is produced by the per-layer dynamic device planner."""
