@@ -2126,10 +2126,14 @@ class DeepseekV4MoE(nn.Module):
             router_logits = self.gate(hidden_states, partials=True)
         else:
             router_logits = self.gate(hidden_states)
-        if moe_hooks is not None and isinstance(
-            getattr(self.experts, "scheduler", None), FusedCommMoEScheduler
+        scheduler = getattr(self.experts, "scheduler", None)
+        if (
+            moe_hooks is not None
+            and isinstance(scheduler, FusedCommMoEScheduler)
+            and not scheduler.forks_after_staging()
         ):
-            # The fused MoE launch also routes: a forked shared expert starts here, ahead of it.
+            # The fused MoE launch also routes: a forked shared expert starts here, ahead of it
+            # (or, for a load balancer that stages its routes, once they are staged).
             moe_hooks.run_post_routing()
 
         # When ENABLE_PERFECT_ROUTER=1, the FusedMoE backend swaps router_logits

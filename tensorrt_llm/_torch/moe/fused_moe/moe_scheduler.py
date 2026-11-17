@@ -1600,12 +1600,24 @@ class FusedCommMoEScheduler(MoEScheduler):
                 output_dtype=output_dtype,
                 do_finalize=do_finalize,
                 routing_aux_chunks=routing_aux_chunks,
+                moe_hooks=moe_hooks,
             )
         if not outputs:
             cast_dtype = output_dtype if output_dtype is not None else x.dtype
             return x.new_empty((0, x.shape[1]), dtype=cast_dtype)
         output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
         return self._as_rank_partial_if_reduced_externally(output)
+
+    def forks_after_staging(self) -> bool:
+        """Whether a shared expert the caller forks (``MoEForwardHooks.post_routing``) starts once
+        the load balancer's routes are staged, ahead of the dispatch, instead of right after the
+        router gate: its first GEMM takes every SM, so a staging launch behind it waits for it."""
+        moe = self.moe
+        return (
+            bool(getattr(moe.layer_load_balancer, "stages_routes", False))
+            and not moe._load_balancer_uses_replica_plan()
+            and bool(getattr(moe.backend, "runs_after_staging", False))
+        )
 
     def _as_rank_partial_if_reduced_externally(self, output: torch.Tensor) -> torch.Tensor:
         """Match the external-comm output contract under attention TP (TEP).
@@ -1733,6 +1745,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         output_dtype: Optional[torch.dtype],
         do_finalize: bool,
         routing_aux_chunks: Optional[List[torch.Tensor]] = None,
+        moe_hooks: Optional[MoEForwardHooks] = None,
     ) -> List[torch.Tensor]:
         """Drive the per-chunk kernel launches, padding zero-token chunks.
 
@@ -1779,6 +1792,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 input_ids=input_ids_chunk,
                 row_offset=row_offset,
                 routing_aux=routing_aux_chunk,
+                moe_hooks=moe_hooks,
             )
             row_offset += x_chunk.shape[0]
             outputs.append(out_chunk)
@@ -1797,6 +1811,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         input_ids: Optional[torch.Tensor] = None,
         row_offset: int = 0,
         routing_aux: Optional[torch.Tensor] = None,
+        moe_hooks: Optional[MoEForwardHooks] = None,
     ) -> torch.Tensor:
         """Run a single chunk through the fused-comm backend.
 
@@ -1934,6 +1949,13 @@ class FusedCommMoEScheduler(MoEScheduler):
         statistic_allreduce_pending = False
         fused_prepare = getattr(moe.backend, "supports_fused_prepare", lambda: False)()
         deferred_route = None
+        # A forked shared expert left for after the staging (forks_after_staging) starts once the
+        # slots are staged: with the staging launch (deferred_route) inside run_moe, else before it.
+        after_staging = (
+            moe_hooks.run_post_routing
+            if moe_hooks is not None and self.forks_after_staging()
+            else None
+        )
         if uses_replica_plan:
             token_selected_experts = _record_routes(moe, token_selected_experts, moe.num_experts)
             token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
@@ -2021,6 +2043,9 @@ class FusedCommMoEScheduler(MoEScheduler):
         # num_slots in quantization.py).
         # Fused-comm backends own the EP exchange, so there is no comm plan:
         # nothing outside the fused kernel decided anything about this forward.
+        if after_staging is not None and deferred_route is None:
+            after_staging()
+            after_staging = None
         out = moe.backend.run_moe(
             MoERunContext(
                 token_selected_experts=token_selected_slots,
@@ -2030,6 +2055,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 output_dtype=output_dtype,
                 replica_plan=replica_plan,
                 route=deferred_route,
+                after_staging=after_staging,
             )
         )
 

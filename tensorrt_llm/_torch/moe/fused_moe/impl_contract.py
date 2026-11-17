@@ -899,6 +899,9 @@ class MoERunContext:
     # produced by routing when the impl's ``try_route_with_sort`` routed this
     # forward: the ``moe_sort`` tables of ``token_selected_experts``.
     sort_tables: Optional[MoESortTables] = None
+    # work the caller forked to start once ``route`` has staged the slots, before the dispatch
+    # launch (a shared expert); an impl that takes it declares ``runs_after_staging``
+    after_staging: Optional[Callable[[], None]] = None
 
 
 def require_comm_plan(impl: object, ctx: MoERunContext) -> MoECommPlan:
