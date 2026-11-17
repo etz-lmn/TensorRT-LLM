@@ -657,12 +657,17 @@ def test_layers_go_home_without_a_copy_once_their_rows_even_out(monkeypatch):
         decider.schedule(w, np.array([[10 + 20 * w, 0, 0.0, 0]] * R))
 
 
-def test_a_draining_batch_prices_the_rows_one_window_ahead(monkeypatch):
+@pytest.mark.parametrize("before,after,ahead", [(40, 2, 0.2), (48, 121.5, 243.0)])
+def test_a_draining_batch_prices_the_rows_one_window_ahead(monkeypatch, before, after, ahead):
     monkeypatch.setattr(rt, "solve_shares", even_split)
-    decider = after_window_0(requests=40)
-    # A fall from 80 to 4 requests forecasts too few rows to repay replica weight streams.
-    window_stats(decider.stats, live=0, requests=2)
+    decider = after_window_0(requests=before)
+    # A rise from 96 to 243 requests is priced at the 243 requests at the close, not carried past them.
+    window_stats(decider.stats, live=0, requests=after)
     update = decider.decide(1)
+    assert decider.kept[-1][2] == pytest.approx(ahead)
+    if after > before:
+        return
+    # A fall from 80 to 4 requests forecasts too few rows to repay replica weight streams.
     assert sorted(update.tables) == [0, 1] and update.moved == [] and (decider.layout == HOME).all()
 
 
