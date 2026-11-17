@@ -280,11 +280,13 @@ class _Decider:
         current = (rows[planned], installed, np.where(refresh[:, None], resolved, old[2]))
         gains = evaluate_gains(*current, new_layout, new_shares, model, geometry)
         # A layer's copy: its busiest receiving GPU's replicas at the lower median of the copy times per
-        # replica within the steps left (one slow copy prices nothing out; the start-up one counts).
+        # replica of every timed copy (one slow copy prices nothing out; the start-up one counts). Not only
+        # those within the steps left: installs are rarer than that, which left the start-up copy, timed
+        # idle, the lower median of every install timed in service.
         fresh = (new_layout >= 0) & (new_layout != installed)
         copied = fresh.reshape(-1, geometry.ep_size, geometry.local_slots).sum(2)
-        recent = [ms for call, ms in self.copy_samples if call >= close - (steps_left or 0.0)]
-        per_replica = sorted(recent)[(len(recent) - 1) // 2] if recent else None
+        timed = sorted(ms for _, ms in self.copy_samples)
+        per_replica = timed[(len(timed) - 1) // 2] if timed else None
         # The home layout is a candidate too: retiring the replicas copies nothing, so the plan stays
         # only where it gains more than the home layout, net of a layer's copy over the steps left.
         home_shares = (home >= 0).astype(np.float64)
