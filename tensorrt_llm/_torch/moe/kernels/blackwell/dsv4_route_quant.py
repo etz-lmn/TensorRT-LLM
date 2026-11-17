@@ -5,7 +5,7 @@
 MXFP8 for a shared expert fused into the MegaMoE kernel."""
 
 import functools
-from typing import Optional, Union
+from typing import NamedTuple, Optional, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -44,6 +44,14 @@ ROUTING_TABLE_TILES = (8, 16, 32)
 
 # Bucket rows past the tokens that one CTA clears when the launch writes into a launch bucket.
 TAIL_ROWS_PER_CTA = 32
+
+# The adaptive mode picks slots as adaptive_eplb_route_into does (adaptiveEplbKernels.cu): a pick of a replicated expert
+# takes the copy its ordinal among the expert's picks in its split block points to. These values are part of that
+# route's result, not tuning: test_adaptive_eplb_fused_route_contract checks them against the route op.
+ADAPTIVE_SPLIT_BLOCK = 1024
+ADAPTIVE_BLOCK_MULTIPLIER = 0x9E3779B9
+ADAPTIVE_EXPERT_MULTIPLIER = 0x632BE5AB
+ADAPTIVE_RANK_MULTIPLIER = 0x85EBCA6B
 
 # A token's CTA scores its experts with every warp only for a bank of at least 256 experts and up to
 # 1280 tokens (b320 x 4), where it shortens the launch; otherwise one warp per token costs less.
@@ -200,6 +208,9 @@ class DSv4RouteNvfp4QuantKernel:
     ``[local_start, local_start + num_local)`` of an expert-parallel rank, numbered from 0. ``pdl``
     launches it as a programmatic dependent of the previous kernel. With ``splits`` > 1 the logits
     are K-chunk partials ``[splits, tokens, experts]``, summed s = 0 .. splits-1 as they load.
+    ``adaptive`` stages an adaptive EPLB layer's slots (``adaptive_eplb_route_into`` in the same launch): the
+    returned ids and weights stay the routing's, the bucket gets slots and weights masked by ``live_word``, and
+    ``adaptive_stats`` adds the live picks to the layer's statistics.
     """
 
     group_size = 16
@@ -222,6 +233,9 @@ class DSv4RouteNvfp4QuantKernel:
         pdl: bool = False,
         cta_scoring: bool = True,
         splits: int = 1,
+        adaptive: bool = False,
+        adaptive_stats: bool = False,
+        live_word: bool = False,
     ):
         warp = cute.arch.WARP_SIZE
         num_local = num_experts if num_local is None else num_local
@@ -238,6 +252,8 @@ class DSv4RouteNvfp4QuantKernel:
             or (remap and not staged)
             or (count_mask and not count)
             or (replicas and not remap)
+            or (adaptive and (not staged or remap or count or routing_tiles))
+            or ((adaptive_stats or live_word) and not adaptive)
         ):
             raise ValueError(
                 f"expected experts divisible by {warp} ({warp * ROUTING_TABLES_MAX_TOKENS} to "
@@ -277,6 +293,11 @@ class DSv4RouteNvfp4QuantKernel:
             raise ValueError(f"MXFP8 needs hidden divisible by {self.group_size * warp}")
         self.mxfp8 = mxfp8
         self.k_atoms = hidden_size // 128
+        self.adaptive = adaptive
+        self.adaptive_stats = adaptive_stats
+        self.live_word = live_word
+        # A split block is mapped in chunks of one pick per thread of the CTA.
+        self.map_chunks = ADAPTIVE_SPLIT_BLOCK // self.num_threads
 
     @cute.jit
     def __call__(
@@ -300,6 +321,15 @@ class DSv4RouteNvfp4QuantKernel:
         count_row_offset: Int32,
         x_fp8: Optional[cute.Tensor],
         x_sf8: Optional[cute.Tensor],
+        staged_weights: Optional[cute.Tensor],
+        route_table: Optional[cute.Tensor],
+        stats_rows: Optional[cute.Tensor],
+        stats_forwards: Optional[cute.Tensor],
+        stats_enabled: Optional[cute.Tensor],
+        live: Optional[cute.Tensor],
+        state: Optional[cute.Tensor],
+        ep_rank: Int32,
+        first: Int32,
         stream: cuda.CUstream,
     ):
         rows = self.num_rows(logits)
@@ -327,6 +357,15 @@ class DSv4RouteNvfp4QuantKernel:
             count_row_offset,
             x_fp8,
             x_sf8,
+            staged_weights,
+            route_table,
+            stats_rows,
+            stats_forwards,
+            stats_enabled,
+            live,
+            state,
+            ep_rank,
+            first,
         ).launch(
             grid=[rows, 1 + self.quant_ctas, 1],
             block=[self.num_threads, 1, 1],
@@ -357,6 +396,15 @@ class DSv4RouteNvfp4QuantKernel:
         count_row_offset: Int32,
         x_fp8: Optional[cute.Tensor],
         x_sf8: Optional[cute.Tensor],
+        staged_weights: Optional[cute.Tensor],
+        route_table: Optional[cute.Tensor],
+        stats_rows: Optional[cute.Tensor],
+        stats_forwards: Optional[cute.Tensor],
+        stats_enabled: Optional[cute.Tensor],
+        live: Optional[cute.Tensor],
+        state: Optional[cute.Tensor],
+        ep_rank: Int32,
+        first: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         row, part, _ = cute.arch.block_idx()
@@ -366,10 +414,11 @@ class DSv4RouteNvfp4QuantKernel:
             # hundreds of CTAs) is released only at exit, so it does not hold SMs the shared
             # expert's concurrent GEMMs need while this launch routes.
             griddepcontrol_wait()
+        if cutlass.const_expr(self.cta_scoring or self.adaptive):
+            smem = SmemAllocator()
         if cutlass.const_expr(self.cta_scoring):
             # Every token's (routing tables) or this CTA's token's selection keys and unbiased
             # scores.
-            smem = SmemAllocator()
             scored = self.scored_rows
             keys_s = smem.allocate_tensor(Int32, cute.make_layout(scored * self.num_experts))
             scores_s = smem.allocate_tensor(Float32, cute.make_layout(scored * self.num_experts))
@@ -386,6 +435,16 @@ class DSv4RouteNvfp4QuantKernel:
             nonzero_s = smem.allocate_tensor(
                 Int32, cute.make_layout(self.num_threads // cute.arch.WARP_SIZE)
             )
+        adapt = None
+        if cutlass.const_expr(self.adaptive):
+            # The split blocks this row completes, then the block's per-expert totals and running counts and one
+            # chunk's spread ids (adaptive_map).
+            done_s = smem.allocate_tensor(Int32, cute.make_layout(2))
+            hist_s = smem.allocate_tensor(Int32, cute.make_layout(self.num_experts))
+            seen_s = smem.allocate_tensor(Int32, cute.make_layout(self.num_experts))
+            chunk_s = smem.allocate_tensor(Int32, cute.make_layout(self.num_threads))
+            adapt = (staged_weights, route_table, stats_rows, stats_forwards, stats_enabled, live, state, ep_rank,
+                     first, done_s, hist_s, seen_s, chunk_s)
         if part == 0:
             if cutlass.const_expr(self.has_tables):
                 if row == 0:
@@ -421,6 +480,7 @@ class DSv4RouteNvfp4QuantKernel:
                         count_bound,
                         count_rows,
                         count_row_offset,
+                        adapt,
                     )
                 else:
                     if tidx < cute.arch.WARP_SIZE:
@@ -438,9 +498,15 @@ class DSv4RouteNvfp4QuantKernel:
                             count_bound,
                             count_rows,
                             count_row_offset,
+                            adapt,
                         )
+                if cutlass.const_expr(self.adaptive):
+                    self.adaptive_map(ids, staged_ids, tidx, adapt)
             elif cutlass.const_expr(self.staged):
-                self.clear_tail(self.num_rows(logits), staged_ids, weights, row, tidx)
+                if cutlass.const_expr(self.adaptive):
+                    self.clear_tail(self.num_rows(logits), staged_ids, staged_weights, row, tidx)
+                else:
+                    self.clear_tail(self.num_rows(logits), staged_ids, weights, row, tidx)
         else:
             if cutlass.const_expr(self.quant):
                 if row < x.shape[0]:
@@ -521,6 +587,7 @@ class DSv4RouteNvfp4QuantKernel:
         count_bound: Optional[cute.Tensor] = None,
         count_rows: Optional[cute.Tensor] = None,
         count_row_offset: Int32 = 0,
+        adapt=None,
     ):
         """Route token ``row`` with the CTA: every thread scores some experts, warp 0 picks."""
         warp_size = cute.arch.WARP_SIZE
@@ -562,6 +629,7 @@ class DSv4RouteNvfp4QuantKernel:
                 count_bound,
                 count_rows,
                 count_row_offset,
+                adapt,
             )
 
     @cute.jit
@@ -582,6 +650,7 @@ class DSv4RouteNvfp4QuantKernel:
         count_bound: Optional[cute.Tensor] = None,
         count_rows: Optional[cute.Tensor] = None,
         count_row_offset: Int32 = 0,
+        adapt=None,
     ) -> Int32:
         """Pick token ``row``'s experts with one warp from the keys and scores at ``base``; lane
         ``k < top_k`` returns pick ``k``. ``nonzero``: some logit of the row is non-zero."""
@@ -630,6 +699,7 @@ class DSv4RouteNvfp4QuantKernel:
             count_bound,
             count_rows,
             count_row_offset,
+            adapt,
         )
 
     @cute.jit
@@ -648,6 +718,7 @@ class DSv4RouteNvfp4QuantKernel:
         count_bound: Optional[cute.Tensor] = None,
         count_rows: Optional[cute.Tensor] = None,
         count_row_offset: Int32 = 0,
+        adapt=None,
     ) -> Int32:
         """Route token ``row`` with one warp, its scores in registers; lane ``k < top_k`` returns
         pick ``k``."""
@@ -714,6 +785,7 @@ class DSv4RouteNvfp4QuantKernel:
             count_bound,
             count_rows,
             count_row_offset,
+            adapt,
         )
 
     @cute.jit
@@ -733,6 +805,7 @@ class DSv4RouteNvfp4QuantKernel:
         count_bound: Optional[cute.Tensor],
         count_rows: Optional[cute.Tensor],
         count_row_offset: Int32,
+        adapt=None,
     ) -> Int32:
         """Write token ``row``'s picks from the warp whose lane ``k < top_k`` holds pick ``k`` and
         its unbiased score (the other lanes zero): ids, staged ids, weights and counts."""
@@ -751,7 +824,7 @@ class DSv4RouteNvfp4QuantKernel:
                     cute.arch.atomic_add(
                         count_hist.iterator + expert, Int32(1), sem="relaxed", scope="gpu"
                     )
-            if cutlass.const_expr(self.staged):
+            if cutlass.const_expr(self.staged and not self.adaptive):
                 bucket_id = expert
                 if cutlass.const_expr(self.replicas):
                     # Copy h(row) % copies of the expert, h(row) = (row * 0x9E3779B1 mod 2^32) >> 16.
@@ -772,6 +845,10 @@ class DSv4RouteNvfp4QuantKernel:
             )
             weight = _mul_rn(weight, Float32(self.routed_scaling_factor))
             weights[row, lane] = weight.to(weights.element_type)
+            if cutlass.const_expr(self.adaptive):
+                self.adaptive_pick(ids.shape[0], row, lane, expert, weight, staged_ids, adapt)
+        if cutlass.const_expr(self.adaptive):
+            self.adaptive_arrive(ids.shape[0], row, lane, adapt)
         return expert
 
     @cute.jit
@@ -801,6 +878,215 @@ class DSv4RouteNvfp4QuantKernel:
             else:
                 counted = Int32(0)
         return counted
+
+    @cute.jit
+    def live_elements(self, live: Optional[cute.Tensor], num_tokens: Int32) -> Int32:
+        """The picks of the live rows (liveIdCount): every pick without a word."""
+        count = num_tokens * self.top_k
+        if cutlass.const_expr(self.live_word):
+            word = Int32(live[0])
+            real = word & Int32(0xFFFF)
+            requests = (word >> Int32(16)) & Int32(0xFFFF)
+            if requests == Int32(0):
+                count = Int32(0)
+            elif real < requests:
+                if num_tokens % requests == Int32(0):
+                    count = num_tokens // requests * real * self.top_k
+        return count
+
+    @cute.jit
+    def adaptive_pick(
+        self, num_tokens: Int32, row: Int32, lane: Int32, expert: Int32, weight: Float32,
+        staged_ids: cute.Tensor, adapt,
+    ):
+        """Stage pick ``lane`` of token ``row``: its weight (0 past the live rows) and, for an expert with one
+        copy, its slot (-1 past the live rows); a replicated expert's slot is left to the block's mapping, whose
+        block it marks. Live picks count in the statistics while they are enabled."""
+        staged_weights, table, rows_t, _, enabled_t, live_t, state, _, _, _, _, _, _ = adapt
+        num_experts = self.num_experts
+        num_slots = table.shape[0] // 2 - num_experts
+        f = row * self.top_k + lane
+        kept = f < self.live_elements(live_t, num_tokens)
+        staged = Float32(0.0)
+        if kept:
+            staged = weight
+        staged_weights[row, lane] = staged.to(staged_weights.element_type)
+        valid = expert >= Int32(0) and expert < num_experts
+        copies = Int32(0)
+        start = Int32(-1)
+        if valid:
+            copies = Int32(table[expert])
+            start = Int32(table[num_experts + expert])
+        routable = valid and copies > Int32(0) and start >= Int32(0) and start + copies <= num_slots
+        slot = Int32(-1)
+        if kept:
+            slot = num_slots
+            if routable:
+                slot = Int32(table[2 * num_experts + start])
+        if routable and copies > Int32(1):
+            # Mark the pick's split block (relaxed: published by the arrival's release below).
+            cute.arch.atomic_add(
+                state.iterator + state.shape[0] // 2 + f // ADAPTIVE_SPLIT_BLOCK, Int32(1), sem="relaxed", scope="gpu"
+            )
+            if not kept:
+                staged_ids[row, lane] = staged_ids.element_type(-1)
+        else:
+            staged_ids[row, lane] = slot.to(staged_ids.element_type)
+        if cutlass.const_expr(self.adaptive_stats):
+            if Int32(enabled_t[0]) != Int32(0):
+                if kept and valid:
+                    # Integer counts in float32 add exactly in any order while a row stays below 2^24.
+                    cute.arch.atomic_add(rows_t.iterator + expert, Float32(1.0), sem="relaxed", scope="gpu")
+
+    @cute.jit
+    def adaptive_arrive(self, num_tokens: Int32, row: Int32, lane: Int32, adapt):
+        """Count token ``row`` in every split block its picks fall in; ``done_s`` gets the blocks it completes
+        (-1: none). Also the forward's count, once per launch."""
+        _, _, _, forwards_t, enabled_t, _, state, _, first, done_s, _, _, _ = adapt
+        # [MO-2] Release: each lane's ids, staged slots and marks are ordered before lane 0's arrival by its own
+        # gpu-scope fence and the warp barrier; the completing CTA acquires them with its arrival (adaptive_map).
+        cute.arch.fence_acq_rel_gpu()
+        cute.arch.sync_warp()
+        if lane == Int32(0):
+            if cutlass.const_expr(self.adaptive_stats):
+                if row == Int32(0):
+                    if Int32(enabled_t[0]) != Int32(0):
+                        if first != Int32(0):
+                            forwards_t[0] = forwards_t[0] + Int64(1)
+            k = self.top_k
+            first_block = row * k // ADAPTIVE_SPLIT_BLOCK
+            last_block = (row * k + k - 1) // ADAPTIVE_SPLIT_BLOCK
+            for j in cutlass.range_constexpr(2):
+                done_s[j] = Int32(-1)
+                block = first_block + j
+                if block <= last_block:
+                    first_row = block * ADAPTIVE_SPLIT_BLOCK // k
+                    last_row = ((block + 1) * ADAPTIVE_SPLIT_BLOCK - 1) // k
+                    if last_row > num_tokens - 1:
+                        last_row = num_tokens - 1
+                    old = cute.arch.atomic_add(state.iterator + block, Int32(1), sem="acq_rel", scope="gpu")
+                    if old + Int32(1) == last_row - first_row + Int32(1):
+                        done_s[j] = block
+
+    @cute.jit
+    def adaptive_map(self, ids: cute.Tensor, staged_ids: cute.Tensor, tidx: Int32, adapt):
+        """With the whole CTA, map the replicated picks of each split block this row completed, then reset the
+        block's arrival count and mark for the next launch."""
+        _, _, _, _, _, _, state, _, _, done_s, _, _, _ = adapt
+        cute.arch.barrier()
+        blocks = state.shape[0] // 2
+        for j in cutlass.range_constexpr(2):
+            block = Int32(done_s[j])
+            if block >= Int32(0):
+                # [MO-3] Acquire: lane 0's acq_rel arrival saw every row of the block arrive; the CTA barrier and
+                # this fence order its acquire before every thread's loads of the other rows' picks.
+                cute.arch.fence_acq_rel_gpu()
+                marked = Int32(state[blocks + block])
+                if marked != Int32(0):
+                    self.map_block(ids, staged_ids, tidx, block, adapt)
+                cute.arch.barrier()
+                if tidx == Int32(0):
+                    state[block] = Int32(0)
+                    state[blocks + block] = Int32(0)
+
+    @cute.jit
+    def map_block(self, ids: cute.Tensor, staged_ids: cute.Tensor, tidx: Int32, block: Int32, adapt):
+        """adaptive_eplb_route_into's slots of the replicated live picks of split block ``block``: a pick's copy
+        follows its ordinal among the block's picks of its expert (in pick order) and their total, in chunks of
+        one pick per thread."""
+        _, table, _, _, _, live_t, _, ep_rank, _, _, hist_s, seen_s, chunk_s = adapt
+        num_experts = self.num_experts
+        num_slots = table.shape[0] // 2 - num_experts
+        k = self.top_k
+        threads = self.num_threads
+        num_tokens = ids.shape[0]
+        live = self.live_elements(live_t, num_tokens)
+        lo = block * ADAPTIVE_SPLIT_BLOCK
+        hi = lo + ADAPTIVE_SPLIT_BLOCK
+        if hi > num_tokens * k:
+            hi = num_tokens * k
+        for v in cutlass.range_constexpr((num_experts + threads - 1) // threads):
+            e = tidx + v * threads
+            if e < num_experts:
+                hist_s[e] = Int32(0)
+                seen_s[e] = Int32(0)
+        cute.arch.barrier()
+        for c in cutlass.range_constexpr(self.map_chunks):
+            f = lo + c * threads + tidx
+            if f < hi:
+                spread = self.spread_id(Int32(ids[f // k, f % k]), table, num_slots)
+                if spread < num_experts:
+                    cute.arch.atomic_add(hist_s.iterator + spread, Int32(1), sem="relaxed", scope="cta")
+        cute.arch.barrier()
+        for c in cutlass.range_constexpr(self.map_chunks):
+            f = lo + c * threads + tidx
+            spread = num_experts
+            if f < hi:
+                spread = self.spread_id(Int32(ids[f // k, f % k]), table, num_slots)
+            chunk_s[tidx] = spread
+            cute.arch.barrier()
+            rank = Int32(0)
+            later = Int32(0)
+            if spread < num_experts:
+                for u in cutlass.range(threads):
+                    if Int32(chunk_s[u]) == spread:
+                        if u < tidx:
+                            rank = rank + Int32(1)
+                        elif u > tidx:
+                            later = later + Int32(1)
+                if f < live:
+                    ordinal = Int32(seen_s[spread]) + rank
+                    slot = self.weighted_slot(spread, ordinal, Int32(hist_s[spread]), block, ep_rank, table, num_slots)
+                    staged_ids[f // k, f % k] = slot.to(staged_ids.element_type)
+            cute.arch.barrier()
+            if spread < num_experts:
+                if later == Int32(0):
+                    seen_s[spread] = Int32(seen_s[spread]) + rank + Int32(1)
+            cute.arch.barrier()
+
+    @cute.jit
+    def spread_id(self, expert: Int32, table: cute.Tensor, num_slots: Int32) -> Int32:
+        """The expert if it is routable with several copies (its picks need the block's ordinal), else num_experts."""
+        num_experts = self.num_experts
+        spread = Int32(num_experts)
+        if expert >= Int32(0) and expert < num_experts:
+            copies = Int32(table[expert])
+            start = Int32(table[num_experts + expert])
+            if copies > Int32(1) and start >= Int32(0) and start + copies <= num_slots:
+                spread = expert
+        return spread
+
+    @cute.jit
+    def weighted_slot(
+        self, expert: Int32, ordinal: Int32, n: Int32, block: Int32, ep_rank: Int32, table: cute.Tensor,
+        num_slots: Int32,
+    ) -> Int32:
+        """weightedSlot: the copy whose cumulative Q32 share first exceeds the pick's point."""
+        num_experts = self.num_experts
+        copies = Int32(table[expert])
+        start = Int32(table[num_experts + expert])
+        full = Uint32(0xFFFFFFFF)
+        step = full
+        if n > Int32(1):
+            un = Uint32(n)
+            step = full // un
+            if full - step * un == un - Uint32(1):
+                step = step + Uint32(1)
+        point = (
+            Uint32(expert) * Uint32(ADAPTIVE_EXPERT_MULTIPLIER)
+            + Uint32(block) * Uint32(ADAPTIVE_BLOCK_MULTIPLIER)
+            + Uint32(ep_rank) * Uint32(ADAPTIVE_RANK_MULTIPLIER)
+            + Uint32(ordinal) * step
+        )
+        copy = Int32(0)
+        stopped = Int32(0)
+        for j in cutlass.range(copies - 1):
+            if stopped == Int32(0):
+                if point >= Uint32(table[2 * num_experts + num_slots + start + j]):
+                    copy = copy + Int32(1)
+                else:
+                    stopped = Int32(1)
+        return Int32(table[2 * num_experts + start + copy])
 
     @cute.jit
     def route_with_tables(
@@ -990,6 +1276,28 @@ _WEIGHT_TYPES = {torch.float32: Float32, torch.bfloat16: cutlass.BFloat16}
 _INDEX_TYPES = {torch.int32: Int32, torch.int64: Int64}
 
 
+class AdaptiveRoute(NamedTuple):
+    """An adaptive EPLB layer's route for ``dsv4_route_nvfp4_quant``'s adaptive mode (``adaptive_eplb_route_into``)."""
+
+    table: torch.Tensor  # int32 [2 * (experts + slots)]: the layer's row of the route tables
+    ep_rank: int
+    statistics: Optional[tuple]  # (rows float32 [experts], forwards int64 [1], enabled int32 [1]), or None
+    first: bool  # the forward's first call: it adds the forward while the statistics are enabled
+    live_row_word: Optional[torch.Tensor]  # int32 [1] or None
+
+
+_ADAPTIVE_STATE: dict = {}
+
+
+def _adaptive_state(device: torch.device, bucket_picks: int) -> torch.Tensor:
+    """The arrival counts and marks of the split blocks of a bucket (int32, zero); every launch leaves them zero."""
+    blocks = (bucket_picks + ADAPTIVE_SPLIT_BLOCK - 1) // ADAPTIVE_SPLIT_BLOCK
+    key = (str(device), blocks)
+    if key not in _ADAPTIVE_STATE:
+        _ADAPTIVE_STATE[key] = torch.zeros(2 * blocks, dtype=torch.int32, device=device)
+    return _ADAPTIVE_STATE[key]
+
+
 @functools.cache
 def _compile(
     num_experts: int,
@@ -1009,6 +1317,9 @@ def _compile(
     pdl: bool = False,
     cta_scoring: bool = True,
     splits: int = 1,
+    adaptive: bool = False,
+    adaptive_stats: bool = False,
+    live_word: bool = False,
 ):
     tokens = cute.sym_int()
     # A launch bucket has its own row count, at least the tokens'.
@@ -1074,13 +1385,17 @@ def _compile(
             pdl=pdl,
             cta_scoring=cta_scoring,
             splits=splits,
+            adaptive=adaptive,
+            adaptive_stats=adaptive_stats,
+            live_word=live_word,
         ),
         logits,
         cute.runtime.make_fake_compact_tensor(Float32, (num_experts,), stride_order=(0,)),
         rows(cutlass.BFloat16, hidden_size, assumed_align=16) if quant else None,
         cute.runtime.make_fake_compact_tensor(Float32, (1,), stride_order=(0,)) if quant else None,
         rows(Int32, top_k),
-        rows(_WEIGHT_TYPES[weights_dtype], top_k, bucket),
+        # The adaptive mode returns the routing's weights per token and stages its own into the bucket.
+        rows(_WEIGHT_TYPES[weights_dtype], top_k, tokens if adaptive else bucket),
         rows(Uint32, hidden_size // 8, bucket) if quant else None,
         rows(Uint8, hidden_size // 16, bucket) if quant else None,
         tables,
@@ -1098,6 +1413,15 @@ def _compile(
         Int32(0),
         x_fp8,
         x_sf8,
+        rows(Float32, top_k, bucket) if adaptive else None,
+        cute.runtime.make_fake_compact_tensor(Int32, (cute.sym_int(),), stride_order=(0,)) if adaptive else None,
+        cute.runtime.make_fake_compact_tensor(Float32, (num_experts,), stride_order=(0,)) if adaptive_stats else None,
+        cute.runtime.make_fake_compact_tensor(Int64, (1,), stride_order=(0,)) if adaptive_stats else None,
+        scalar(adaptive_stats),
+        scalar(live_word),
+        cute.runtime.make_fake_compact_tensor(Int32, (cute.sym_int(),), stride_order=(0,)) if adaptive else None,
+        Int32(0),
+        Int32(0),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--opt-level 2 --enable-tvm-ffi",
     )
@@ -1166,6 +1490,7 @@ def dsv4_route_nvfp4_quant(
     replicas: bool = False,
     local_experts: Optional[tuple[int, int]] = None,
     routing_tiles: tuple[int, ...] = ROUTING_TABLE_TILES,
+    adaptive: Optional[AdaptiveRoute] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """DeepSeek-V4 routing and NVFP4 input quantization in one launch, bitwise ``routing.apply``
     then ``fp4_quantize``; ``with_routing_tables`` also returns ``run_moe``'s routing tables for
@@ -1186,6 +1511,10 @@ def dsv4_route_nvfp4_quant(
     MXFP8, exactly as ``mxfp8_quantize_megamoe`` writes it.
 
     ``router_logits`` may be ``RouterLogitPartials``: the launch routes on their sum, s = 0 .. S-1.
+
+    ``adaptive`` (with ``staged``): the bucket gets ``adaptive_eplb_route_into``'s slots and weights of the
+    routes, masked by the live-row word, and the layer's statistics the live picks; the returned ids and
+    weights stay the routing's for every token, as the route-only launch returns them.
     """
     from tensorrt_llm._torch.custom_ops.router_logit_partials import RouterLogitPartials
 
@@ -1195,6 +1524,8 @@ def dsv4_route_nvfp4_quant(
         if logits.stride(1) != logits.shape[2]:
             raise ValueError("router logit partials need each row contiguous over the experts")
     num_tokens, num_experts = logits.shape[-2:]
+    if adaptive is not None and (staged is None or slot_of_expert is not None or counters is not None):
+        raise ValueError("the adaptive mode stages its own slots: pass staged, without slot_of_expert or counters")
     hidden_size = x.shape[1]
     device = x.device
     ids = torch.empty((num_tokens, top_k), dtype=torch.int32, device=device)
@@ -1209,6 +1540,16 @@ def dsv4_route_nvfp4_quant(
         staged_index_dtype = staged_ids.dtype
         if with_routing_tables or not 0 < num_tokens <= staged_ids.shape[0]:
             raise ValueError(f"cannot stage {num_tokens} tokens into {staged_ids.shape[0]} rows")
+    staged_weights = table = stats_rows = stats_forwards = stats_enabled = live = state = None
+    ep_rank = first = 0
+    if adaptive is not None:
+        staged_weights, weights = weights, torch.empty((num_tokens, top_k), dtype=weights_dtype, device=device)
+        table, ep_rank, first, live = adaptive.table, int(adaptive.ep_rank), int(adaptive.first), adaptive.live_row_word
+        if adaptive.statistics is not None:
+            stats_rows, stats_forwards, stats_enabled = adaptive.statistics
+        if table.dtype != torch.int32 or not table.is_contiguous() or table.numel() <= 2 * num_experts:
+            raise ValueError("the adaptive route table must be a contiguous int32 row of counts, starts, slots, shares")
+        state = _adaptive_state(device, staged_ids.shape[0] * top_k)
     count_hist = count_flag = count_bound = count_rows = None
     count_row_offset = 0
     if counters is not None:
@@ -1260,8 +1601,13 @@ def dsv4_route_nvfp4_quant(
             mxfp8 is not None,
             replicas,
             num_local=num_local,
+            # As the route-only launch it replaces on an adaptive layer, a programmatic dependent of the router GEMM.
+            pdl=TRTLLM_ENABLE_PDL and adaptive is not None,
             cta_scoring=_cta_scoring(num_tokens, num_experts),
             splits=splits,
+            adaptive=adaptive is not None,
+            adaptive_stats=stats_rows is not None,
+            live_word=live is not None,
         )(
             logits,
             selection_bias,
@@ -1282,7 +1628,19 @@ def dsv4_route_nvfp4_quant(
             int(count_row_offset),
             x_fp8,
             x_sf8,
+            staged_weights,
+            table,
+            stats_rows,
+            stats_forwards,
+            stats_enabled,
+            live,
+            state,
+            ep_rank,
+            first,
         )
+    if adaptive is not None:
+        rows = slice(0, num_tokens)
+        return ids, weights, x_fp4[rows].view(torch.uint8), x_sf[rows], None
     if staged is not None:
         rows = slice(0, num_tokens)
         return ids, weights[rows], x_fp4[rows].view(torch.uint8), x_sf[rows], None
@@ -1363,5 +1721,14 @@ def dsv4_route(
             0,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
         )
     return ids, weights, tables

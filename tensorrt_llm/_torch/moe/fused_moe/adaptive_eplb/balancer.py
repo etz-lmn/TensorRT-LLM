@@ -280,6 +280,7 @@ class AdaptiveMoeLayerLoadBalancer:
         self.statistics = ExpertStatistics.of(manager.statistics(device), self.layer_idx, flag)
         tables = manager.route_tables(device)[self.layer_idx]
         self._tables = tables.split([self.expert_count] * 2 + [self.num_slots] * 2)
+        self._table_row = tables
         self._slot_dtype = slot_dtype
         self._route_staging = route_staging
         self._route_into = torch.ops.trtllm.adaptive_eplb_route_into
@@ -307,6 +308,20 @@ class AdaptiveMoeLayerLoadBalancer:
             self._pending = (local_raw_expert_ids, is_first_stage)
 
     update_statistic_with_local_ids = update_local_statistic
+
+    def fused_route(self, first: bool) -> tuple:
+        """``(table, ep_rank, statistics, first)`` for a backend launch that routes, maps, stages and
+        counts in one go (``dsv4_route_nvfp4_quant``'s adaptive mode): this layer's route table row and
+        its statistics when :meth:`update_local_statistic` would keep the routes (recording, or under
+        CUDA graph capture, where the device flag gates every replay), else None."""
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            self.statistics.record(*pending)
+        statistics = self.statistics
+        counted = self.manager.recording or (
+            statistics.rows.is_cuda and torch.cuda.is_current_stream_capturing()
+        )
+        return self._table_row, self.manager.ep_rank, tuple(statistics) if counted else None, first
 
     def route(
         self,

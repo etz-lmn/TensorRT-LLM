@@ -757,6 +757,8 @@ class MoEFusedRouteQuant:
     routing_tables: Optional[MoERoutingTables] = None
     # The launch also added its picks to the warmup expert placement's counters.
     routes_counted: bool = False
+    # The launch also staged the adaptive load balancer's slots and counted its statistics (adaptive mode).
+    routes_mapped: bool = False
 
 
 @dataclass(frozen=True)
