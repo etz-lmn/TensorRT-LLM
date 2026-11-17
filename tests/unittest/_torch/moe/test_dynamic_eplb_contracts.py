@@ -2448,7 +2448,12 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
     _extract_function(source, "_leading_rows", namespace)
     _extract_function(source, "_routes_recorded", namespace)
     _extract_function(source, "_num_rows", namespace)
-    base_methods = {"_try_fused_route_quant", "_route_quant_eligible", "_partials_route"}
+    base_methods = {
+        "_try_fused_route_quant",
+        "_route_quant_eligible",
+        "_partials_route",
+        "_route_only",
+    }
     available = {
         n.name for n in ast.walk(ast.parse(source.read_text())) if isinstance(n, ast.FunctionDef)
     }
@@ -3140,6 +3145,74 @@ def test_partial_logits_capability_matches_the_consumer(staged, blocked):
     if route_only:
         assert route_only(None) == "route_only"
     assert "fused" not in seen if staged else "route_only" not in seen
+
+
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize(
+    "blocked",
+    [None, "aux", "input_weight", "dynamic", "replica", "disabled", "backend", "consumer"],
+)
+def test_whole_logits_take_the_route_only_launch_where_partials_would(partial, staged, blocked):
+    class Partials:
+        pass
+
+    class Logits:
+        def __init__(self):
+            self.calls = []
+
+        def to(self, dtype):
+            self.calls.append(("to", dtype))
+            return self
+
+        def contiguous(self):
+            self.calls.append(("contiguous",))
+            return self
+
+    ns = {
+        "Fp4QuantizedTensor": type("Fp4QuantizedTensor", (), {}),
+        "RouterLogitPartials": Partials,
+        "torch": SimpleNamespace(float32="fp32"),
+    }
+    cls = _extract_class(
+        _TORCH_ROOT / "moe/fused_moe/moe_scheduler.py",
+        "MoEScheduler",
+        {"_route_quant_eligible", "_partials_route", "_route_only"},
+        ns,
+    )
+    seen = []
+    backend = SimpleNamespace(
+        fused_route_quant_enabled=blocked != "disabled",
+        takes_router_logit_partials=lambda: blocked != "backend",
+    )
+    if blocked != "consumer":
+        backend.route_from_logit_partials = lambda logits: seen.append(logits) or ("ids", "w")
+    scheduler = cls()
+    scheduler.moe = SimpleNamespace(
+        backend=backend,
+        apply_router_weight_on_input=blocked == "input_weight",
+        _using_dynamic_load_balancer=lambda: blocked == "dynamic",
+        _load_balancer_uses_replica_plan=lambda: blocked == "replica",
+        layer_load_balancer=SimpleNamespace(stages_routes=staged),
+    )
+    aux = object() if blocked == "aux" else None
+    logits = Partials() if partial else Logits()
+    route_only = staged and blocked is None
+    if partial and not route_only:
+        # Partial logits without a route-only consumer stay an error.
+        with pytest.raises(RuntimeError, match="does not sum them"):
+            scheduler._route_only(logits, aux)
+        assert not seen
+        return
+    routes = scheduler._route_only(logits, aux)
+    if route_only:
+        # A staged, eligible layer routes whole logits as FP32 rows in the route-only launch.
+        assert routes == ("ids", "w") and seen == [logits]
+        assert partial or logits.calls == [("to", "fp32"), ("contiguous",)]
+    else:
+        # Everywhere else the forward routes with routing_method.apply, as before.
+        assert routes is None and not seen
+        assert partial or not logits.calls
 
 
 @pytest.mark.parametrize("splits", [None, 0, 1, 2, 4, 8])
