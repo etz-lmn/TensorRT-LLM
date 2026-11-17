@@ -2615,9 +2615,9 @@ class TokenCommNonDeterministic(KernelComponent):
 
         iket.range_push("token_in.wait_metadata_ready")
         self._router.wait_for_metadata_ready(self._device_workspace)
-        if cutlass.const_expr(self.one_round_dispatch):
-            # The plane rows were written by peers' generic stores and are read below through TMA.
-            fence_proxy_async_global()
+        # The rows this flag publishes are pulled below with TMA (async proxy): the one-round plane rows that
+        # peers wrote with generic stores, or the peers' staged inputs that an earlier kernel on their stream wrote.
+        fence_proxy_async_global()
         iket.range_pop()
 
         for size_copy_round in cutlass.range_constexpr(size_copy_rounds):
