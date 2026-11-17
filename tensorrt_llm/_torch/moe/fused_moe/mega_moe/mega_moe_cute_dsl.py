@@ -1561,6 +1561,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             self._shared_quantized = (shared_target[0], x.shape[0])
         if bucket is not None:
             self._prestaged = (bucket[0], ids, weights, x_fp4, x_sf)
+            # The activation rows are in the bucket as quantize_input leaves them, so a launch
+            # given other routes (perfect router, calibrator replay) re-stages only the routes.
+            self._quantized_into = (bucket[2].data_ptr(), x.shape[0])
         return MoEFusedRouteQuant(
             ids, weights, x_fp4, x_sf, routes_counted=route_counters is not None
         )

@@ -446,3 +446,72 @@ def test_preparation_consumes_handout_before_an_uncached_bucket(
         )
         assert backend.run_moe(context).dtype == torch.bfloat16
     assert backend._handed_out_route_staging is None
+
+
+@pytest.mark.parametrize("static_slots", [False, True])
+def test_routes_replaced_after_the_fused_route_quant_are_staged_without_the_activation(
+    preparation_backend, monkeypatch, static_slots
+):
+    """The DeepSeek-V4 fused route+quant writes the bucket's activation rows and routes. When the
+    scheduler then replaces the routes (``ENABLE_PERFECT_ROUTER=expert_ids``, a calibrator
+    replay), ``run_moe`` keeps the staged activation and stages only the new routes."""
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoERunContext
+
+    rows, top_k, experts = 3, 2, 4
+    backend = preparation_backend
+    backend._fuses_route_quant = True
+    backend.routing_method = SimpleNamespace(
+        experts_per_token=top_k,
+        top_k=top_k,
+        e_score_correction_bias=torch.zeros(experts),
+        routed_scaling_factor=1.0,
+    )
+    if static_slots:
+        backend._slot_of_expert = torch.tensor([3, 2, 1, 0], dtype=torch.int32)
+
+    def route_quant(logits, bias, x, scale, k, scaling, dtype, *, staged, slot_of_expert, **kw):
+        ids_out, weights_out, x_out, sf_out = staged
+        ids = torch.zeros(rows, k, dtype=torch.int32)
+        ids_out[:rows] = ids if slot_of_expert is None else slot_of_expert[ids.long()]
+        ids_out[rows:] = -1
+        weights_out[:rows] = 1.0
+        weights_out[rows:] = 0.0
+        x_out[:rows] = 7
+        sf_out[:rows] = 5
+        return ids, weights_out[:rows], x_out[:rows], sf_out[:rows], None
+
+    staged_routes, stage_activation = [], []
+    monkeypatch.setattr(mm, "dsv4_route_nvfp4_quant", route_quant, raising=False)
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "megamoe_stage_routes",
+        lambda ids, *args: staged_routes.append(ids.clone()),
+        raising=False,
+    )
+    del backend._stage_inputs  # the real staging, down to the route op
+    stage = backend._stage_inputs
+    backend._stage_inputs = lambda **kw: stage_activation.append(kw["stage_activation"]) or stage(
+        **kw
+    )
+    x = torch.zeros(rows, 64, dtype=torch.bfloat16)
+
+    def forward(routes=None):
+        backend.set_adaptive_launch_tokens(8, output_dtype=torch.bfloat16)
+        fused = backend.try_fused_route_quant(x, torch.zeros(rows, experts))
+        context = MoERunContext(
+            x=fused.x,
+            x_sf=fused.x_sf,
+            token_selected_experts=fused.token_selected_experts if routes is None else routes,
+            token_final_scales=fused.token_final_scales,
+            output_dtype=torch.bfloat16,
+        )
+        backend.run_moe(context)
+
+    forward()
+    assert not staged_routes and not stage_activation  # The fused launch staged the bucket.
+    replaced = torch.tensor([[1, 2], [3, 0], [2, 1]], dtype=torch.int32)
+    forward(replaced)
+    assert stage_activation == [False]
+    expected = backend.slots_of_experts(replaced) if static_slots else replaced
+    assert len(staged_routes) == 1 and torch.equal(staged_routes[0], expected)
+    assert backend._quantized_into is None and backend._prestaged is None
