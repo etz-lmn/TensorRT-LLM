@@ -211,6 +211,28 @@ class MoEScheduler(ABC):
                 return route if callable(route) else None
         return None
 
+    def _route_only(
+        self,
+        router_logits: Union[torch.Tensor, RouterLogitPartials],
+        routing_aux: Optional[torch.Tensor],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """The routes of the backend's route-only launch, or None to route with ``routing_method.apply``.
+
+        Partial logits have no other consumer. Whole logits (the small-batch router GEMM's) take the
+        same launch wherever partials would, as the FP32 rows ``apply`` reads: it returns ``apply``'s
+        experts and weights bit for bit, in place of the separate ``gate_forward`` kernel.
+        """
+        route = self._partials_route(routing_aux)
+        if isinstance(router_logits, RouterLogitPartials):
+            if route is None:
+                raise RuntimeError(
+                    "router logit partials reached a routing path that does not sum them"
+                )
+            return route(router_logits)
+        if route is None:
+            return None
+        return route(router_logits.to(torch.float32).contiguous())
+
     def _try_fused_route_quant(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -1831,17 +1853,8 @@ class FusedCommMoEScheduler(MoEScheduler):
             else None
         )
         partial_routes = None
-        if (
-            num_tokens > 0
-            and fused_result is None
-            and isinstance(router_logits_chunk_real, RouterLogitPartials)
-        ):
-            route_partials = self._partials_route(routing_aux)
-            if route_partials is None:
-                raise RuntimeError(
-                    "router logit partials reached a routing path that does not sum them"
-                )
-            partial_routes = route_partials(router_logits_chunk_real)
+        if num_tokens > 0 and fused_result is None:
+            partial_routes = self._route_only(router_logits_chunk_real, routing_aux)
         if num_tokens > 0:
             if fused_result is not None:
                 token_selected_experts = fused_result.token_selected_experts
