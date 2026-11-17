@@ -36,7 +36,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4MoE
 from tensorrt_llm._torch.models.modeling_dspark_v41 import convert_draft_experts_to_nvfp4
 from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
 from tensorrt_llm._torch.moe.fused_moe import SwigluActivation, create_moe
-from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, mega_moe_cute_dsl
+from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl
 from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm._utils import get_sm_version, mpi_allgather, mpi_rank, mpi_world_size
@@ -516,7 +516,7 @@ def _run(one_round: bool) -> list:
             return f"{label}: {problems}" if problems else None
 
         staged, kernels = [], []
-        stage = mega_moe_cute_dsl.stage_megamoe_inputs
+        stage = MegaMoECuteDsl._stage_inputs
         resolve = op.Sm100MegaMoENvfp4Runner._resolve_kernel_descriptor
 
         def recording(self, *args, **kwargs):
@@ -542,8 +542,8 @@ def _run(one_round: bool) -> list:
                 _assert_on_all_ranks(check_reference(call))
             with pytest.MonkeyPatch.context() as patch:
                 patch.setattr(
-                    mega_moe_cute_dsl,
-                    "stage_megamoe_inputs",
+                    MegaMoECuteDsl,
+                    "_stage_inputs",
                     lambda *a, **k: staged.append(1) or stage(*a, **k),
                 )
                 patch.setattr(op.Sm100MegaMoENvfp4Runner, "_resolve_kernel_descriptor", recording)
