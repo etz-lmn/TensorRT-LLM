@@ -20,6 +20,7 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
+from tensorrt_llm._torch.modules.low_m_gemm import freeze_lowm_row_counts
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
@@ -321,9 +322,14 @@ class DecoderWarmup:
         )
         # Warm here, not in AllReduce.__init__, to scope it to the LLM executor's graph capture.
         warmup_named_allreduce_topologies(self.model)
+        # Warmup compiles the low-M MMA kernels at the row counts it reaches; serving reuses them.
+        freeze_lowm_row_counts(False)
         # Retain a partial summary when a phase raises.
         with self._warmup_timer:
-            return self._warmup_scheduled(resource_manager, kv_cache_manager)
+            reclaimer = self._warmup_scheduled(resource_manager, kv_cache_manager)
+            with self._warmup_timer.phase("lowm_row_counts"):
+                freeze_lowm_row_counts(True)
+            return reclaimer
 
     def _get_max_shape_warmup_requests(
         self, resource_manager: ResourceManager

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import bisect
 import functools
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -1032,9 +1033,15 @@ def default_k_warps(k: int) -> int:
     return next((kw for kw in valid if chunks // kw <= 8), valid[-1])
 
 
+# The most rows the MMA kernel takes (``LowMFp8MmaGemmKernel``'s ``num_rows`` bound).
+_MMA_MAX_ROWS = 64
+# Row counts compiled for every kernel before serving (freeze_lowm_row_counts).
+_MMA_POWER_OF_TWO_ROWS = tuple(1 << i for i in range(_MMA_MAX_ROWS.bit_length()))
+
+
 def lowm_fp8_mma_fits(m: int, n: int, k: int) -> bool:
     """Whether the MMA kernel serves an ``[m, k] x [n, k]`` problem on this device."""
-    return lowm_fp8_supported() and 0 < m <= 64 and n % 8 == 0 and k > 0 and k % 64 == 0
+    return lowm_fp8_supported() and 0 < m <= _MMA_MAX_ROWS and n % 8 == 0 and k > 0 and k % 64 == 0
 
 
 @functools.lru_cache(maxsize=None)
@@ -1133,6 +1140,59 @@ def _rope_placeholders(m: int, device):
     )
 
 
+# Row counts each MMA kernel is compiled for (``num_rows`` is a compile-time constant), sorted,
+# keyed by the other ``_compiled_mma`` arguments as the callers pass them.
+_COMPILED_ROWS: Dict[tuple, List[int]] = {}
+# Whether a row count without its own kernel reuses a larger one (freeze_lowm_row_counts).
+_ROW_COUNTS_FROZEN = False
+
+
+def freeze_lowm_row_counts(frozen: bool) -> None:
+    """Close (``True``) or reopen (``False``) the row counts the MMA kernels are compiled for.
+
+    Each kernel is compiled for its exact row count on first use. Warmup reaches the CUDA-graph
+    batch sizes, but an eager attention-DP step meets other per-rank row counts (one row per
+    request in the draft steps), and compiling one there stalls every rank at the next
+    collective. Closing first compiles, for every kernel warmup used, the powers of two up to
+    ``_MMA_MAX_ROWS``; afterwards an eager call whose row count has no kernel runs the smallest
+    compiled one above it on zero-padded rows. A row's output depends on its own input row only
+    (masked loads, MMA, the split-K sum in a fixed warp order, the per-row epilogue), so the
+    real rows come out as their own kernel writes them. CUDA-graph capture keeps exact counts.
+    """
+    global _ROW_COUNTS_FROZEN
+    if frozen:
+        for (args, kwargs), rows in _COMPILED_ROWS.items():
+            for run in _MMA_POWER_OF_TWO_ROWS:
+                if run not in rows:
+                    _compiled_mma(run, *args, **dict(kwargs))
+                    bisect.insort(rows, run)
+    _ROW_COUNTS_FROZEN = frozen
+
+
+def _mma_for_rows(m: int, *args, **kwargs):
+    """``(kernel, rows)``: the compiled MMA kernel for an ``m``-row call and the rows it runs."""
+    # In the callers' keyword order: _compiled_mma's lru_cache tells keyword orders apart.
+    key = (args, tuple(kwargs.items()))
+    rows = _COMPILED_ROWS.get(key, ())
+    run = m
+    if _ROW_COUNTS_FROZEN and m not in rows and not torch.cuda.is_current_stream_capturing():
+        above = bisect.bisect_left(rows, m)
+        if above < len(rows):
+            run = rows[above]
+    fn = _compiled_mma(run, *args, **kwargs)
+    if run not in rows:
+        bisect.insort(_COMPILED_ROWS.setdefault(key, []), run)
+    return fn, run
+
+
+def _pad_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
+    """``t`` with zero rows appended up to ``rows`` (``t`` itself when it has them)."""
+    extra = rows - t.shape[0]
+    if extra == 0:
+        return t
+    return torch.nn.functional.pad(t, [0, 0] * (t.dim() - 1) + [0, extra])
+
+
 def mxfp8_lowm_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1162,18 +1222,13 @@ def mxfp8_lowm_linear(
     n = weight.shape[0]
     if n % (8 * n_tiles):
         raise ValueError(f"N={n} is not a multiple of {8 * n_tiles}")
-    if split_n:
-        out = torch.empty((m, split_n), dtype=torch.bfloat16, device=x.device)
-        out2 = torch.empty((m, n - split_n), dtype=torch.bfloat16, device=x.device)
-    else:
-        out = out2 = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     if rope is None:
-        positions, cos_sin = _rope_placeholders(m, x.device)
+        cos_sin = None
         head_dim = 0
     else:
         positions, cos_sin, head_dim = rope
         positions = positions.reshape(-1).to(torch.int32)
-    fn = _compiled_mma(
+    fn, rows = _mma_for_rows(
         m,
         n,
         k,
@@ -1186,6 +1241,16 @@ def mxfp8_lowm_linear(
         a_rms_eps=None if rms_norm is None else float(rms_norm[1]),
         n_tiles=n_tiles,
     )
+    x = _pad_rows(x, rows)
+    if rope is None:
+        positions, cos_sin = _rope_placeholders(rows, x.device)
+    else:
+        positions = _pad_rows(positions, rows)
+    if split_n:
+        out = torch.empty((rows, split_n), dtype=torch.bfloat16, device=x.device)
+        out2 = torch.empty((rows, n - split_n), dtype=torch.bfloat16, device=x.device)
+    else:
+        out = out2 = torch.empty((rows, n), dtype=torch.bfloat16, device=x.device)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn(
         graph_safe_from_dlpack(x),
@@ -1198,6 +1263,8 @@ def mxfp8_lowm_linear(
         graph_safe_from_dlpack(_no_gamma(x.device) if rms_norm is None else rms_norm[0].view(1, k)),
         stream,
     )
+    if rows != m:
+        out, out2 = out[:m], out2[:m]
     return (out, out2) if split_n else out
 
 
@@ -1212,10 +1279,9 @@ def bf16_lowm_linear(
 
     m, k = x.shape
     n = weight.shape[0]
-    out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     # Two weight vectors per lane and K chunk: twice the FP8 split keeps as many loads per warp.
     k_warps = 2 * default_k_warps(k)
-    fn = _compiled_mma(
+    fn, rows = _mma_for_rows(
         m,
         n,
         k,
@@ -1225,7 +1291,9 @@ def bf16_lowm_linear(
         out_dtype=out_dtype,
         k_warps=k_warps if (k // 64) % k_warps == 0 else 0,
     )
-    positions, cos_sin = _rope_placeholders(m, x.device)
+    x = _pad_rows(x, rows)
+    out = torch.empty((rows, n), dtype=out_dtype, device=x.device)
+    positions, cos_sin = _rope_placeholders(rows, x.device)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn(
         graph_safe_from_dlpack(x),
@@ -1238,7 +1306,7 @@ def bf16_lowm_linear(
         graph_safe_from_dlpack(_no_gamma(x.device)),
         stream,
     )
-    return out
+    return out if rows == m else out[:m]
 
 
 def mxfp8_linear_scale(module: torch.nn.Module) -> Optional[torch.Tensor]:
@@ -1286,13 +1354,12 @@ def fp8_grouped_lowm(
     m = x.shape[0]
     n, k = weight.shape
     block128 = scale.dtype == torch.float32
-    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     if inverse_rope is None:
-        pos, cos_sin = _rope_placeholders(m, x.device)
+        cos_sin = None
         head_dim = 0
     else:
         pos, cos_sin, head_dim = inverse_rope
-    fn = _compiled_mma(
+    fn, rows = _mma_for_rows(
         m,
         n,
         k,
@@ -1303,6 +1370,12 @@ def fp8_grouped_lowm(
         rope_positions=cos_sin.shape[0] if inverse_rope is not None else 0,
         a_rope_head_dim=head_dim,
     )
+    x = _pad_rows(x, rows)
+    if inverse_rope is None:
+        pos, cos_sin = _rope_placeholders(rows, x.device)
+    else:
+        pos = _pad_rows(pos, rows)
+    out = torch.empty((rows, n), dtype=torch.bfloat16, device=x.device)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn(
         graph_safe_from_dlpack(x),
@@ -1315,7 +1388,7 @@ def fp8_grouped_lowm(
         graph_safe_from_dlpack(_no_gamma(x.device)),
         stream,
     )
-    return out
+    return out if rows == m else out[:m]
 
 
 __all__ = [
@@ -1325,6 +1398,7 @@ __all__ = [
     "apply_low_m_gemm",
     "bf16_lowm_linear",
     "fp8_grouped_lowm",
+    "freeze_lowm_row_counts",
     "low_m_gemm_dispatcher",
     "lowm_fp8_supported",
     "mxfp8_linear_scale",
