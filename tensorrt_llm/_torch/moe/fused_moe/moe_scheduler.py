@@ -261,15 +261,19 @@ class MoEScheduler(ABC):
         routing_aux: Optional[torch.Tensor],
         route_counters=None,
         first: bool = True,
+        adaptive: bool = False,
     ) -> Optional[MoEFusedRouteQuant]:
         """The backend's one-launch routing and input quantization (only the routing for an input
         that arrives quantized), unless a routing aux, a router weight on the input, a dynamic
         balancer or a cleared ``fused_route_quant_enabled`` needs the separate launches. A backend
         that ``counts_routes`` also adds the picks to the warmup placement's ``route_counters``."""
         moe = self.moe
-        adaptive = self._adaptive_fused_route(x, routing_aux, route_counters, first)
-        if adaptive is not None:
-            return moe.backend.try_fused_route_quant(x, router_logits, adaptive_route=adaptive)
+        # Only a caller that handles ``routes_mapped`` (the fused-comm forward) asks for the adaptive mode.
+        adaptive_route = (
+            self._adaptive_fused_route(x, routing_aux, route_counters, first) if adaptive else None
+        )
+        if adaptive_route is not None:
+            return moe.backend.try_fused_route_quant(x, router_logits, adaptive_route=adaptive_route)
         if not self._route_quant_eligible(routing_aux):
             return None
         if isinstance(x, Fp4QuantizedTensor):
@@ -1874,6 +1878,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 routing_aux,
                 moe._warmup_placement_route_counters(row_offset),
                 first=is_first_call,
+                adaptive=True,
             )
             if num_tokens > 0 and not uses_replica_plan
             else None

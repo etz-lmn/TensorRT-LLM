@@ -940,7 +940,9 @@ class DSv4RouteNvfp4QuantKernel:
             cute.arch.atomic_add(
                 state.iterator + state.shape[0] // 2 + f // ADAPTIVE_SPLIT_BLOCK, Int32(1), sem="relaxed", scope="gpu"
             )
-            if not kept:
+            if kept:
+                pass  # the block's mapping writes the slot
+            else:
                 staged_ids[row, lane] = staged_ids.element_type(-1)
         else:
             staged_ids[row, lane] = slot.to(staged_ids.element_type)
