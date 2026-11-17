@@ -14,6 +14,7 @@ bitwise the one-copy identity placement's; after the last one the counters stop.
 """
 
 import functools
+import importlib
 import pickle
 import sys
 from types import SimpleNamespace
@@ -30,7 +31,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import SwigluActivation, create_moe
 from tensorrt_llm._torch.moe.fused_moe import moe_warmup_placement as mwp
-from tensorrt_llm._torch.moe.fused_moe.mega_moe import mega_moe_cute_dsl
+from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -55,6 +56,28 @@ MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCO
 
 def _init_worker(paths: list[str]) -> None:
     sys.path[:] = paths
+
+
+def _count_separate_staging(patch: pytest.MonkeyPatch, staged: list) -> None:
+    """Append to ``staged`` the name of every launch that stages a MegaMoE bucket apart from the
+    DeepSeek-V4 fused route+quant: the backend's copy-and-stage path and the two staging ops."""
+    stage = MegaMoECuteDsl._stage_inputs
+    patch.setattr(
+        MegaMoECuteDsl,
+        "_stage_inputs",
+        lambda *a, **k: staged.append("_stage_inputs") or stage(*a, **k),
+    )
+    # Imported here rather than read off the module's torch: cloudpickle ships the worker by value,
+    # and a global torch.ops reference would pull in the namespace object, which does not pickle.
+    trtllm_ops = importlib.import_module("torch").ops.trtllm
+    for name in ("megamoe_stage_inputs", "megamoe_stage_routes"):
+        if hasattr(trtllm_ops, name):
+            staging_op = getattr(trtllm_ops, name)
+            patch.setattr(
+                trtllm_ops,
+                name,
+                lambda *a, _op=staging_op, _name=name, **k: staged.append(_name) or _op(*a, **k),
+            )
 
 
 def _assert_on_all_ranks(problem: Optional[str]) -> None:
@@ -294,12 +317,7 @@ def _run_placement(gens: int, draft_len: int) -> None:
                     out.copy_(_forward(moe, balancer, x, logits))
                 graphs.append((graph, out))
         staging, separate_counts = [], []
-        stage = mega_moe_cute_dsl.stage_megamoe_inputs
-        patch.setattr(
-            mega_moe_cute_dsl,
-            "stage_megamoe_inputs",
-            lambda *a, **k: staging.append(1) or stage(*a, **k),
-        )
+        _count_separate_staging(patch, staging)
         patch.setattr(mwp, "count_routing", lambda *a, **k: separate_counts.append(1))
         moved = [0] * len(layers)
         # Step 1 plans under a min_round_gain no plan meets: it moves nothing but halves the
@@ -367,7 +385,9 @@ def _run_placement(gens: int, draft_len: int) -> None:
             None if torch.equal(controller._hist, frozen_counts) else "counted after the freeze"
         )
         patch.undo()
-        _assert_on_all_ranks(f"re-staged launches: {len(staging)}" if staging else None)
+        _assert_on_all_ranks(
+            f"re-staged launches: {len(staging)} by {sorted(set(staging))}" if staging else None
+        )
         _assert_on_all_ranks(
             f"separate count launches: {len(separate_counts)}" if separate_counts else None
         )
@@ -392,3 +412,13 @@ def test_megamoe_placement(gens: int, draft_len: int) -> None:
     ) as executor:
         results = [executor.submit(run) for _ in range(_WORLD_SIZE)]
         assert all(result.result() is None for result in results)
+
+
+@pytest.mark.cpu_only
+def test_the_worker_pickles_for_the_mpi_pool() -> None:
+    """The worker this module submits to MPIPoolExecutor pickles.
+
+    The pool ships it with cloudpickle, by value (the module registers itself so), so nothing it
+    references may be unpicklable, the torch.ops namespace included.
+    """
+    cloudpickle.dumps(functools.partial(_run_placement, 25, 5))
