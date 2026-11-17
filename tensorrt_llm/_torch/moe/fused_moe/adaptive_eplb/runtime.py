@@ -239,13 +239,14 @@ class _Decider:
             per_step = total["accepted"] / total["requests"]  # tokens a request accepts per step
             steps_left = total["remaining"] / per_step / total["requests"]
         # A batch that changed between two closes more than it ever did (a steady batch never does, a
-        # draining one keeps doing so) is priced where the new layouts serve it: the requests at this
-        # close carried a window ahead at that rate, over their mean across the window.
+        # draining one keeps doing so) is priced where the new layouts serve it, over its mean across the
+        # window: a draining batch at the requests at this close carried a window ahead at that rate, a
+        # growing one at the requests at this close, as what bounds its growth is outside the server.
         requests, before = total["requests"], self.close_requests
         change = abs(requests / before - 1.0) if min(requests, before) > 0.0 else 0.0
         self.close_requests, ahead = requests, None
         if change > self.largest_change:
-            ahead = requests * requests / before
+            ahead = requests * min(requests / before, 1.0)
             rows = rows * (ahead / ((before + requests) / 2.0))
         self.largest_change = max(self.largest_change, change)
         requests = ahead or ((before + requests) / 2.0 if before > 0.0 else requests)
