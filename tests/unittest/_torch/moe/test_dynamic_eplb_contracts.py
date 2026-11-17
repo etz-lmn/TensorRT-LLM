@@ -2453,6 +2453,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
         "_route_quant_eligible",
         "_partials_route",
         "_route_only",
+        "_adaptive_fused_route",
     }
     available = {
         n.name for n in ast.walk(ast.parse(source.read_text())) if isinstance(n, ast.FunctionDef)

@@ -1945,7 +1945,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                         token_selected_experts, router_logits_chunk_real, row_offset
                     )
             maps_expert_slots = getattr(moe.backend, "maps_expert_slots", False)
-            if fused_result is not None and fused_result.routes_mapped:
+            if fused_result is not None and getattr(fused_result, "routes_mapped", False):
                 # The fused launch staged the slots in the bucket and counted the statistics.
                 moe._load_balancer_done_wait_gpu_stage(is_first_call)
                 token_selected_slots = token_selected_experts
