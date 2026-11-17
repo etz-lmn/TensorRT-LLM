@@ -911,19 +911,31 @@ class DSv4RouteNvfp4QuantKernel:
         if kept:
             staged = weight
         staged_weights[row, lane] = staged.to(staged_weights.element_type)
-        valid = expert >= Int32(0) and expert < num_experts
+        # Flags as Int32 (0/1): the expert is in the table, routable (weightedSlot's checks), replicated.
+        valid = Int32(0)
+        if expert >= Int32(0):
+            if expert < num_experts:
+                valid = Int32(1)
+        routable = Int32(0)
         copies = Int32(0)
         start = Int32(-1)
-        if valid:
+        if valid != Int32(0):
             copies = Int32(table[expert])
             start = Int32(table[num_experts + expert])
-        routable = valid and copies > Int32(0) and start >= Int32(0) and start + copies <= num_slots
+            if copies > Int32(0):
+                if start >= Int32(0):
+                    if start + copies <= num_slots:
+                        routable = Int32(1)
+        replicated = Int32(0)
+        if routable != Int32(0):
+            if copies > Int32(1):
+                replicated = Int32(1)
         slot = Int32(-1)
         if kept:
             slot = num_slots
-            if routable:
+            if routable != Int32(0):
                 slot = Int32(table[2 * num_experts + start])
-        if routable and copies > Int32(1):
+        if replicated != Int32(0):
             # Mark the pick's split block (relaxed: published by the arrival's release below).
             cute.arch.atomic_add(
                 state.iterator + state.shape[0] // 2 + f // ADAPTIVE_SPLIT_BLOCK, Int32(1), sem="relaxed", scope="gpu"
@@ -934,9 +946,10 @@ class DSv4RouteNvfp4QuantKernel:
             staged_ids[row, lane] = slot.to(staged_ids.element_type)
         if cutlass.const_expr(self.adaptive_stats):
             if Int32(enabled_t[0]) != Int32(0):
-                if kept and valid:
-                    # Integer counts in float32 add exactly in any order while a row stays below 2^24.
-                    cute.arch.atomic_add(rows_t.iterator + expert, Float32(1.0), sem="relaxed", scope="gpu")
+                if kept:
+                    if valid != Int32(0):
+                        # Integer counts in float32 add exactly in any order while a row stays below 2^24.
+                        cute.arch.atomic_add(rows_t.iterator + expert, Float32(1.0), sem="relaxed", scope="gpu")
 
     @cute.jit
     def adaptive_arrive(self, num_tokens: Int32, row: Int32, lane: Int32, adapt):
@@ -1049,11 +1062,14 @@ class DSv4RouteNvfp4QuantKernel:
         """The expert if it is routable with several copies (its picks need the block's ordinal), else num_experts."""
         num_experts = self.num_experts
         spread = Int32(num_experts)
-        if expert >= Int32(0) and expert < num_experts:
-            copies = Int32(table[expert])
-            start = Int32(table[num_experts + expert])
-            if copies > Int32(1) and start >= Int32(0) and start + copies <= num_slots:
-                spread = expert
+        if expert >= Int32(0):
+            if expert < num_experts:
+                copies = Int32(table[expert])
+                start = Int32(table[num_experts + expert])
+                if copies > Int32(1):
+                    if start >= Int32(0):
+                        if start + copies <= num_slots:
+                            spread = expert
         return spread
 
     @cute.jit
