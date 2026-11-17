@@ -1669,6 +1669,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
     # The fused launch also maps, stages and counts an adaptive load balancer's routes (adaptive_route).
     fuses_adaptive_route = True
+    # run_moe calls MoERunContext.after_staging between the route's staging and the dispatch launch.
+    runs_after_staging = True
 
     def try_fused_route_quant(
         self,
@@ -2055,6 +2057,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             )
         elif route is not None:
             token_selected_experts = route()
+        after_staging = getattr(ctx, "after_staging", None)
+        if after_staging is not None:
+            after_staging()
 
         # Routes stay as produced: the route staging widens int32 to the
         # kernel's index dtype, and it is the first route reader.
