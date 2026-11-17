@@ -233,18 +233,49 @@ class MoEScheduler(ABC):
             return None
         return route(router_logits.to(torch.float32).contiguous())
 
+    def _adaptive_fused_route(self, x, routing_aux, route_counters, first: bool) -> Optional[tuple]:
+        """The adaptive balancer's route for a backend launch that maps, stages and counts it with the
+        routing and quantization (``fuses_adaptive_route``), or None to route as before: a routing aux,
+        a router weight on the input, a dynamic balancer or replica plan, a quantized input, warmup
+        counters, or a recorder of the slots need the separate launches."""
+        moe = self.moe
+        if (
+            routing_aux is not None
+            or moe.apply_router_weight_on_input
+            or moe._using_dynamic_load_balancer()
+            or moe._load_balancer_uses_replica_plan()
+            or not getattr(moe.layer_load_balancer, "stages_routes", False)
+            or not getattr(moe.backend, "fuses_adaptive_route", False)
+            or not moe.backend.fused_route_quant_enabled
+            or isinstance(x, Fp4QuantizedTensor)
+            or route_counters is not None
+            or _routes_recorded()
+        ):
+            return None
+        return moe.layer_load_balancer.fused_route(first)
+
     def _try_fused_route_quant(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         routing_aux: Optional[torch.Tensor],
         route_counters=None,
+        first: bool = True,
+        adaptive: bool = False,
     ) -> Optional[MoEFusedRouteQuant]:
         """The backend's one-launch routing and input quantization (only the routing for an input
         that arrives quantized), unless a routing aux, a router weight on the input, a dynamic
         balancer or a cleared ``fused_route_quant_enabled`` needs the separate launches. A backend
         that ``counts_routes`` also adds the picks to the warmup placement's ``route_counters``."""
         moe = self.moe
+        # Only a caller that handles ``routes_mapped`` (the fused-comm forward) asks for the adaptive mode.
+        adaptive_route = (
+            self._adaptive_fused_route(x, routing_aux, route_counters, first) if adaptive else None
+        )
+        if adaptive_route is not None:
+            return moe.backend.try_fused_route_quant(
+                x, router_logits, adaptive_route=adaptive_route
+            )
         if not self._route_quant_eligible(routing_aux):
             return None
         if isinstance(x, Fp4QuantizedTensor):
@@ -1848,6 +1879,8 @@ class FusedCommMoEScheduler(MoEScheduler):
                 router_logits_chunk_real,
                 routing_aux,
                 moe._warmup_placement_route_counters(row_offset),
+                first=is_first_call,
+                adaptive=True,
             )
             if num_tokens > 0 and not uses_replica_plan
             else None
@@ -1914,7 +1947,11 @@ class FusedCommMoEScheduler(MoEScheduler):
                         token_selected_experts, router_logits_chunk_real, row_offset
                     )
             maps_expert_slots = getattr(moe.backend, "maps_expert_slots", False)
-            if moe.layer_load_balancer and not maps_expert_slots:
+            if fused_result is not None and getattr(fused_result, "routes_mapped", False):
+                # The fused launch staged the slots in the bucket and counted the statistics.
+                moe._load_balancer_done_wait_gpu_stage(is_first_call)
+                token_selected_slots = token_selected_experts
+            elif moe.layer_load_balancer and not maps_expert_slots:
                 statistic_allreduce_pending = True
                 moe._load_balancer_done_wait_gpu_stage(is_first_call)
                 # ignore_allreduce=False: the fused kernel has no side channel

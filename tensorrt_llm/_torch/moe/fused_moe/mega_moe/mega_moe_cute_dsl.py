@@ -127,7 +127,11 @@ from .shared_expert import (
 )
 
 if IS_CUTLASS_DSL_AVAILABLE:
-    from ....moe.kernels.blackwell.dsv4_route_quant import dsv4_route, dsv4_route_nvfp4_quant
+    from ....moe.kernels.blackwell.dsv4_route_quant import (
+        AdaptiveRoute,
+        dsv4_route,
+        dsv4_route_nvfp4_quant,
+    )
 
 __all__ = [
     "MegaMoECuteDsl",
@@ -1663,18 +1667,26 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         )
         return ids, weights
 
+    # The fused launch also maps, stages and counts an adaptive load balancer's routes (adaptive_route).
+    fuses_adaptive_route = True
+
     def try_fused_route_quant(
         self,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         route_counters: Optional[RouteCounters] = None,
+        adaptive_route: Optional[tuple] = None,
     ) -> Optional[MoEFusedRouteQuant]:
         """Sqrt-softplus routing and NVFP4 input quantization in one launch, written straight into
         the launch bucket's kernel inputs once the scheduler has chosen the bucket; a static
-        placement's slots go into the bucket and ``route_counters`` get the picks."""
+        placement's slots go into the bucket and ``route_counters`` get the picks. With
+        ``adaptive_route`` (an adaptive balancer's ``fused_route``) the bucket gets its slots and the
+        launch counts its statistics, as ``adaptive_eplb_route_into``; None without a bucket."""
         if not self._route_quant_fuses():
             return None
         bucket = self._route_quant_bucket(x.shape[0], self.routing_method.top_k, x.device, x.dtype)
+        if adaptive_route is not None:
+            return self._fused_adaptive_route_quant(x, router_logits, bucket, adaptive_route)
         table = self._slot_of_expert
         shared_target = self._shared_activation_target(x.shape[0])
         ids, weights, x_fp4, x_sf, _ = dsv4_route_nvfp4_quant(
@@ -1698,6 +1710,35 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         return MoEFusedRouteQuant(
             ids, weights, x_fp4, x_sf, routes_counted=route_counters is not None
         )
+
+    def _fused_adaptive_route_quant(self, x, router_logits, bucket, adaptive_route):
+        """The adaptive mode of the fused launch into ``bucket``: the bucket's live-row word as
+        ``route_staging`` hands it out, the returned routes stay the routing's."""
+        if bucket is None or self._slot_of_expert is not None:
+            return None
+        table, ep_rank, statistics, first = adaptive_route
+        word = (
+            live_rows.current_word(x.device)
+            if bucket[0].shape[0] in self._padding_drop_buckets
+            else None
+        )
+        shared_target = self._shared_activation_target(x.shape[0])
+        ids, weights, x_fp4, x_sf, _ = dsv4_route_nvfp4_quant(
+            router_logits,
+            self.routing_method.e_score_correction_bias,
+            x,
+            self.fc31_input_scale,
+            self.routing_method.top_k,
+            self.routing_method.routed_scaling_factor,
+            torch.float32,
+            staged=bucket,
+            mxfp8=None if shared_target is None else shared_target[1:],
+            adaptive=AdaptiveRoute(table, ep_rank, statistics, first, word),
+        )
+        if shared_target is not None:
+            self._shared_quantized = (shared_target[0], x.shape[0])
+        self._prestaged = (bucket[0], ids, weights, x_fp4, x_sf)
+        return MoEFusedRouteQuant(ids, weights, x_fp4, x_sf, routes_mapped=True)
 
     def _route_quant_bucket(self, num_tokens: int, top_k: int, device, output_dtype):
         """The chosen launch bucket's (ids, weights, activation, scales) when the fused launch can
