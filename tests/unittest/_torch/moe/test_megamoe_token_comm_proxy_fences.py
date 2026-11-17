@@ -21,6 +21,10 @@ model orders accesses of two proxies only across a proxy fence, so the acquire o
 ``fc2_done`` alone does not order those rows before token-back's TMA read of them: every
 thread that acquires ``fc2_done`` issues ``fence.proxy.async.global`` before the read.
 
+Token-in has the same order to keep: after ``metadata_ready`` it pulls the peers' rows with TMA,
+rows written with generic stores (the one-round plane rows, or the peers' staged inputs), so it
+issues the fence after that wait on every dispatch path.
+
 The check reads the sources only (no GPU, no import of the kernels).
 """
 
@@ -101,4 +105,38 @@ def test_tma_reads_of_fc2_rows_follow_a_proxy_fence(source: str) -> None:
             after = after[1:]
         if after[:1] != [_GLOBAL_FENCE]:
             unfenced.append(f"{source}:{lineno} {method} reads the FC2 rows with TMA unfenced")
+    assert not unfenced, "\n".join(unfenced)
+
+
+def _token_in_metadata_waits() -> list[tuple[int, list[str]]]:
+    """Each wait for metadata_ready in token_comm.py's token_in as (line, the statement after it)."""
+    waits = []
+    tree = ast.parse((_NVLINK_DOMAIN / "token_comm.py").read_text())
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.FunctionDef) or function.name != "token_in":
+            continue
+        for node in ast.walk(function):
+            body = getattr(node, "body", None)
+            if not isinstance(body, list):
+                continue
+            for index, statement in enumerate(body):
+                call = statement.value if isinstance(statement, ast.Expr) else None
+                if (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "wait_for_metadata_ready"
+                ):
+                    after = [ast.unparse(s) for s in body[index + 1 : index + 2]]
+                    waits.append((statement.lineno, after))
+    return waits
+
+
+def test_token_in_fences_the_rows_metadata_ready_publishes() -> None:
+    waits = _token_in_metadata_waits()
+    assert waits, "token_comm.py: token_in no longer waits for metadata_ready"
+    unfenced = [
+        f"token_comm.py:{lineno} token_in pulls the peers' rows with TMA unfenced"
+        for lineno, after in waits
+        if after != ["fence_proxy_async_global()"]
+    ]
     assert not unfenced, "\n".join(unfenced)
