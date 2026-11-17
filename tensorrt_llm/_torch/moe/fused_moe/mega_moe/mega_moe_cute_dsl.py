@@ -1330,11 +1330,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._profiling_scratch_provider_ref = None
         self._launch_buffers.clear()
         for max_T in self._maxt_buckets:
-            (
-                shared_workspace_bytes,
-                supports_direct_inputs,
-                masks_invalid_routes,
-            ) = query_megamoe_kernel_properties(
+            properties = query_megamoe_kernel_properties(
                 world_size=self.ep_size,
                 num_topk=top_k,
                 num_experts_per_rank=self.compute_slot_count,
@@ -1359,9 +1355,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
             )
-            if supports_direct_inputs:
+            shared_workspace_bytes = properties.shared_workspace_bytes
+            if properties.supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)
-            if masks_invalid_routes:
+            if properties.masks_invalid_routes:
                 self._padding_drop_buckets.add(max_T)
             provider = get_megamoe_symm_provider(
                 process_group=self._ep_pg,
@@ -1965,11 +1962,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 query_megamoe_kernel_properties,
             )
 
-            (
-                shared_bytes,
-                supports_direct_inputs,
-                masks_invalid_routes,
-            ) = query_megamoe_kernel_properties(
+            properties = query_megamoe_kernel_properties(
                 world_size=1,
                 num_topk=top_k,
                 num_experts_per_rank=self.compute_slot_count,
@@ -1994,15 +1987,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
             )
-            if supports_direct_inputs:
+            if properties.supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)
-            if masks_invalid_routes:
+            if properties.masks_invalid_routes:
                 self._padding_drop_buckets.add(max_T)
             # zeros (not empty): the leading counter prefix is an atomic-add
             # target the kernel only tail-resets for the NEXT launch, so the
             # FIRST launch needs it pre-zeroed (one-time; cached per bucket).
             staging["shared_workspace"] = torch.zeros(
-                shared_bytes, dtype=torch.uint8, device=device
+                properties.shared_workspace_bytes, dtype=torch.uint8, device=device
             )
         cached[cache_key] = staging
         return staging

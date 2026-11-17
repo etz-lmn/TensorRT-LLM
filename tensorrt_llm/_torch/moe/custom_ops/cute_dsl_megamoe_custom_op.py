@@ -38,7 +38,7 @@ import dataclasses
 import functools
 import math
 import weakref
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -1284,6 +1284,19 @@ def _require_megamoe_shared_workspace(
         )
 
 
+class MegaMoeKernelProperties(NamedTuple):
+    """What a bucket's default kernel tells the backend before its first launch
+    (``query_megamoe_kernel_properties``). Read the fields by name: a new field then breaks no
+    caller."""
+
+    shared_workspace_bytes: int
+    # The kernel reads the caller's inputs in place (an exact-size generation-phase bucket).
+    supports_direct_inputs: bool
+    # The kernel's top-k reduce masks routes with an invalid expert, so routes staged as -1
+    # drop their rows.
+    masks_invalid_routes: bool
+
+
 def megamoe_activation_sf_bytes_per_row(hidden_size: int) -> int:
     """Return the per-row byte width the MegaMoE kernel expects for the
     activation SF tensor.
@@ -2422,7 +2435,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         situ_linear_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
-    ) -> Tuple[int, bool, bool]:
+    ) -> MegaMoeKernelProperties:
         """Probe the default kernel: its shared workspace bytes, whether it reads its inputs in
         place (direct inputs), and whether its top-k reduce masks routes with an invalid expert
         (``masks_invalid_combine_slots``), so that routes staged as -1 drop their rows."""
@@ -2543,10 +2556,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # otherwise the provider carves an undersized shared region and the
         # combine staging writes OOB (single-rank IMA; EP>1 looks like a hang).
         _, shared_bytes = probe.get_workspace_sizes()
-        return (
-            int(shared_bytes),
-            isinstance(probe, RubinInferenceGenphaseMegaMoE),
-            bool(getattr(probe, "masks_invalid_combine_slots", False)),
+        return MegaMoeKernelProperties(
+            shared_workspace_bytes=int(shared_bytes),
+            supports_direct_inputs=isinstance(probe, RubinInferenceGenphaseMegaMoE),
+            masks_invalid_routes=bool(getattr(probe, "masks_invalid_combine_slots", False)),
         )
 
     def _megamoe_autotune_num_tokens(shapes: List[torch.Size]) -> int:

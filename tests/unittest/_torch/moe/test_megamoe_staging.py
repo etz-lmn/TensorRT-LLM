@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests of the MegaMoE CuteDSL backend's staging of the next run."""
 
+import importlib
 import types
 from dataclasses import replace
 from types import SimpleNamespace
@@ -515,3 +516,84 @@ def test_routes_replaced_after_the_fused_route_quant_are_staged_without_the_acti
     expected = backend.slots_of_experts(replaced) if static_slots else replaced
     assert len(staged_routes) == 1 and torch.equal(staged_routes[0], expected)
     assert backend._quantized_into is None and backend._prestaged is None
+
+
+_GLM_SM107 = (
+    "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
+    "glm_5_2_nvfp4__sm_107__high_throughput"
+)
+
+
+def test_rubin_glm_buckets_read_the_kernel_properties_by_name(monkeypatch):
+    """The GLM-5.2 SM107 wrapper of the kernel-properties query returns the shared record from
+    both its branches, and its provider allocation reads every field, so a multi-rank
+    initialization over buckets outside the generation-phase ones does not fail to unpack it."""
+    from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as shared
+    from tensorrt_llm._torch.utils import ActivationType
+
+    if not shared.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip("the MegaMoE CuteDSL op is not available")
+    try:
+        runner = importlib.import_module(_GLM_SM107 + ".ops.moe.megamoe_runner")
+        megamoe = importlib.import_module(_GLM_SM107 + ".ops.moe.megamoe")
+    except NoTarget as error:
+        pytest.skip(f"this installation does not carry the GLM-5.2 SM107 target: {error}")
+
+    class GenerationPhaseRunner:
+        def __init__(self, local_rank, output_dtype, **kwargs):
+            self.max_tokens_per_rank = kwargs["max_tokens_per_rank"]
+
+        def unique_id(self):
+            return "generation-phase"
+
+        def _resolve_kernel_descriptor(self, tactic, allow_fallback):
+            return SimpleNamespace(get_workspace_sizes=lambda: (0, 2048)), None
+
+    generic = shared.MegaMoeKernelProperties(4096, False, True)
+    monkeypatch.setattr(
+        shared, "query_megamoe_kernel_properties", lambda **kw: generic, raising=False
+    )
+    monkeypatch.setattr(runner, "RubinMegaMoERunner", GenerationPhaseRunner)
+    monkeypatch.setattr(runner, "_default_megamoe_tactic_for_key", lambda key, num_tokens: None)
+    providers = []
+    monkeypatch.setattr(
+        shared,
+        "get_megamoe_symm_provider",
+        lambda **kw: providers.append(kw["shared_workspace_bytes"]) or object(),
+        raising=False,
+    )
+    ladder = (32, 64, 128, 192, 256, 1024, 4096)
+    backend = SimpleNamespace(
+        _ep_pg=object(),
+        routing_method=SimpleNamespace(experts_per_token=8),
+        _maxt_buckets=ladder,
+        _profiling_scratch_provider_ref=None,
+        _launch_buffers={},
+        ep_size=16,
+        ep_rank=0,
+        compute_slot_count=16,
+        hidden_size=6144,
+        intermediate_size_per_partition=2048,
+        expand_intermediate_size_per_partition=4096,
+        apply_topk_in_fc1=True,
+        act_clamp=None,
+        activation_type=ActivationType.Swiglu,
+        act_alpha=None,
+        act_beta=None,
+        _use_in_kernel_fc2_reduce=lambda max_T: False,
+        combine_format="bf16",
+        _genphase_direct_input_buckets=set(),
+        _padding_drop_buckets=set(),
+        dtype=torch.bfloat16,
+        _symm_providers={},
+        tactic_autotune=False,
+    )
+    megamoe.RubinMegaMoE._alloc_symm_provider(backend)
+    generation_phase = set(runner.GEN_TOKEN_BUCKETS) & set(ladder)
+    assert backend._genphase_direct_input_buckets == generation_phase
+    assert backend._padding_drop_buckets == set(ladder) - generation_phase
+    assert providers == [2048 if bucket in generation_phase else 4096 for bucket in ladder]
+    for bucket in (64, 256):
+        properties = runner.query_rubin_kernel_properties(max_tokens_per_rank=bucket)
+        assert isinstance(properties, shared.MegaMoeKernelProperties)
