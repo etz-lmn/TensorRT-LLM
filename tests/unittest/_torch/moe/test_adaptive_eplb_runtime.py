@@ -692,6 +692,21 @@ def test_one_slow_copy_does_not_price_the_next_installs_out(monkeypatch):
     assert decider.decide(1).moved == [0, 1]
 
 
+def test_copies_timed_in_service_price_the_installs_after_them(monkeypatch):
+    monkeypatch.setattr(rt, "solve_shares", even_split)
+    costs = []
+    monkeypatch.setattr(
+        rt, "choose_layers_to_install", lambda *args: costs.append(args[2]) or REAL_CHOOSE(*args)
+    )
+    decider = after_window_0(4.0, remaining=800)  # start-up 0.5 ms per replica; then 4 ms over 4
+    window_stats(decider.stats, (4, 5), live=0, remaining=800)
+    assert decider.decide(1).moved == [0, 1]
+    decider.schedule(1, np.array([[30, 2, 4.0, 0]] * R))  # 1 ms per replica again
+    window_stats(decider.stats, live=1, remaining=8)  # one step left: both copies are past it
+    decider.decide(2)
+    assert costs[-1] == {layer: 2 * cost for layer, cost in costs[0].items()}
+
+
 def test_decision_process_answers_and_reports_its_failure():
     process = rt.DecisionProcess(rt.DecisionConfig(GEOMETRY, MODEL, np.tile(HOME, (L, 1)), 1, 1))
     try:
