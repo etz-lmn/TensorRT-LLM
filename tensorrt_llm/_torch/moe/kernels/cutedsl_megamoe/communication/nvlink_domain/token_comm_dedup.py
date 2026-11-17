@@ -2235,8 +2235,10 @@ class TokenCommDedup(KernelComponent):
                         if completed_expert_prefix <= local_expert:
                             nanosleep(wait_sleep_ns)
                             wait_sleep_ns = cutlass.min(wait_sleep_ns * Int32(2), Int32(self.fc2_done_wait_sleep_max_ns))
-                    # Order every lane's fc2_done acquire before the TMA that reads the completed copies.
+                    # Order every lane's fc2_done acquire before the TMA that reads the completed copies: the warp
+                    # barrier orders the lanes, the proxy fence orders the async-proxy read after the acquires.
                     cute.arch.sync_warp()
+                    cute.arch.fence_proxy("async.global")
                     iket.range_pop()
                     block_index = Int64(metadata.src_token) * Int64(self.world_size) + Int64(metadata.src_rank)
                     block_address = order_pointer.toint() + block_index * Int64(self.order_block_bytes)

@@ -3002,6 +3002,9 @@ class TokenCommNonDeterministic(KernelComponent):
                 iket.range_push("token_back.wait_fc2")
                 while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
                     nanosleep(500)
+                # The FC2 epilogue writes the rows this counter publishes with ordinary stores
+                # (data rows on the non-bulk path, scale rows on every path); TMA reads them below.
+                cute.arch.fence_proxy("async.global")
                 iket.range_pop()
             chunk_total = token_count * Int32(chunk_count)
             pool_expert_base = pool_expert_bases[local_expert]
@@ -3228,6 +3231,9 @@ class TokenCommNonDeterministic(KernelComponent):
                     iket.range_push("token_back.wait_fc2")
                     while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
                         nanosleep(500)
+                    # The FC2 epilogue writes the rows this counter publishes with ordinary stores
+                    # (data rows on the non-bulk path, scale rows on every path); TMA reads them below.
+                    cute.arch.fence_proxy("async.global")
                     iket.range_pop()
 
             while next_dense_token < expert_valid_end:
@@ -3241,6 +3247,9 @@ class TokenCommNonDeterministic(KernelComponent):
                             self.fc2_done_signals_per_token_tile
                         ):
                             nanosleep(500)
+                        # The FC2 epilogue writes the rows this counter publishes with ordinary stores
+                        # (data rows on the non-bulk path, scale rows on every path); TMA reads them below.
+                        cute.arch.fence_proxy("async.global")
                         iket.range_pop()
                         last_ready_slot = ready_slot
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
