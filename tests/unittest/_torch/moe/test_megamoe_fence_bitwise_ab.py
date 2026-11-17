@@ -15,11 +15,12 @@
 """Bitwise A/B of MegaMoE outputs across two builds of the token communication (a measurement driver).
 
 Runs the four-rank MegaMoE layer of test_megamoe_live_rows_gpu.py with the NVFP4 combine, the
-configuration whose token-back waits for fc2_done and reads the FC2 rows with TMA. Each run
-saves every rank's outputs under a directory named by the digest of the token_comm.py it
-imported; when a directory of another digest is already there (the other arm of a one-node
-A/B, which runs first), the outputs must be equal bit for bit.
-A proxy fence orders memory and changes no arithmetic, so any difference is a failure.
+configuration whose token-back waits for fc2_done and reads the FC2 rows with TMA. Each arm
+saves every rank's outputs, with the digest of the token_comm.py module it ran, into a
+directory of its own, named by the arm (the stem of its JUnit file). When the other arm's
+directory is already there (the arm that ran first), this arm only reads it: the two digests
+must differ (else the A/B compared one build with itself) and the outputs must be equal bit
+for bit. A proxy fence orders memory and changes no arithmetic, so any difference is a failure.
 
 The run also records, from the kernel descriptor the forward used, that token-back pushes the
 FC2 rows (token_back_push_data) and that the FC2 epilogue stores them without bulk copies:
@@ -29,10 +30,12 @@ directory); without either the test skips.
 """
 
 import hashlib
+import importlib
 import json
 import os
 import pickle
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,25 +54,65 @@ MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCO
 _COMBINE_FORMAT = "16e2m1xbf16"
 _SEEDS = (1, 2, 3)
 _TOKEN_COMM = (
-    "tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/communication/nvlink_domain/token_comm.py"
+    "tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.communication.nvlink_domain.token_comm"
 )
+_JUNIT_SUFFIX = ".junit.xml"
 
 
-def _dump_root(config: pytest.Config) -> Path | None:
-    root = os.environ.get("MEGAMOE_BITWISE_DUMP_ROOT")
-    if root:
-        return Path(root)
+def _dump_root_and_arm(config: pytest.Config) -> tuple[Path, str] | None:
+    """The directory both arms write under and this arm's name (its JUnit file's stem), or None."""
     junit = config.getoption("xmlpath", None)
-    if not junit:
-        return None
-    return Path(junit).resolve().parent / "megamoe-fence-bitwise" / _COMBINE_FORMAT
+    arm = os.environ.get("MEGAMOE_BITWISE_ARM") or (
+        Path(junit).name.removesuffix(_JUNIT_SUFFIX) if junit else None
+    )
+    root = os.environ.get("MEGAMOE_BITWISE_DUMP_ROOT")
+    if root is None and junit:
+        root = str(Path(junit).parent / "megamoe-fence-bitwise" / _COMBINE_FORMAT)
+    return (Path(root), arm) if root and arm else None
 
 
 def _token_comm_digest() -> str:
-    import tensorrt_llm
+    """The digest of the token_comm.py this process imported, read at the module's own path: the A/B
+    harness overlays a changed file as a copy and an unchanged one as a symlink, so the path must not
+    be resolved to the image's package directory."""
+    module = importlib.import_module(_TOKEN_COMM)
+    return hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()[:16]
 
-    source = Path(tensorrt_llm.__file__).resolve().parent.parent / _TOKEN_COMM
-    return hashlib.sha256(source.read_bytes()).hexdigest()[:16]
+
+def _record_and_compare(root: Path, arm: str, digest: str, results: list) -> int:
+    """Write this arm's outputs into root/<arm>, then compare them with every other arm already there.
+
+    Returns how many other arms were compared. The arm's own directory must not exist yet: a rerun of
+    the same arm into one run directory is refused rather than mixed with an earlier dump."""
+    mine = root / arm
+    assert not mine.exists(), f"{mine} already holds a dump of arm {arm}: refused, not overwritten"
+    root.mkdir(parents=True, exist_ok=True)  # shared by both arms
+    staging = Path(tempfile.mkdtemp(prefix=f".{arm}.", dir=root))  # always a new directory
+    for result in results:
+        torch.save(result["outputs"], staging / f"rank{result['rank']}.pt")
+    (staging / "path.json").write_text(
+        json.dumps(dict(arm=arm, digest=digest, paths=[r["path"] for r in results]), indent=1)
+        + "\n"
+    )
+    staging.rename(mine)
+
+    others = sorted(
+        d for d in root.iterdir() if d.is_dir() and d.name != arm and not d.name.startswith(".")
+    )
+    for other in others:
+        theirs_meta = json.loads((other / "path.json").read_text())
+        assert theirs_meta["digest"] != digest, (
+            f"arms {other.name} and {arm} imported the same token_comm.py ({digest}): nothing was compared"
+        )
+        for result in results:
+            theirs = torch.load(other / f"rank{result['rank']}.pt")
+            assert len(theirs) == len(result["outputs"])
+            for index, (a, b) in enumerate(zip(theirs, result["outputs"])):
+                assert torch.equal(a, b), (
+                    f"rank {result['rank']} output {index} differs between arm {other.name} "
+                    f"(token_comm {theirs_meta['digest']}) and arm {arm} (token_comm {digest})"
+                )
+    return len(others)
 
 
 def _worker(seeds: tuple) -> dict:
@@ -231,9 +274,12 @@ def test_megamoe_nvfp4_outputs_are_bitwise_equal_across_builds(
 ) -> None:
     from _torch.moe.test_megamoe_live_rows_gpu import _WORLD, _init_worker
 
-    root = _dump_root(request.config)
-    if root is None:
-        pytest.skip("needs a JUnit file (the one-node A/B harness) or MEGAMOE_BITWISE_DUMP_ROOT")
+    located = _dump_root_and_arm(request.config)
+    if located is None:
+        pytest.skip(
+            "needs a JUnit file (the one-node A/B harness) or MEGAMOE_BITWISE_DUMP_ROOT and _ARM"
+        )
+    root, arm = located
     with MPIPoolExecutor(
         initializer=_init_worker, initargs=(sys.path,), max_workers=_WORLD
     ) as executor:
@@ -248,24 +294,4 @@ def test_megamoe_nvfp4_outputs_are_bitwise_equal_across_builds(
         for first, again in zip(outs[0::3], outs[1::3]):
             assert torch.equal(first, again), f"rank {result['rank']}: a repeat differs"
 
-    digest = _token_comm_digest()
-    mine = root / digest
-    mine.mkdir(parents=True, exist_ok=False)
-    for result in results:
-        torch.save(result["outputs"], mine / f"rank{result['rank']}.pt")
-    arm = Path(request.config.getoption("xmlpath", None) or "unknown").stem
-    (mine / "path.json").write_text(
-        json.dumps(dict(arm=arm, paths=[r["path"] for r in results]), indent=1) + "\n"
-    )
-
-    others = [d for d in root.iterdir() if d.is_dir() and d.name != digest]
-    assert len(others) <= 1, f"more than two builds under {root}: {sorted(d.name for d in others)}"
-    for other in others:
-        for result in results:
-            theirs = torch.load(other / f"rank{result['rank']}.pt")
-            assert len(theirs) == len(result["outputs"])
-            for index, (a, b) in enumerate(zip(theirs, result["outputs"])):
-                assert torch.equal(a, b), (
-                    f"rank {result['rank']} output {index} differs between token_comm "
-                    f"{other.name} and {digest}"
-                )
+    _record_and_compare(root, arm, _token_comm_digest(), results)
