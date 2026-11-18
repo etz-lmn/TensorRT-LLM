@@ -680,22 +680,7 @@ class _OneRoundRouter(KernelComponent):
         # Adaptive route: the rows this launch counts (the live rows of the forward's token rows, none while the
         # recording flag is clear), and the forward count, once per forward from one thread of the grid.
         if cutlass.const_expr(self.adaptive_route_experts > 0):
-            tables, rows, forwards, enabled, word_address, num_tokens, first = adaptive
-            word = _ld_s32(word_address)
-            real = word & Int32(0xFFFF)
-            requests = (word >> Int32(16)) & Int32(0xFFFF)
-            counted_rows = num_tokens
-            if requests == Int32(0):
-                counted_rows = Int32(0)
-            elif real < requests:
-                if num_tokens % requests == Int32(0):
-                    counted_rows = num_tokens // requests * real
-            if _ld_s32(enabled) == Int32(0):
-                counted_rows = Int32(0)
-            elif cta_idx == Int32(0):
-                if thread_idx == Int32(0):
-                    if first != Int32(0):
-                        _red_add_u64(forwards, Int64(1))
+            counted_rows = self._adaptive_counted_rows(adaptive, cta_idx, thread_idx)
 
         for token_round in cutlass.range_constexpr(self.token_rounds):
             token = global_warp_idx + Int32(token_round * self.global_warp_count)
@@ -712,9 +697,7 @@ class _OneRoundRouter(KernelComponent):
                         )
                         expert = Int32(raw_index)
                         if lane_valid:
-                            if token < counted_rows:
-                                _red_add_f32(rows + Int64(expert) * Int64(4), cutlass.Float32(1.0))
-                            expert = self._adaptive_slot(tables, expert, token, local_rank)
+                            expert = self._adaptive_pick(adaptive, counted_rows, expert, token, local_rank)
                             lane_valid = expert >= Int32(0)
                     else:
                         # Int64 ids; a negative one compares as a large unsigned value.
@@ -795,6 +778,40 @@ class _OneRoundRouter(KernelComponent):
                     peer_rank_ptr_mapper.map(count_address, destination, Int64(0)),
                     epoch_tag | (destination_count[destination] + Int32(1)),
                 )
+
+    @cute.jit
+    def _adaptive_counted_rows(self, adaptive: tuple, cta_idx: Int32, thread_idx: Int32) -> Int32:
+        """The token rows whose picks this launch counts: the live rows of the forward's rows by its live-row
+        word (adaptiveEplbKernels.cu liveIdCount), none while the recording flag is clear. Thread 0 of CTA 0 also
+        adds the forward to the forward count on the forward's first call."""
+        _, _, forwards, enabled, word_address, num_tokens, first = adaptive
+        word = _ld_s32(word_address)
+        real = word & Int32(0xFFFF)
+        requests = (word >> Int32(16)) & Int32(0xFFFF)
+        counted_rows = num_tokens
+        if requests == Int32(0):
+            counted_rows = Int32(0)
+        elif real < requests:
+            if num_tokens % requests == Int32(0):
+                counted_rows = num_tokens // requests * real
+        if _ld_s32(enabled) == Int32(0):
+            counted_rows = Int32(0)
+        elif cta_idx == Int32(0):
+            if thread_idx == Int32(0):
+                if first != Int32(0):
+                    _red_add_u64(forwards, Int64(1))
+        return counted_rows
+
+    @cute.jit
+    def _adaptive_pick(
+        self, adaptive: tuple, counted_rows: Int32, expert: Int32, token: Int32, ep_rank: Int32
+    ) -> Int32:
+        """One pick of ``expert`` (a valid id) in token row ``token``: counted into the statistics row when the
+        row is counted, and routed to its slot (-1 for a malformed table entry)."""
+        tables, rows = adaptive[0], adaptive[1]
+        if token < counted_rows:
+            _red_add_f32(rows + Int64(expert) * Int64(4), cutlass.Float32(1.0))
+        return self._adaptive_slot(tables, expert, token, ep_rank)
 
     @cute.jit
     def _adaptive_slot(self, tables: Int64, expert: Int32, token: Int32, ep_rank: Int32) -> Int32:
