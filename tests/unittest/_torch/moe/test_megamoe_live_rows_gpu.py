@@ -139,6 +139,9 @@ def _published_counts(
 def test_published_counts_uses_the_forward_descriptor_not_cached_variants(monkeypatch):
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
 
+    if not op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(op.MEGAMOE_OP_UNAVAILABLE_REASON))
+
     width, experts, rank, bucket = 4, 3, 2, 16
     router = SimpleNamespace(
         sizes_by_rank_region=object(), expert_count_padded=width, expert_count=experts

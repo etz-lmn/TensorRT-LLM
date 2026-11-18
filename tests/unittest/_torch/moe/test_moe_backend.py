@@ -4819,6 +4819,25 @@ def test_megamoe_helper_bearing_candidates_offer_atomic_counter_work_ids(sm_vers
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [100, 103])
+def test_megamoe_blackwell_candidates_offer_no_token_tile(sm_version: int) -> None:
+    """The vendored SM100 / SM103 kernel refuses token_tile readiness at build time, so neither the
+    load-balanced candidates nor the validator offer it there."""
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    for tokens in (_MEGAMOE_HELPER_TOKENS, 2048, _MEGAMOE_PREFILL_TOKENS):
+        tactics = megamoe_op.enumerate_megamoe_candidate_tactics(
+            tokens, sm_version=sm_version, load_balance=True
+        )
+        assert tactics
+        assert all(megamoe_op._unpack_tactic(t)[-1] == "expert" for t in tactics)
+    token_tile = megamoe_op._unpack_tactic(megamoe_op._MEGAMOE_NVFP4_COMBINE_BULK_TACTIC)
+    token_tile = (*token_tile[:4], "atomic_counter", *token_tile[5:-1], "token_tile")
+    with pytest.raises(ValueError, match="token_tile builds on SM107 only"):
+        megamoe_op.validate_megamoe_tactic(token_tile, sm_version=sm_version)
+
+
+@pytest.mark.cpu_only
 def test_megamoe_helper_bearing_work_ids_keep_sm107_candidates() -> None:
     """A twin differs from its candidate only in its work ids; SM107 keeps its candidates."""
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op

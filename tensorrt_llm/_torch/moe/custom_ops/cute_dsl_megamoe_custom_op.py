@@ -1529,6 +1529,10 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
         #     requires use_bulk_fc2_store, and get_valid_tactics already drops
         #     every bulk candidate when in_kernel_fc2_reduce is set.
         unmet = []
+        if sm_version in (100, 103):
+            # The vendored Blackwell kernel builds only expert readiness (_validate_geometry:
+            # "Blackwell requires token_back_ready_granularity='expert'").
+            unmet.append(f"SM{sm_version} (token_tile builds on SM107 only)")
         if work_id_mode != "atomic_counter":
             unmet.append(f"work_id_mode={work_id_mode!r} (need 'atomic_counter')")
         if token_back_mode not in ("standalone_warps", "reuse_dispatch_warps"):
