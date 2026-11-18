@@ -3150,9 +3150,15 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # first, and `tactic_t` is final from `_resolve_megamoe_kernel_tactic`
             # above.
             cache_key = self._tactic_cache_key(tactic_t)
+            # The adaptive-route variant differs only in device code (it registers no
+            # workspace region), so it shares the staged variant's local workspace. Both
+            # advance the dispatch barrier phase of the same shared workspace (a forward
+            # can run both: hash-routed layers take the staged route); a second local
+            # workspace would drop out of phase and lose its barrier-reset fence.
+            route = ("adaptive_route", self.adaptive_route_experts)
             local_workspace = _get_or_alloc_local_workspace(
                 kernel,
-                cache_key=cache_key,
+                cache_key=(tuple(k for k in cache_key[0] if k != route), *cache_key[1:]),
                 device=activation.device,
                 latch_in_tuning_mode=self.tactic_autotune,
             )
