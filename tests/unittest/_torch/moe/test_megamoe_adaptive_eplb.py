@@ -182,4 +182,6 @@ def test_router_route_ranks_and_rows_are_the_balancers():
     assert "rank=int(self.local_rank)" in inspect.getsource(op)
     # The fused route stages the forward's routes in the bucket's leading rows, row for row.
     source = inspect.getsource(mm.TrtllmCutedslMegaMoeNvfp4Impl.try_fused_route_quant)
-    assert "staged=bucket" in source and "slot_of_expert=None if bucket is None else table" in source
+    assert (
+        "staged=bucket" in source and "slot_of_expert=None if bucket is None else table" in source
+    )

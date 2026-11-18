@@ -77,7 +77,10 @@ def slot(expert: int, token: int, ep_rank: int, tables, num_experts: int, num_sl
 def slots_of(ids: Sequence[Sequence[int]], ep_rank: int, packed, num_experts: int, num_slots: int):
     """``[rows][top_k]`` slots of ``[rows][top_k]`` expert ids (row index = token row of the bucket)."""
     tables = unpack(packed, num_experts, num_slots)
-    return [[slot(int(e), t, ep_rank, tables, num_experts, num_slots) for e in row] for t, row in enumerate(ids)]
+    return [
+        [slot(int(e), t, ep_rank, tables, num_experts, num_slots) for e in row]
+        for t, row in enumerate(ids)
+    ]
 
 
 def live_rows(word: int | None, rows: int) -> int:
@@ -90,7 +93,15 @@ def live_rows(word: int | None, rows: int) -> int:
     return rows if real >= requests or rows % requests else rows // requests * real
 
 
-def record(rows_stat: list, forwards: list, ids, num_tokens: int, word: int | None, enabled: bool, first: bool):
+def record(
+    rows_stat: list,
+    forwards: list,
+    ids,
+    num_tokens: int,
+    word: int | None,
+    enabled: bool,
+    first: bool,
+):
     """Add the router's statistics of one launch: the picks of the live rows of the forward's
     ``num_tokens`` rows into ``rows_stat`` (per expert), and 1 to ``forwards[0]`` on its first call,
     only while ``enabled`` (as ``adaptive_eplb_record``)."""

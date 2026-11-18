@@ -559,7 +559,9 @@ class _OneRoundRouter(KernelComponent):
         and the forward's live-row word (int32), then the forward's token rows and whether it is the forward's
         first call (Int32 each)."""
         if cutlass.const_expr((adaptive_route is not None) != (self.adaptive_route_experts > 0)):
-            raise ValueError("adaptive_route is passed iff the router is built with adaptive_route_experts")
+            raise ValueError(
+                "adaptive_route is passed iff the router is built with adaptive_route_experts"
+            )
         if cutlass.const_expr(adaptive_route is None):
             adaptive_route = (None,) * 7
         kernel = self._kernel(
@@ -697,7 +699,9 @@ class _OneRoundRouter(KernelComponent):
                         )
                         expert = Int32(raw_index)
                         if lane_valid:
-                            expert = self._adaptive_pick(adaptive, counted_rows, expert, token, local_rank)
+                            expert = self._adaptive_pick(
+                                adaptive, counted_rows, expert, token, local_rank
+                            )
                             lane_valid = expert >= Int32(0)
                     else:
                         # Int64 ids; a negative one compares as a large unsigned value.
@@ -837,7 +841,9 @@ class _OneRoundRouter(KernelComponent):
                 while searching:
                     searching = cutlass.Boolean(False)
                     if k < copies - Int32(1):
-                        bound = cutlass.Uint32(_ld_nc_s32(shares_base + Int64(start + k) * Int64(4)))
+                        bound = cutlass.Uint32(
+                            _ld_nc_s32(shares_base + Int64(start + k) * Int64(4))
+                        )
                         # A bound of 2^32 - 1 ends the range: no point passes it.
                         if bound != cutlass.Uint32(0xFFFFFFFF):
                             if point >= bound:

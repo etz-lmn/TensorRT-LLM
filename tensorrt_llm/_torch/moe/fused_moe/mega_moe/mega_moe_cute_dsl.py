@@ -1686,11 +1686,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         launch_max_T = self._router_launch_max_tokens(num_tokens)
         if launch_max_T is None:
             return False
-        from ....moe.kernels.cutedsl_megamoe.kernel_src.blackwell.inference.mega.block_scaled_swap_ab_mega_moe_kernel import (
-            one_round_dispatch_enabled,
+        from ....moe.kernels.cutedsl_megamoe.kernel_src.blackwell.inference.mega import (
+            block_scaled_swap_ab_mega_moe_kernel as kernel,
         )
 
-        return one_round_dispatch_enabled(int(self.ep_size), int(launch_max_T), False, True)
+        return kernel.one_round_dispatch_enabled(int(self.ep_size), int(launch_max_T), False, True)
 
     def try_fused_route_quant(
         self,
@@ -1707,7 +1707,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if not self._route_quant_fuses():
             return None
         bucket = self._route_quant_bucket(x.shape[0], self.routing_method.top_k, x.device, x.dtype)
-        if adaptive_route is not None and (bucket is None or not self.routes_adaptive_in_router(x.shape[0])):
+        if adaptive_route is not None and (
+            bucket is None or not self.routes_adaptive_in_router(x.shape[0])
+        ):
             return None
         table = self._slot_of_expert
         shared_target = self._shared_activation_target(x.shape[0])
@@ -1731,7 +1733,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             self._prestaged = (bucket[0], ids, weights, x_fp4, x_sf)
         if adaptive_route is not None:
             table_row, rows, forwards, enabled, first = adaptive_route
-            self._adaptive_route_launch = (table_row, rows, forwards, enabled, int(x.shape[0]), first)
+            self._adaptive_route_launch = (
+                table_row,
+                rows,
+                forwards,
+                enabled,
+                int(x.shape[0]),
+                first,
+            )
         return MoEFusedRouteQuant(
             ids,
             weights,

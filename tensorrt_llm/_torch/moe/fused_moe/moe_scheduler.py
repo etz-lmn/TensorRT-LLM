@@ -275,7 +275,9 @@ class MoEScheduler(ABC):
         With ``adaptive`` (a caller that handles ``routes_mapped``), an adaptive balancer's layer
         keeps the same launch where the backend's dispatch router maps and counts its routes."""
         moe = self.moe
-        router_route = self._router_route(x, routing_aux, route_counters, first) if adaptive else None
+        router_route = (
+            self._router_route(x, routing_aux, route_counters, first) if adaptive else None
+        )
         if router_route is not None:
             return moe.backend.try_fused_route_quant(x, router_logits, adaptive_route=router_route)
         if not self._route_quant_eligible(routing_aux):

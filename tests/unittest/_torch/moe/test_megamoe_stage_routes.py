@@ -403,8 +403,19 @@ def _compile_router_probe(rows):
 
     class Probe:
         @cute.kernel
-        def kernel(self, ids: cute.Tensor, out: cute.Tensor, tables: Int64, stat_rows: Int64, forwards: Int64,
-                   enabled: Int64, word: Int64, num_tokens: Int32, first: Int32, ep_rank: Int32):
+        def kernel(
+            self,
+            ids: cute.Tensor,
+            out: cute.Tensor,
+            tables: Int64,
+            stat_rows: Int64,
+            forwards: Int64,
+            enabled: Int64,
+            word: Int64,
+            num_tokens: Int32,
+            first: Int32,
+            ep_rank: Int32,
+        ):
             thread_idx, _, _ = cute.arch.thread_idx()
             cta_idx, _, _ = cute.arch.block_idx()
             warp = thread_idx // Int32(32)
@@ -421,9 +432,23 @@ def _compile_router_probe(rows):
                     out[token, lane] = slot
 
         @cute.jit
-        def __call__(self, ids: cute.Tensor, out: cute.Tensor, tables: Int64, stat_rows: Int64, forwards: Int64,
-                     enabled: Int64, word: Int64, num_tokens: Int32, first: Int32, ep_rank: Int32, stream):
-            self.kernel(ids, out, tables, stat_rows, forwards, enabled, word, num_tokens, first, ep_rank).launch(
+        def __call__(
+            self,
+            ids: cute.Tensor,
+            out: cute.Tensor,
+            tables: Int64,
+            stat_rows: Int64,
+            forwards: Int64,
+            enabled: Int64,
+            word: Int64,
+            num_tokens: Int32,
+            first: Int32,
+            ep_rank: Int32,
+            stream,
+        ):
+            self.kernel(
+                ids, out, tables, stat_rows, forwards, enabled, word, num_tokens, first, ep_rank
+            ).launch(
                 grid=[(rows + warps - 1) // warps, 1, 1], block=[warps * 32, 1, 1], stream=stream
             )
 
@@ -472,17 +497,37 @@ def test_router_adaptive_route_is_bitwise_its_definition(rows):
         stat_rows = torch.zeros(_AR_EXPERTS, dtype=torch.float32, device=device)
         forwards = torch.zeros(1, dtype=torch.int64, device=device)
         flag = torch.tensor([1 if enabled else 0], dtype=torch.int32, device=device)
-        word_t = torch.tensor([0x7FFFFFFF if word is None else word], dtype=torch.int32, device=device)
+        word_t = torch.tensor(
+            [0x7FFFFFFF if word is None else word], dtype=torch.int32, device=device
+        )
         out = torch.full((rows, _AR_TOP_K), -7, dtype=torch.int32, device=device)
         ids_t = torch.tensor(ids, dtype=torch.int64, device=device)
-        compiled(ids_t, out, table.data_ptr(), stat_rows.data_ptr(), forwards.data_ptr(), flag.data_ptr(),
-                 word_t.data_ptr(), num_tokens, 1 if first else 0, ep_rank)
+        compiled(
+            ids_t,
+            out,
+            table.data_ptr(),
+            stat_rows.data_ptr(),
+            forwards.data_ptr(),
+            flag.data_ptr(),
+            word_t.data_ptr(),
+            num_tokens,
+            1 if first else 0,
+            ep_rank,
+        )
         torch.cuda.synchronize()
 
         want_slots = rr.slots_of(ids, ep_rank, packed, _AR_EXPERTS, _AR_SLOTS)
         want_rows, want_forwards = [0.0] * _AR_EXPERTS, [0]
         # A word that keeps every row reads as 0x7FFF real of 0x7FFF requests.
-        rr.record(want_rows, want_forwards, ids, num_tokens, 0x7FFFFFFF if word is None else word, enabled, first)
+        rr.record(
+            want_rows,
+            want_forwards,
+            ids,
+            num_tokens,
+            0x7FFFFFFF if word is None else word,
+            enabled,
+            first,
+        )
         assert out.cpu().tolist() == want_slots, (rows, case)
         assert stat_rows.cpu().tolist() == want_rows, (rows, case)
         assert forwards.item() == want_forwards[0], (rows, case)
@@ -517,17 +562,22 @@ for f in sorted(out.rglob("*")):
         digests[f.name] = ["ptx", hashlib.sha256(text.encode()).hexdigest()]
     elif f.suffix == ".cubin":
         try:
-            usage = subprocess.run(["cuobjdump", "--dump-resource-usage", str(f)], capture_output=True, text=True).stdout
+            dump = ["cuobjdump", "--dump-resource-usage", str(f)]
+            usage = subprocess.run(dump, capture_output=True, text=True).stdout
         except OSError as error:
             usage = f"cuobjdump: {{error}}"
         digests[f.name] = ["cubin", hashlib.sha256(f.read_bytes()).hexdigest(), usage]
 print("DIGESTS " + json.dumps(digests))
 """
-    env = dict(os.environ, CUTE_DSL_KEEP_PTX="1", CUTE_DSL_KEEP_CUBIN="1", CUTE_DSL_DUMP_DIR=str(out_dir))
-    done = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=1800)
+    env = dict(
+        os.environ, CUTE_DSL_KEEP_PTX="1", CUTE_DSL_KEEP_CUBIN="1", CUTE_DSL_DUMP_DIR=str(out_dir)
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=1800
+    )
     assert done.returncode == 0, done.stderr[-4000:]
     line = next(x for x in done.stdout.splitlines() if x.startswith("DIGESTS "))
-    return json.loads(line[len("DIGESTS "):])
+    return json.loads(line[len("DIGESTS ") :])
 
 
 @_requires_cute_gpu
@@ -539,11 +589,23 @@ def test_megamoe_kernels_without_the_adaptive_route_record_their_ptx(tmp_path, r
 
     digests = _kernel_ptx_digests(0, tmp_path / "base")
     kept = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
-    assert any(kind == "ptx" for kind, *_ in digests.values()), f"the compile kept no PTX: {kept[:20]}"
-    record_property("no_eplb_kernel_digests", json.dumps({k: v[:2] for k, v in digests.items()}, sort_keys=True))
-    record_property("no_eplb_resource_usage", json.dumps({k: v[2] for k, v in digests.items() if v[0] == "cubin"}))
-    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.communication.nvlink_domain import one_round_router
+    assert any(kind == "ptx" for kind, *_ in digests.values()), (
+        f"the compile kept no PTX: {kept[:20]}"
+    )
+    record_property(
+        "no_eplb_kernel_digests", json.dumps({k: v[:2] for k, v in digests.items()}, sort_keys=True)
+    )
+    record_property(
+        "no_eplb_resource_usage",
+        json.dumps({k: v[2] for k, v in digests.items() if v[0] == "cubin"}),
+    )
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.communication.nvlink_domain import (
+        one_round_router,
+    )
 
     if hasattr(one_round_router._OneRoundRouter, "_adaptive_pick"):
         adaptive = _kernel_ptx_digests(_AR_EXPERTS, tmp_path / "adaptive")
-        record_property("adaptive_resource_usage", json.dumps({k: v[2] for k, v in adaptive.items() if v[0] == "cubin"}))
+        record_property(
+            "adaptive_resource_usage",
+            json.dumps({k: v[2] for k, v in adaptive.items() if v[0] == "cubin"}),
+        )

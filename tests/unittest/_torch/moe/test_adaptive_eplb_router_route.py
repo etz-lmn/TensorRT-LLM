@@ -123,7 +123,9 @@ class RouterRouteTest(unittest.TestCase):
                     self.assertEqual(slot, expert_slots[x][0])
                 else:
                     self.assertIn(slot, expert_slots[x])
-                    self.assertGreater(shares[slot] if sum(shares[q] for q in expert_slots[x]) else 1, 0)
+                    self.assertGreater(
+                        shares[slot] if sum(shares[q] for q in expert_slots[x]) else 1, 0
+                    )
 
     def test_record_counts_live_rows_only_while_enabled(self):
         ids = [[0, 1], [1, 2], [2, 3], [3, 4]]
@@ -154,7 +156,9 @@ class RouterRouteTest(unittest.TestCase):
                     weights = [1.0 if k == 0 else 0.0 for k in range(copies)]
                 expert_slots = [list(range(copies))]
                 shares = weights + [0.0] * 4
-                _, (counts, starts, slots, cumulative) = build_tables(expert_slots, shares, 1, copies + 4)
+                _, (counts, starts, slots, cumulative) = build_tables(
+                    expert_slots, shares, 1, copies + 4
+                )
                 cum = cumulative[:copies]
                 picks = sorted(rng.sample(range(tokens), rng.randrange(1, tokens + 1)))
                 ep_rank = rng.randrange(32)
@@ -171,7 +175,10 @@ class RouterRouteTest(unittest.TestCase):
         for tokens, max_rows, p99_rows in worst:
             # A copy is off its share by at most a few rows at every bucket size.
             self.assertLessEqual(max_rows, max(4.0, 0.2 * tokens), (tokens, max_rows, p99_rows))
-        print("router split error rows (tokens, max, p99):", [(t, round(m, 2), round(p, 2)) for t, m, p in worst])
+        print(
+            "router split error rows (tokens, max, p99):",
+            [(t, round(m, 2), round(p, 2)) for t, m, p in worst],
+        )
 
 
 if __name__ == "__main__":

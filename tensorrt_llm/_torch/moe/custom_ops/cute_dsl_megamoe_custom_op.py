@@ -3392,7 +3392,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     raise RuntimeError(
                         "MegaMoE-CuteDSL: an adaptive-route kernel needs the layer's adaptive route; got None."
                     )
-                tables, rows, forwards, enabled, live_word, route_tokens, first = self._adaptive_route
+                tables, rows, forwards, enabled, live_word, route_tokens, first = (
+                    self._adaptive_route
+                )
                 for name, tensor, dtype in (
                     ("tables", tables, torch.int32),
                     ("rows", rows, torch.float32),
@@ -3401,7 +3403,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     ("live_word", live_word, torch.int32),
                 ):
                     if tensor.dtype != dtype or not tensor.is_cuda or not tensor.is_contiguous():
-                        raise RuntimeError(f"MegaMoE-CuteDSL: adaptive route {name} must be contiguous CUDA {dtype}")
+                        raise RuntimeError(
+                            f"MegaMoE-CuteDSL: adaptive route {name} must be contiguous CUDA {dtype}"
+                        )
                     runtime_kwargs[f"adaptive_route_{name}"] = cutlass.Int64(tensor.data_ptr())
                 runtime_kwargs["adaptive_route_num_tokens"] = cutlass.Int32(int(route_tokens))
                 runtime_kwargs["adaptive_route_first"] = cutlass.Int32(1 if first else 0)
