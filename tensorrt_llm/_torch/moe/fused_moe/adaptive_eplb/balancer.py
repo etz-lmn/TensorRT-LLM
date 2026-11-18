@@ -30,6 +30,8 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
 from ..moe_load_balancer import BaseMoeLoadBalancer
+from .calibration import CalibrationConfig, calibrate, torch_launcher
+from .calibration import Geometry as CalibrationGeometry
 from .policy import (
     ExpertGeometry,
     ExpertStatistics,
@@ -493,7 +495,50 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
             f"adaptive EPLB balances {len(self.layers)} MoE layers; one layer's install copy "
             f"takes {copy_ms:.3f} ms per replica at start-up"
         )
+        if path is None:
+            time_model = self.calibrate(backend, time_model, decode_tokens, hosts)
         self.start_runtime(time_model, self.mapping.gpus_per_node, copy_ms)
+
+    def calibrate(
+        self,
+        backend: AdaptiveEplbBackend,
+        model: TimeModel,
+        decode_tokens: Sequence[int],
+        hosts: int,
+        config: CalibrationConfig | None = None,
+    ) -> TimeModel:
+        """``model`` with the terms fitted per decode bucket on this run's first balanced layer
+        (:func:`~.calibration.calibrate`), or ``model`` itself where a fit fails. Collective over EP;
+        runs after the weights moved and before the first forward."""
+        config = config or CalibrationConfig()
+        if not config.enabled or not decode_tokens:
+            return model
+        layer = self.layers[0]
+        ep = self.ep_size
+        top_k = int(backend.routing_method.experts_per_token)
+
+        def geometry_of(tokens: int) -> CalibrationGeometry:
+            return CalibrationGeometry(
+                ep, self.num_slots // ep, layer.expert_count // ep, tokens, top_k, model.tile_rows
+            )
+
+        identity = calibration_identity(backend, ep, hosts, list(decode_tokens))
+        launcher = torch_launcher(
+            backend, layer, top_k, int(backend.hidden_size), self.transport.allgather, config
+        )
+        fitted, table, why = calibrate(
+            geometry_of, decode_tokens, self.ep_rank, launcher, model, identity, config
+        )
+        if table is None:
+            logger.warning(f"adaptive EPLB keeps its built-in time model: {why}")
+            return fitted
+        accepted = [b["rows"] for b in table["buckets"] if b["accepted"]]
+        if self.ep_rank == 0:
+            logger.info(
+                f"adaptive EPLB calibrated its time model in {table['seconds']:.2f} s; buckets "
+                f"(rows per GPU) fitted {accepted}, the rest built-in: {json.dumps(table)}"
+            )
+        return fitted
 
     def platform_gap(self, backend: AdaptiveEplbBackend) -> str | None:
         """Why the installs cannot run on this rank, or ``None``: they copy experts from every EP

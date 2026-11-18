@@ -65,7 +65,8 @@ class TimeModel:
     With ``time_shares``, :func:`solve_shares` minimizes the busiest GPU's time, not its rows.
     ``scales`` holds ``(rows, scale, per_active_slot_us, route_us, time_shares)`` per calibrated
     CUDA graph bucket, ascending by the rows a GPU's tokens route per forward in it (:meth:`at`);
-    empty, the fields hold at every size.
+    empty, the fields hold at every size. ``buckets`` holds, alike, ``(rows, ((field, value), ...))``:
+    every field a bucket's warm-up fit sets (:mod:`.calibration`); it takes precedence over ``scales``.
     """
 
     per_active_slot_us: float
@@ -77,10 +78,15 @@ class TimeModel:
     scales: tuple[tuple[float, float, float, float, bool], ...] = ()
     route_us: float = 0.0
     time_shares: bool = False
+    buckets: tuple[tuple[float, tuple[tuple[str, float], ...]], ...] = ()
 
     def at(self, rows: float) -> TimeModel:
         """The model of the smallest bucket of at least ``rows`` rows per GPU per forward, the
         bucket a step of that size pads to (the largest bucket beyond them)."""
+        if self.buckets:
+            i = bisect.bisect_left([size for size, _ in self.buckets], rows)
+            values = dict(self.buckets[min(i, len(self.buckets) - 1)][1])
+            return replace(self, scales=(), buckets=(), **values)
         if not self.scales:
             return self
         i = bisect.bisect_left([size for size, *_ in self.scales], rows)
