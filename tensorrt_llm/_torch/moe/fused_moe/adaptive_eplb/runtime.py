@@ -761,8 +761,7 @@ class AdaptiveRuntime:
         publish. Ranks that decided differently go to the main thread's check, which stops them."""
         apply_call = int(rows[:, ROW.index("copied_call")].max()) + 1
         self._event("copied", window=update.window, apply_call=apply_call, rows=rows)
-        if not self._apply_events:  # else the earlier publish's own timing is still to be read
-            self.last_applied = (float(update.window), 0.0, 0.0)  # publishing nothing takes no time
+        # No timing either: the install timings price the publishes that run, which change tables.
         return self.decision.ask(("copied", update.window, rows))
 
     def _apply_tables(self, call: int, update: LayoutUpdate) -> None:
