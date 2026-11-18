@@ -1730,13 +1730,15 @@ class FusedCommMoEScheduler(MoEScheduler):
         EPLB hook ordering (matches ``ExternalCommMoEScheduler._forward_chunk_impl``):
         ``start_wait_gpu_stage`` -> routing -> ``done_wait_gpu_stage`` ->
         ``update_statistic(ignore_allreduce=False)`` -> ``route`` ->
-        quantize -> ``run_moe`` -> ``start_set_cpu_stage`` ->
-        ``done_set_cpu_stage``. ``start/done_set_cpu_stage`` are placed
-        AFTER ``run_moe``; otherwise dynamic-EPLB weight migration would
-        race with the fused kernel using those weights. A per-layer dynamic
-        EPLB layer has no CPU stage and no host statistics: it only gets
-        ``route`` and the post-``run_moe`` ``start_set_cpu_stage``, which
-        releases its replica plan.
+        quantize -> ``wait_for_statistic_allreduce`` -> ``run_moe`` ->
+        ``start_set_cpu_stage`` -> ``done_set_cpu_stage``. The statistic
+        AllReduce runs on the load balancer's auxiliary stream under
+        multi-stream; the fused kernel must not run alongside it.
+        ``start/done_set_cpu_stage`` are placed AFTER ``run_moe``; otherwise
+        dynamic-EPLB weight migration would race with the fused kernel using
+        those weights. A per-layer dynamic EPLB layer has no CPU stage and no
+        host statistics: it only gets ``route`` and the post-``run_moe``
+        ``start_set_cpu_stage``, which releases its replica plan.
         """
         moe = self.moe
         assert not moe.apply_router_weight_on_input, (
@@ -1848,6 +1850,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         # as expert IDs; otherwise the recorded routes are the slots routed to.
         # With the load balancer off, slots are expert IDs, so one recording
         # drives both arms.
+        statistic_allreduce_pending = False
         if uses_replica_plan:
             token_selected_experts = _record_routes(moe, token_selected_experts, moe.num_experts)
             token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
@@ -1860,10 +1863,13 @@ class FusedCommMoEScheduler(MoEScheduler):
                     )
             maps_expert_slots = getattr(moe.backend, "maps_expert_slots", False)
             if moe.layer_load_balancer and not maps_expert_slots:
+                statistic_allreduce_pending = True
                 moe._load_balancer_done_wait_gpu_stage(is_first_call)
                 # ignore_allreduce=False: the fused kernel has no side channel
                 # for an external stats gather. The base helper runs its own
-                # EP-wide AllReduce, gated to is_last_call=True.
+                # EP-wide AllReduce, gated to is_last_call=True, on the load
+                # balancer's auxiliary stream under multi-stream; it is joined
+                # before run_moe below.
                 moe._load_balancer_update_statistic(
                     token_selected_experts,
                     is_first_call,
@@ -1902,6 +1908,13 @@ class FusedCommMoEScheduler(MoEScheduler):
             )
 
         # ----- MoE compute -----
+        # The fused kernel waits for the other ranks inside the kernel, so it
+        # must not run alongside the statistic allreduce on the load
+        # balancer's auxiliary stream (eager or replayed). Routing and the
+        # quantization above overlap it; input preparation inside run_moe
+        # (a backend that ``supports_fused_prepare``) runs after this wait.
+        if statistic_allreduce_pending:
+            moe._load_balancer_wait_for_statistic_allreduce()
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's
         # ``num_experts`` template parameter (SymmBuffer / weights sized to
         # num_slots in quantization.py).
