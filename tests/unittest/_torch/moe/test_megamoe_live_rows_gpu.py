@@ -407,24 +407,32 @@ def _layer_worker_impl(mode: str) -> dict:
         _,
         rank,
     ):
-        staged = []
+        staged, entered, reentered = [], [], []
         # Read by name: an attribute named ``ops`` next to the global ``torch`` makes cloudpickle ship
         # torch.ops, which is not a module, as a submodule of this worker.
         trtllm_ops = getattr(torch, "ops").trtllm
         for name in ("megamoe_stage_inputs", "megamoe_stage_routes", "fp4_quantize"):
             if hasattr(trtllm_ops, name):
                 op = getattr(trtllm_ops, name)
-                patch.object(
-                    trtllm_ops,
-                    name,
-                    lambda *a, _op=op, _name=name, **k: staged.append(_name) or _op(*a, **k),
-                ).start()
+
+                def counted(*a, _op=op, _name=name, **k):
+                    # A launch is counted once: a torch-function handler may call the op back by name
+                    # while the launch runs.
+                    (reentered if entered else staged).append(_name)
+                    entered.append(_name)
+                    try:
+                        return _op(*a, **k)
+                    finally:
+                        entered.pop()
+
+                patch.object(trtllm_ops, name, counted).start()
         counts = [_TIMED_ROWS] * _WORLD if mode == "hinted" else None
         outputs, times = [], []
         with torch.inference_mode():
             fused_moe.forward(x, router_logits, all_rank_num_tokens=counts)  # builds the bucket
             torch.cuda.synchronize()
             staged.clear()
+            reentered.clear()
             for _ in range(_TIMED_FORWARDS):
                 begin = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
@@ -441,6 +449,10 @@ def _layer_worker_impl(mode: str) -> dict:
             repeats=all(torch.equal(out, outputs[0]) for out in outputs),
             forward_us=sorted(times)[len(times) // 2],
             staging_launches=len(staged) / _TIMED_FORWARDS,
+            staging_reentries=len(reentered) / _TIMED_FORWARDS,
+            staging_ops={
+                name: staged.count(name) / _TIMED_FORWARDS for name in sorted(set(staged))
+            },
         )
 
 
@@ -468,5 +480,7 @@ def test_megamoe_cutedsl_layer_digest_time_and_staging_launches(
         record_property(f"rank{result['rank']}_digest", result["digest"])
         record_property(f"rank{result['rank']}_forward_us", round(result["forward_us"], 2))
         record_property(f"rank{result['rank']}_staging_launches", result["staging_launches"])
+        record_property(f"rank{result['rank']}_staging_ops", result["staging_ops"])
+        record_property(f"rank{result['rank']}_staging_reentries", result["staging_reentries"])
     assert all(result["repeats"] for result in results)
     assert all(result["staging_launches"] <= 1 for result in results), results
