@@ -261,3 +261,210 @@ def test_cute_dsl_issues_the_wait_right_before_the_kernel(monkeypatch):
     # The output clear and the route wait are enqueued before the wait; the
     # kernel right after it.
     assert trace == ["rebalance", ("wait", True), "kernel"]
+
+
+# ---------------------------------------------------------------------------
+# GPU: MegaMoEDeepGemm under online EPLB on four ranks, multi-stream on, so the statistic
+# allreduce runs on the load balancer's auxiliary stream. Per rank it records the median forward
+# time and how long the launch stream stalls in the statistic-allreduce wait (wherever the build
+# issues it: before run_moe, or from the backend's launch path), for an A/B of two builds.
+# ---------------------------------------------------------------------------
+_WORLD = 4
+_ROWS = 64
+_FORWARDS = 8
+
+if torch.cuda.is_available():
+    import pickle
+    import sys
+
+    import cloudpickle
+
+    # The 4-GPU MoE cases' shared pool; test_moe_module queries the device when imported.
+    from _torch.moe.test_moe_module import moe_multi_gpu_executor  # noqa: F401
+    from mpi4py import MPI
+
+    # The pool's workers get this module's worker by value.
+    cloudpickle.register_pickle_by_value(sys.modules[__name__])
+    MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
+
+
+def _deepgemm_eplb_worker() -> dict:
+    import traceback
+
+    try:
+        return _deepgemm_eplb_worker_impl()
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+def _deepgemm_eplb_worker_impl() -> dict:
+    from _torch.moe.moe_test_utils import MoeBackendType, MoeModelConfig
+    from _torch.moe.quantize_utils import get_test_quant_params
+    from _torch.moe.test_moe_module import (
+        _create_mapping_for_parallel_mode,
+        _create_model_config,
+        _create_moe_load_balancer,
+        _ensure_dist_for_megamoe,
+    )
+
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+    from tensorrt_llm._torch.moe.fused_moe import (
+        DEFAULT_MOE_ACTIVATION,
+        RenormalizeMoeRoutingMethod,
+        create_moe,
+    )
+    from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+    from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancerIterContext
+    from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
+    from tensorrt_llm._utils import mpi_rank
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    model = MoeModelConfig(8, 2, 512, 512)
+    num_slots, dtype = 16, torch.bfloat16
+    backend = MoeBackendType.MEGAMOE_DEEPGEMM
+    rank = mpi_rank()
+    mapping = _create_mapping_for_parallel_mode(_WORLD, "DEP")
+    mapping.rank = rank
+    torch.cuda.set_device(rank)
+    _ensure_dist_for_megamoe(backend.value, rank, _WORLD)
+    with torch.device(f"cuda:{rank}"):
+        torch.manual_seed(0)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=model.top_k)
+        x = torch.randn((_ROWS, model.hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((_ROWS, model.num_experts), dtype=dtype, device="cuda")
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.W4A8_MXFP4_MXFP8, x, backend
+        )
+        quant_kwargs.pop("ref_cls", None)
+        quantize_util = quantize_util_cls(
+            num_experts=model.num_experts,
+            dtype=dtype,
+            intermediate_size=model.intermediate_size,
+            hidden_size=model.hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            swiglu_limit=None,
+            num_local_experts=model.num_experts // mapping.moe_ep_size,
+            activation_type=ActivationType.Swiglu,
+        )
+        model_cfg = _create_model_config(
+            num_experts=model.num_experts,
+            hidden_size=model.hidden_size,
+            intermediate_size=model.intermediate_size,
+            dtype=dtype,
+            mapping=mapping,
+            quant_config=quant_config,
+            moe_backend=backend.value,
+            enable_eplb=True,
+            num_slots=num_slots,
+            layer_updates_per_iter=1,
+            max_num_tokens=max(256, _ROWS),
+        )
+        balancer = _create_moe_load_balancer(model_cfg, True)
+        with (
+            nccl_window_tensor_scope(x),
+            balancer,
+            create_moe(
+                routing_method=routing_method,
+                reduce_results=True,
+                model_config=model_cfg,
+                bias=False,
+                activation=DEFAULT_MOE_ACTIVATION,
+                weight_loading_mode=getattr(
+                    quantize_util, "weight_loading_mode", MoEWeightLoadingMode.VANILLA
+                ),
+            ) as fused_moe,
+        ):
+            fused_moe.create_weights()
+            weights, _, _ = quantize_util.prepare_weights_from_backend(fused_moe, **quant_kwargs)
+            fused_moe.load_weights(
+                [{k: v.to("cpu") if isinstance(v, torch.Tensor) else v for k, v in weights.items()}]
+            )
+            fused_moe.post_load_weights()
+            fused_moe.cuda(f"cuda:{rank}")
+            balancer.register_weight_slots_after_to_cuda()
+            balancer.finalize_model()
+            balancer.set_iter_info(enable_statistic=True, enable_update_weights=True)
+
+            # The wait, wherever the build issues it, timed on the launch stream.
+            waits = []
+            wait = fused_moe._load_balancer_wait_for_statistic_allreduce
+
+            def timed_wait():
+                begin = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                begin.record()
+                wait()
+                end.record()
+                waits.append((begin, end))
+
+            fused_moe._load_balancer_wait_for_statistic_allreduce = timed_wait
+            counts = [_ROWS] * _WORLD
+            times, outputs = [], []
+            with torch.inference_mode(), with_multi_stream(True):
+                for i in range(_FORWARDS + 1):
+                    begin = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    with MoeLoadBalancerIterContext(balancer):
+                        begin.record()
+                        out = fused_moe.forward(x, router_logits, all_rank_num_tokens=counts)
+                        end.record()
+                    end.synchronize()
+                    if i:  # the first forward primes the kernels
+                        times.append(begin.elapsed_time(end) * 1e3)
+                        outputs.append(out.float())
+            torch.cuda.synchronize()
+            stalls = [b.elapsed_time(e) * 1e3 for b, e in waits[1:]]
+    return dict(
+        rank=rank,
+        forward_us=sorted(times)[len(times) // 2],
+        wait_us=sorted(stalls)[len(stalls) // 2] if stalls else None,
+        waits=len(waits),
+        finite=all(bool(torch.isfinite(out).all()) for out in outputs),
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < _WORLD,
+    reason=f"needs {_WORLD} GPUs",
+)
+@pytest.mark.threadleak(enabled=False)  # the pool's manager thread persists by design
+def test_deepgemm_online_eplb_layer_time_and_statistic_wait(
+    moe_multi_gpu_executor, record_property
+):
+    """MegaMoEDeepGemm under online EPLB with multi-stream on: every forward finishes (no rank waits
+    on another whose kernel runs beside the allreduce) and gives finite rows; the median forward
+    time and the launch stream's stall in the statistic-allreduce wait are recorded per rank."""
+    from _torch.moe.moe_test_utils import MoeBackendType, MoeModelConfig
+    from _torch.moe.test_moe_module import MEGAMOE_IGNORE_COMM_METHOD, should_skip_MegaMoEDeepGemm
+
+    from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    reason = should_skip_MegaMoEDeepGemm(
+        "DEP",
+        MEGAMOE_IGNORE_COMM_METHOD,
+        MoeBackendType.MEGAMOE_DEEPGEMM,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+        torch.bfloat16,
+        MoeModelConfig(8, 2, 512, 512),
+        RenormalizeMoeRoutingMethod,
+        False,
+    )
+    if reason:
+        pytest.skip(reason)
+    results = list(moe_multi_gpu_executor.map(_deepgemm_eplb_worker_wrapper, range(_WORLD)))
+    for result in results:
+        record_property(f"rank{result['rank']}_forward_us", round(result["forward_us"], 2))
+        if result["wait_us"] is not None:
+            record_property(f"rank{result['rank']}_statistic_wait_us", round(result["wait_us"], 2))
+        record_property(f"rank{result['rank']}_statistic_waits", result["waits"])
+    assert all(result["finite"] for result in results)
+
+
+def _deepgemm_eplb_worker_wrapper(_index: int) -> dict:
+    return _deepgemm_eplb_worker()
