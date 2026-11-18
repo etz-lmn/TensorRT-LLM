@@ -457,11 +457,14 @@ class AdaptiveRuntime:
         device: torch.device,
         tables: torch.Tensor,
         statistics: dict[str, torch.Tensor],
+        on_window: Callable[[bool], None] | None = None,
     ) -> None:
         # Imported here: the decision process imports this module without the rest of the package.
         from tensorrt_llm._utils import prefer_pinned
 
         self.layers = layers
+        # Told when a window opens (True) and closes (False): the statistics count only inside one.
+        self.on_window = on_window
         self.transport = transport
         self.copy_stream = copy_stream
         self.decision = decision
@@ -570,6 +573,8 @@ class AdaptiveRuntime:
         from tensorrt_llm.logger import logger
 
         self.failure = error
+        if self.on_window is not None:
+            self.on_window(False)
         self.pending_updates.clear()
         self.worker.inbox.clear()
         self.open_at = self.close_at = None
@@ -633,8 +638,10 @@ class AdaptiveRuntime:
         logger.debug(f"adaptive EPLB {event}: {', '.join(f'{k}={v}' for k, v in shown.items())}")
 
     def _open_window(self) -> None:
-        """Zero the statistics."""
+        """Zero the statistics and start counting."""
         self._storage.zero_()
+        if self.on_window is not None:
+            self.on_window(True)
 
     def _close_window(self) -> None:
         """Copy the statistics into this rank's window statistics, timing the copies, and have the
@@ -644,6 +651,8 @@ class AdaptiveRuntime:
         self._stats_copy_begin.record()
         self._own_raw.copy_(self._storage, non_blocking=True)
         self._stats_copy_end.record()
+        if self.on_window is not None:
+            self.on_window(False)  # until the next window opens, nothing reads the counts
         self.close_at = None
         progress, window = self._progress, self.window
         self.worker.post(lambda: self._gather_window(progress, window))

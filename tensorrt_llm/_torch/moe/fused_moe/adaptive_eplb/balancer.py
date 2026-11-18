@@ -411,7 +411,10 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         self.off_reason: str | None = None
         # Whether the forwards now running record their routes.
         self.recording = False
+        # Whether the runtime's window is open: the device flag counts only while both hold.
+        self.window_open = False
         self._recording_flag: torch.Tensor | None = None
+        self._flag_value = 0
         self._route_tables: torch.Tensor | None = None
         self._statistics: dict[str, torch.Tensor] | None = None
 
@@ -550,6 +553,7 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
             device,
             self.route_tables(device),
             self.statistics(device),
+            on_window=self._set_window_open,
         )
 
     def statistics(self, device: torch.device | str) -> dict[str, torch.Tensor]:
@@ -574,9 +578,10 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         return self._route_tables
 
     def recording_flag(self, device: torch.device | str) -> torch.Tensor:
-        """The ``[1]`` int32 flag the statistics read: set for generation steps outside warmup."""
+        """The ``[1]`` int32 flag the statistics read: set for generation steps outside warmup
+        while the runtime's window is open (:meth:`_sync_recording_flag`)."""
         if self._recording_flag is None:
-            self._recording_flag = torch.zeros(1, dtype=torch.int32, device=device)
+            self._recording_flag = torch.full((1,), self._flag_value, dtype=torch.int32, device=device)
         return self._recording_flag
 
     def observe_scheduled_batch(
@@ -591,12 +596,24 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         recording = num_generation_requests > 0 and generation_only and not is_warmup
         if self.off_reason is not None or getattr(self.runtime, "failure", None) is not None:
             recording = False  # nothing reads the statistics of adaptive EPLB that is off
-        if recording != self.recording:
-            self.recording = recording
-            if self._recording_flag is not None:
-                self._recording_flag.fill_(int(recording))
+        self.recording = recording
+        self._sync_recording_flag()
         if self.runtime is not None and self.runtime.wants_request_progress:
             self.runtime.add_request_progress(num_generation_requests, generation_progress)
+
+    def _set_window_open(self, open_: bool) -> None:
+        self.window_open = bool(open_)
+        self._sync_recording_flag()
+
+    def _sync_recording_flag(self) -> None:
+        """Set the device flag the statistics ops and the router read to whether the forwards now
+        running count: generation steps outside warmup, while the runtime's window is open. A
+        stream-ordered write at a fixed address, so captured graphs read it at every replay."""
+        value = int(self.recording and self.window_open)
+        if value != self._flag_value:
+            self._flag_value = value
+            if self._recording_flag is not None:
+                self._recording_flag.fill_(value)
 
     def iteration_stats(self) -> dict[str, int] | None:
         """The runtime's counters (:meth:`~.runtime.AdaptiveRuntime.counters`) once it runs."""
