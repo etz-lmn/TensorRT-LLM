@@ -405,9 +405,11 @@ def _route_table(rng, zero_one):
     return build_route_tables(layout, shares, _AR_EXPERTS, _AR_SLOTS).packed()
 
 
-def _compile_router_probe(rows):
+def _compile_router_probe(rows, staged=False):
+    """``staged``: the probe's CTA first stages the route table in shared memory, as the router's push does."""
     import cutlass
     import cutlass.cute as cute
+    import cutlass.utils
     from cutlass.cutlass_dsl import Int32, Int64
 
     from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
@@ -457,6 +459,16 @@ def _compile_router_probe(rows):
             warp = thread_idx // Int32(32)
             lane = thread_idx % Int32(32)
             adaptive = (tables, stat_rows, forwards, enabled, word, num_tokens, first)
+            table = None
+            if cutlass.const_expr(staged):
+                workspace = router.router_smem_workspace
+                storage = cutlass.utils.SmemAllocator().allocate(workspace.storage_class())
+                table = workspace.tensor(
+                    router.smem_adaptive_table_region, storage.buffer.data_ptr()
+                )
+                entries = router._adaptive_table_load(tables, thread_idx, warps * 32)
+                router._adaptive_table_store(entries, table, thread_idx, warps * 32)
+                cute.arch.sync_threads()
             counted = router._adaptive_counted_rows(adaptive, cta_idx, thread_idx)
             token = cta_idx * Int32(warps) + warp
             if token < Int32(rows):
@@ -464,7 +476,9 @@ def _compile_router_probe(rows):
                     raw = ids[token, lane]
                     slot = Int32(-1)
                     if cutlass.Uint64(raw) < cutlass.Uint64(_AR_EXPERTS):
-                        slot = router._adaptive_pick(adaptive, counted, Int32(raw), token, ep_rank)
+                        slot = router._adaptive_pick(
+                            adaptive, counted, Int32(raw), token, ep_rank, table
+                        )
                     out[token, lane] = slot
 
         @cute.jit
@@ -503,15 +517,17 @@ def _compile_router_probe(rows):
 
 
 @_requires_cute_gpu
+@pytest.mark.parametrize("staged", [False, True], ids=["global", "staged"])
 @pytest.mark.parametrize("rows", [8, 32, 64, 256])
-def test_router_adaptive_route_is_bitwise_its_definition(rows):
+def test_router_adaptive_route_is_bitwise_its_definition(rows, staged):
     """Slots and statistics of the router's adaptive route equal router_route.py's, with replicated experts,
-    0/1 shares, invalid ids, padding rows past the forward's rows, live-row words and the recording flag."""
+    0/1 shares, invalid ids, padding rows past the forward's rows, live-row words and the recording flag; with
+    the table read from global memory and from the copy the router stages in shared memory."""
     import random
 
     rr = _router_route_module()
     rng = random.Random(rows)
-    compiled = _compile_router_probe(rows)
+    compiled = _compile_router_probe(rows, staged)
     device = torch.device("cuda")
     for case in range(12):
         packed = _route_table(rng, zero_one=0.4 if case % 2 else 0.0)
