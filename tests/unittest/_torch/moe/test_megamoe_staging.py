@@ -453,9 +453,10 @@ def test_preparation_consumes_handout_before_an_uncached_bucket(
     assert backend._handed_out_route_staging is None
 
 
+@pytest.mark.parametrize("drops", [False, True])
 @pytest.mark.parametrize("static_slots", [False, True])
 def test_routes_replaced_after_the_fused_route_quant_are_staged_without_the_activation(
-    preparation_backend, monkeypatch, static_slots
+    preparation_backend, monkeypatch, static_slots, drops
 ):
     """The DeepSeek-V4 fused route+quant writes the bucket's activation rows and routes. When the
     scheduler then replaces the routes (``ENABLE_PERFECT_ROUTER=expert_ids``, a calibrator
@@ -473,8 +474,14 @@ def test_routes_replaced_after_the_fused_route_quant_are_staged_without_the_acti
     )
     if static_slots:
         backend._slot_of_expert = torch.tensor([3, 2, 1, 0], dtype=torch.int32)
+    # A bucket whose kernel drops masked routes: the fused launch stages it under the word.
+    backend._padding_drop_buckets = {8} if drops else set()
+    word = torch.tensor([1], dtype=torch.int32)
+    monkeypatch.setattr(mm.live_rows, "current_word", lambda device: word)
+    words = []
 
     def route_quant(logits, bias, x, scale, k, scaling, dtype, *, staged, slot_of_expert, **kw):
+        words.append(kw.get("live_row_word"))
         ids_out, weights_out, x_out, sf_out = staged
         ids = torch.zeros(rows, k, dtype=torch.int32)
         ids_out[:rows] = ids if slot_of_expert is None else slot_of_expert[ids.long()]
@@ -514,6 +521,7 @@ def test_routes_replaced_after_the_fused_route_quant_are_staged_without_the_acti
 
     forward()
     assert not staged_routes and not stage_activation  # The fused launch staged the bucket.
+    assert len(words) == 1 and words[0] is (word if drops else None)
     replaced = torch.tensor([[1, 2], [3, 0], [2, 1]], dtype=torch.int32)
     forward(replaced)
     assert stage_activation == [False]

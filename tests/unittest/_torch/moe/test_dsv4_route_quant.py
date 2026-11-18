@@ -208,3 +208,48 @@ def test_moe_with_routing_tables_is_bitwise_to_its_own_routing(num_tokens, do_fi
             e2p = [out[2].flatten()[: num_tokens * TOP_K].long() for out in (expected, got)]
             rows = [out[0][e] for out, e in zip((expected, got), e2p)]
             torch.testing.assert_close(rows[1], rows[0], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_staged_launch_drops_the_padding_rows_of_the_live_row_word(index_dtype):
+    """With the forward's live-row word, the staged bucket's rows of padding requests get expert -1
+    and weight 0, as megamoe_stage_routes stages them; the live rows, the returned token ids and
+    the activation are those of a launch without the word."""
+    from tensorrt_llm._torch.moe import live_rows
+    from tensorrt_llm._torch.moe.kernels.blackwell.dsv4_route_quant import dsv4_route_nvfp4_quant
+
+    num_tokens, bucket_rows = 32, 64  # 8 requests of 4 rows in a 64-row bucket
+    logits, bias, x, global_scale = _inputs(num_tokens, seed=3)
+    routing = _routing(bias)
+
+    def staged(word):
+        bucket = (
+            torch.full((bucket_rows, TOP_K), 7, dtype=index_dtype, device="cuda"),
+            torch.full((bucket_rows, TOP_K), 3.0, device="cuda"),
+            torch.zeros((bucket_rows, HIDDEN // 2), dtype=torch.uint8, device="cuda"),
+            torch.zeros((bucket_rows, HIDDEN // 16), dtype=torch.uint8, device="cuda"),
+        )
+        ids, *_ = dsv4_route_nvfp4_quant(
+            logits,
+            routing.e_score_correction_bias,
+            x,
+            global_scale,
+            routing.top_k,
+            routing.routed_scaling_factor,
+            torch.float32,
+            staged=bucket,
+            live_row_word=word,
+        )
+        torch.cuda.synchronize()
+        return ids, bucket
+
+    ids_all, all_rows = staged(None)
+    for value in (live_rows.ALL_ROWS, live_rows.encode(5, 8), live_rows.NO_ROWS):
+        word = torch.tensor([value], dtype=torch.int64).to(torch.int32).cuda()
+        ids, bucket = staged(word)
+        live = live_rows.live_row_count(value, num_tokens)
+        assert torch.equal(ids, ids_all)
+        assert torch.equal(bucket[0][:live], all_rows[0][:live]), hex(value)
+        assert torch.equal(bucket[1][:live], all_rows[1][:live])
+        assert (bucket[0][live:] == -1).all() and not bucket[1][live:].any(), hex(value)
+        assert torch.equal(bucket[2], all_rows[2]) and torch.equal(bucket[3], all_rows[3])

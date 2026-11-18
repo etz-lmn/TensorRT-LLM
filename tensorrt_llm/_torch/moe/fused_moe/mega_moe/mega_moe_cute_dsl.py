@@ -1540,6 +1540,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         bucket = self._route_quant_bucket(x.shape[0], self.routing_method.top_k, x.device, x.dtype)
         table = self._slot_of_expert
         shared_target = self._shared_activation_target(x.shape[0])
+        # A bucket whose kernel drops masked routes stages the padding requests' rows as -1 / 0,
+        # as megamoe_stage_routes does on the other paths.
+        word = None
+        if bucket is not None and bucket[0].shape[0] in self._padding_drop_buckets:
+            word = live_rows.current_word(x.device)
         ids, weights, x_fp4, x_sf, _ = dsv4_route_nvfp4_quant(
             router_logits,
             self.routing_method.e_score_correction_bias,
@@ -1553,6 +1558,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             replicas=bucket is not None and self._replicated,
             counters=route_counters,
             mxfp8=None if shared_target is None else shared_target[1:],
+            live_row_word=word,
         )
         if shared_target is not None:
             self._shared_quantized = (shared_target[0], x.shape[0])
