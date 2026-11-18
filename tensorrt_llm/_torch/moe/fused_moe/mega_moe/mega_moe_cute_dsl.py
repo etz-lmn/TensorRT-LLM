@@ -1676,21 +1676,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
     def routes_adaptive_in_router(self, num_tokens: int) -> bool:
         """Whether a launch of ``num_tokens`` rows can take an adaptive balancer's routes as expert
-        ids, mapped to slots and counted by its dispatch router: the model's fused route+quant
-        writes the bucket, and the bucket's kernel dispatches in one push round (the predicate the
-        kernel builds with). Otherwise the balancer stages the slots itself."""
+        ids, mapped to slots and counted by its dispatch router (either router: the one-round push
+        and the metadata push carry the same adaptive route): the model's fused route+quant writes
+        the launch bucket. Otherwise the balancer stages the slots itself."""
         if not IS_CUTLASS_DSL_AVAILABLE or self._slot_of_expert is not None:
             return False
-        if not self._route_quant_fuses() or not self.apply_topk_in_fc1:
+        if not self._route_quant_fuses():
             return False
-        launch_max_T = self._router_launch_max_tokens(num_tokens)
-        if launch_max_T is None:
-            return False
-        from ....moe.kernels.cutedsl_megamoe.kernel_src.blackwell.inference.mega import (
-            block_scaled_swap_ab_mega_moe_kernel as kernel,
-        )
-
-        return kernel.one_round_dispatch_enabled(int(self.ep_size), int(launch_max_T), False, True)
+        return self._router_launch_max_tokens(num_tokens) is not None
 
     def try_fused_route_quant(
         self,

@@ -533,7 +533,7 @@ def test_router_adaptive_route_is_bitwise_its_definition(rows):
         assert forwards.item() == want_forwards[0], (rows, case)
 
 
-def _kernel_ptx_digests(adaptive_route_experts, out_dir):
+def _kernel_ptx_digests(adaptive_route_experts, out_dir, tokens=32):
     """Build and compile the DeepSeek-V4 EP32 MegaMoE kernel of a 32-token bucket in a fresh interpreter with its
     PTX and cubins kept: {file: sha256 of the PTX without source locations, of the cubin}, and the resource usage."""
     import json
@@ -545,13 +545,13 @@ import hashlib, json, os, pathlib, re, subprocess, torch
 from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
 kwargs = dict(world_size=32, local_rank=0, num_topk=6, num_experts_per_rank=16, hidden_size=7168,
               intermediate_size_per_partition=3072, expand_intermediate_size_per_partition=6144,
-              max_tokens_per_rank=32, output_dtype=torch.bfloat16, apply_topk_in_fc1=True, swiglu_alpha=None,
+              max_tokens_per_rank={tokens}, output_dtype=torch.bfloat16, apply_topk_in_fc1=True, swiglu_alpha=None,
               swiglu_beta=None, gate_up_clamp=None, situ_beta=None, situ_linear_beta=None, in_kernel_fc2_reduce=False,
               combine_format="16e2m1xbf16", tactic_autotune=False, helper_expert_count=0)
 if {adaptive_route_experts}:
     kwargs["adaptive_route_experts"] = {adaptive_route_experts}
 runner = op._megamoe_get_runner(**kwargs)
-tactic = op._default_megamoe_tactic_for_key(runner._tactic_lookup_key(), num_tokens=32)
+tactic = op._default_megamoe_tactic_for_key(runner._tactic_lookup_key(), num_tokens={tokens})
 kernel = runner._build_kernel_once(tactic)
 kernel.aot_compile()
 out = pathlib.Path({str(out_dir)!r})
@@ -581,13 +581,17 @@ print("DIGESTS " + json.dumps(digests))
 
 
 @_requires_cute_gpu
-def test_megamoe_kernels_without_the_adaptive_route_record_their_ptx(tmp_path, record_property):
-    """The no-EPLB EP32 one-round build's kernels, digested (PTX without source locations, cubin) into the JUnit
-    properties of each arm of the GPU unit run: base and change must record the same PTX digests. The adaptive
-    build's router resource usage is recorded beside them where the arm has the route."""
+@pytest.mark.parametrize("tokens", [32, 1024])
+def test_megamoe_kernels_without_the_adaptive_route_record_their_ptx(
+    tmp_path, record_property, tokens
+):
+    """The no-EPLB EP32 build's kernels of a 32-token bucket (the one-round router) and a 1024-token bucket (the
+    metadata-push router), digested (PTX without source locations, cubin) into the JUnit properties of each arm of
+    the GPU unit run: base and change must record the same PTX digests. The adaptive build's resource usage is
+    recorded beside them where the arm has the route."""
     import json
 
-    digests = _kernel_ptx_digests(0, tmp_path / "base")
+    digests = _kernel_ptx_digests(0, tmp_path / "base", tokens)
     kept = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
     assert any(kind == "ptx" for kind, *_ in digests.values()), (
         f"the compile kept no PTX: {kept[:20]}"
@@ -604,7 +608,7 @@ def test_megamoe_kernels_without_the_adaptive_route_record_their_ptx(tmp_path, r
     )
 
     if hasattr(one_round_router._OneRoundRouter, "_adaptive_pick"):
-        adaptive = _kernel_ptx_digests(_AR_EXPERTS, tmp_path / "adaptive")
+        adaptive = _kernel_ptx_digests(_AR_EXPERTS, tmp_path / "adaptive", tokens)
         record_property(
             "adaptive_resource_usage",
             json.dumps({k: v[2] for k, v in adaptive.items() if v[0] == "cubin"}),

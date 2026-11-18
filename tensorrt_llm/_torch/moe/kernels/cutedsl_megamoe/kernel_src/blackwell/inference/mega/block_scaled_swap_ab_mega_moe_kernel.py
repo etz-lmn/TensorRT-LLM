@@ -218,8 +218,6 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             self.apply_topk_at_fc1,
         )
         self.adaptive_route_experts = int(impl_desc.get("adaptive_route_experts", 0) or 0)
-        if self.adaptive_route_experts and not self.one_round_dispatch:
-            raise ValueError("An adaptive route in the router needs the one-round dispatch.")
         # The sorter waits on one counter per (source rank, source CTA), one thread each (512 per CTA).
         self.one_round_cta_count = max(1, min(32, 512 // max(self.world_size, 1)))
 

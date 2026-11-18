@@ -44,6 +44,7 @@ from ...helpers.smem_workspace import SmemWorkspace
 from ...helpers.utils import ceil_div, round_up
 from ...quant_def import QuantKind
 from ..token_protocol import TokenSrcMetadata
+from .adaptive_route import AdaptiveRouteMixin
 from .symmetric_buffer import SymmetricBufferDevice
 
 
@@ -142,67 +143,6 @@ def _st_release_sys_s32(address: Int64, value: Int32, *, loc=None, ip=None) -> N
 
 
 @dsl_user_op
-def _ld_nc_s32(address: Int64, *, loc=None, ip=None) -> Int32:
-    """A read-only (non-coherent cache) load: route tables the launch never writes."""
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [address.ir_value()],
-            "ld.global.nc.b32 $0, [$1];",
-            "=r,l",
-            has_side_effects=True,
-            asm_dialect=0,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _ld_s32(address: Int64, *, loc=None, ip=None) -> Int32:
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [address.ir_value()],
-            "ld.global.b32 $0, [$1];",
-            "=r,l",
-            has_side_effects=True,
-            asm_dialect=0,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _red_add_f32(address: Int64, value: cutlass.Float32, *, loc=None, ip=None) -> None:
-    llvm.inline_asm(
-        None,
-        [address.ir_value(), value.ir_value()],
-        "red.relaxed.gpu.global.add.f32 [$0], $1;",
-        "l,f",
-        has_side_effects=True,
-        asm_dialect=0,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _red_add_u64(address: Int64, value: Int64, *, loc=None, ip=None) -> None:
-    llvm.inline_asm(
-        None,
-        [address.ir_value(), value.ir_value()],
-        "red.relaxed.gpu.global.add.u64 [$0], $1;",
-        "l,l",
-        has_side_effects=True,
-        asm_dialect=0,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def fence_proxy_async_global(*, loc=None, ip=None) -> None:
     """Order this thread's earlier generic-proxy acquires before its later async-proxy (TMA) reads."""
     llvm.inline_asm(
@@ -217,7 +157,7 @@ def fence_proxy_async_global(*, loc=None, ip=None) -> None:
     )
 
 
-class _OneRoundRouter(KernelComponent):
+class _OneRoundRouter(AdaptiveRouteMixin, KernelComponent):
     """One-round push dispatch with the ``_MetadataPushRouter`` output contract (see the module docstring)."""
 
     threads_per_cta: ClassVar[int] = 512
@@ -230,11 +170,6 @@ class _OneRoundRouter(KernelComponent):
     wait_sleep_cycles: ClassVar[int] = 64
     # Records per chunk the sorter keeps in registers between its two passes (the rest re-read with a scratch slot).
     sort_keep: ClassVar[int] = 8
-    # Adaptive route (``adaptive_route_experts`` > 0): the multipliers of the point that picks a replicated expert's
-    # copy, as adaptive_eplb/router_route.py defines them (its K_EXPERT, K_RANK, K_TOKEN).
-    adaptive_expert_multiplier: ClassVar[int] = 0x632BE5AB
-    adaptive_rank_multiplier: ClassVar[int] = 0x85EBCA6B
-    adaptive_token_multiplier: ClassVar[int] = 0x9E3779B9
 
     # Symmetric regions: sources write them through the peer pointer mapper.
     inbox_records_region: ClassVar[str] = "nvlink.one_round.inbox_records"
@@ -782,75 +717,6 @@ class _OneRoundRouter(KernelComponent):
                     peer_rank_ptr_mapper.map(count_address, destination, Int64(0)),
                     epoch_tag | (destination_count[destination] + Int32(1)),
                 )
-
-    @cute.jit
-    def _adaptive_counted_rows(self, adaptive: tuple, cta_idx: Int32, thread_idx: Int32) -> Int32:
-        """The token rows whose picks this launch counts: the live rows of the forward's rows by its live-row
-        word (adaptiveEplbKernels.cu liveIdCount), none while the recording flag is clear. Thread 0 of CTA 0 also
-        adds the forward to the forward count on the forward's first call."""
-        _, _, forwards, enabled, word_address, num_tokens, first = adaptive
-        word = _ld_s32(word_address)
-        real = word & Int32(0xFFFF)
-        requests = (word >> Int32(16)) & Int32(0xFFFF)
-        counted_rows = num_tokens
-        if requests == Int32(0):
-            counted_rows = Int32(0)
-        elif real < requests:
-            if num_tokens % requests == Int32(0):
-                counted_rows = num_tokens // requests * real
-        if _ld_s32(enabled) == Int32(0):
-            counted_rows = Int32(0)
-        elif cta_idx == Int32(0):
-            if thread_idx == Int32(0):
-                if first != Int32(0):
-                    _red_add_u64(forwards, Int64(1))
-        return counted_rows
-
-    @cute.jit
-    def _adaptive_pick(
-        self, adaptive: tuple, counted_rows: Int32, expert: Int32, token: Int32, ep_rank: Int32
-    ) -> Int32:
-        """One pick of ``expert`` (a valid id) in token row ``token``: counted into the statistics row when the
-        row is counted, and routed to its slot (-1 for a malformed table entry)."""
-        tables, rows = adaptive[0], adaptive[1]
-        if token < counted_rows:
-            _red_add_f32(rows + Int64(expert) * Int64(4), cutlass.Float32(1.0))
-        return self._adaptive_slot(tables, expert, token, ep_rank)
-
-    @cute.jit
-    def _adaptive_slot(self, tables: Int64, expert: Int32, token: Int32, ep_rank: Int32) -> Int32:
-        """The slot of a pick of ``expert`` (a valid id) in token row ``token``: its only copy, or for a replicated
-        expert the copy whose cumulative-share range holds the pick's point (adaptive_eplb/router_route.py), -1
-        for a malformed entry. Tables: ``counts | starts`` per expert, ``slots | cumulative_shares`` per slot."""
-        experts = self.adaptive_route_experts
-        slot_count = self.expert_count
-        copies = _ld_nc_s32(tables + Int64(expert) * Int64(4))
-        start = _ld_nc_s32(tables + (Int64(experts) + Int64(expert)) * Int64(4))
-        slots_base = tables + Int64(2 * experts) * Int64(4)
-        shares_base = tables + Int64(2 * experts + slot_count) * Int64(4)
-        slot = Int32(-1)
-        if copies > Int32(0) and start >= Int32(0) and start + copies <= Int32(slot_count):
-            k = Int32(0)
-            if copies > Int32(1):
-                point = (
-                    cutlass.Uint32(expert) * cutlass.Uint32(self.adaptive_expert_multiplier)
-                    + cutlass.Uint32(ep_rank) * cutlass.Uint32(self.adaptive_rank_multiplier)
-                    + cutlass.Uint32(token) * cutlass.Uint32(self.adaptive_token_multiplier)
-                )
-                searching = cutlass.Boolean(True)
-                while searching:
-                    searching = cutlass.Boolean(False)
-                    if k < copies - Int32(1):
-                        bound = cutlass.Uint32(
-                            _ld_nc_s32(shares_base + Int64(start + k) * Int64(4))
-                        )
-                        # A bound of 2^32 - 1 ends the range: no point passes it.
-                        if bound != cutlass.Uint32(0xFFFFFFFF):
-                            if point >= bound:
-                                k = k + Int32(1)
-                                searching = cutlass.Boolean(True)
-            slot = _ld_nc_s32(slots_base + Int64(start + k) * Int64(4))
-        return slot
 
     @cute.jit
     def _push_row(
