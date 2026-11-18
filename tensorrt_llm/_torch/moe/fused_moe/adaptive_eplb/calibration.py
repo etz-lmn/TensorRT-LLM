@@ -18,9 +18,9 @@ model's terms are fitted to the times:
   and on a table with replicas; ``route_us`` is the paired extra over the kernel terms' prediction,
   kept when above ``z`` standard errors.
 
-A bucket's fit is accepted when, on every ``holdout_every``-th design held out of the fit, it is not
-worse than the built-in model (refitted to a scale and an intercept on the same designs) by more
-than ``z`` standard errors; else that bucket keeps the built-in model. Every rank computes the
+A bucket's fit is accepted when, on every ``holdout_every``-th design held out of the fit, its error
+is below the built-in model's (refitted to a scale and an intercept on the same designs); else that
+bucket keeps the built-in model. Every rank computes the
 same sealed table; when any check fails on any rank before the first launch, or the ranks' tables
 differ, every rank keeps the built-in model.
 
@@ -354,7 +354,6 @@ def fit_bucket(
     k, a = np.polyfit(p[fit], y[fit], 1)
     e_own = y[held] - (a + k * p[held])
     w, e = (both, e5) if remote["resolved"] else (base, e4)
-    worse, worse_se = _paired(e, e_own)
     rows = float(g.tokens * g.top_k)
     rmse, own_rmse = float(np.sqrt(np.mean(e**2))), float(np.sqrt(np.mean(e_own**2)))
     route = dict(route_us=0.0, mean=None, se=None, resolved=False)
@@ -367,8 +366,8 @@ def fit_bucket(
     why = ""
     if not np.isfinite(w).all() or not np.isfinite(y).all():
         why = "a time or a cost is not finite"
-    elif worse > cfg.z * worse_se:
-        why = f"held-out error {rmse:.2f} us is worse than the built-in model's {own_rmse:.2f} us"
+    elif not rmse < own_rmse:
+        why = f"held-out error {rmse:.2f} us does not beat the built-in model's {own_rmse:.2f} us"
     terms = {}
     if not why:
         c = dict(zip(FEATURES, w[1:5].tolist()))
@@ -382,7 +381,11 @@ def fit_bucket(
         full[:4, :4] = cov
         full[4, 4] = route["se"] ** 2 if route["resolved"] else 0.0
         terms = dict(c, scale=1.0, route_us=route["route_us"], time_shares=True)
-        terms.update(covariance=tuple(full.ravel().tolist()), gain_z=cfg.gain_z)
+        # The held-out error of a difference of two predictions: what the covariance, which assumes the
+        # model's form, misses. Every pair of held-out designs, their residuals' difference.
+        i, j = np.triu_indices(len(e), 1)
+        residual = float(np.sqrt(np.mean((e[i] - e[j]) ** 2))) if len(i) else math.inf
+        terms.update(covariance=tuple(full.ravel().tolist()), gain_z=cfg.gain_z, gain_residual_us=residual)
     return BucketFit(rows, not why, why, terms, rmse, own_rmse, remote, route, len(y))
 
 
@@ -423,7 +426,10 @@ def time_model_of(table: dict | None, fallback: TimeModel) -> TimeModel:
     not accepted keeps the fallback's fields, as does every size without a table."""
     if not table or not any(b["accepted"] for b in table["buckets"]):
         return fallback
-    keep = {k: getattr(fallback, k) for k in (*FEATURES, "scale", "route_us", "time_shares", "covariance", "gain_z")}
+    keep = {
+        k: getattr(fallback, k)
+        for k in (*FEATURES, "scale", "route_us", "time_shares", "covariance", "gain_z", "gain_residual_us")
+    }
     rows = [
         (float(b["rows"]), tuple(sorted((b["terms"] if b["accepted"] else keep).items())))
         for b in table["buckets"]

@@ -68,8 +68,9 @@ class TimeModel:
     empty, the fields hold at every size. ``buckets`` holds, alike, ``(rows, ((field, value), ...))``:
     every field a bucket's warm-up fit sets (:mod:`.calibration`); it takes precedence over ``scales``.
     A fitted bucket also sets ``covariance``, the flattened covariance of :attr:`COVARIED` (us at
-    scale 1), and ``gain_z``: :func:`resolved_gains` keeps a predicted gain only above ``gain_z``
-    standard errors of it. Without them (a built-in model) every gain stands.
+    scale 1), ``gain_residual_us``, the held-out error of a difference of two of its predictions,
+    and ``gain_z``: :func:`resolved_gains` keeps a predicted gain only above ``gain_z`` standard
+    errors of it. Without them (a built-in model) every gain stands.
     """
 
     per_active_slot_us: float
@@ -84,6 +85,7 @@ class TimeModel:
     buckets: tuple[tuple[float, tuple[tuple[str, float], ...]], ...] = ()
     covariance: tuple[float, ...] = ()
     gain_z: float = 0.0
+    gain_residual_us: float = 0.0
 
     COVARIED = ("per_active_slot_us", "per_extra_tile_us", "per_row_us", "hot_slot_extra_tile_us", "route_us")
 
@@ -434,17 +436,18 @@ def gain_standard_error(
     model: TimeModel,
     geometry: ExpertGeometry,
 ) -> np.ndarray | None:
-    """``[L]`` standard error in ms of :func:`evaluate_gains`' gains from the model's coefficient
-    covariance: the variance of the difference of the two predictions, whose errors share the
-    coefficients (the busiest GPUs held), so it is far below either prediction's error. None without
-    a covariance."""
+    """``[L]`` standard error in ms of :func:`evaluate_gains`' gains: the variance of the difference of
+    the two predictions from the model's coefficient covariance (the busiest GPUs held), plus the
+    held-out error of such a difference (``gain_residual_us``), which the covariance, assuming the
+    model's form, misses. None without a covariance."""
     if not model.covariance or not len(load):
         return None
     before = _busiest_features(slot_rows(load, layout, shares), layout, model, geometry)
     after = _busiest_features(slot_rows(load, new_layout, new_shares), new_layout, model, geometry)
     d = (before - after) * np.array([model.scale] * 4 + [1.0])
     cov = np.asarray(model.covariance, dtype=np.float64).reshape(5, 5)
-    return np.sqrt(np.maximum(np.einsum("li,ij,lj->l", d, cov, d), 0.0)) / 1e3
+    var = np.maximum(np.einsum("li,ij,lj->l", d, cov, d), 0.0) + model.gain_residual_us**2
+    return np.sqrt(var) / 1e3
 
 
 def resolved_gains(gains: np.ndarray, errors: np.ndarray | None, model: TimeModel) -> np.ndarray:

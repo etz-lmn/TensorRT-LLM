@@ -82,7 +82,7 @@ def test_a_bad_fit_falls_back(monkeypatch):
     y = times(designs, np.random.default_rng(3))
     monkeypatch.setattr(cal, "fit_max", lambda f, y, start, it: np.r_[0.0, 50.0 * np.ones(f.shape[-1])])
     fit = cal.fit_bucket(G, designs, y, BUILT_IN, CFG)
-    assert not fit.accepted and "worse than the built-in" in fit.why
+    assert not fit.accepted and "does not beat the built-in" in fit.why
     y[0] = np.nan
     monkeypatch.undo()
     assert not cal.fit_bucket(G, designs, y, BUILT_IN, CFG).accepted
@@ -173,7 +173,7 @@ def test_a_gain_inside_its_standard_error_installs_nothing():
     designs = cal.make_designs(G, CFG, (G.tokens,))
     fit = cal.fit_bucket(G, designs, times(designs, np.random.default_rng(5), noise=2.0), BUILT_IN, CFG)
     model = cal.time_model_of(cal.make_table([fit], {}), BUILT_IN).at(1.0)
-    assert len(model.covariance) == 25 and model.gain_z == CFG.gain_z
+    assert len(model.covariance) == 25 and model.gain_z == CFG.gain_z and model.gain_residual_us > 0
     geometry = ExpertGeometry(num_experts=G.ep * G.homes, num_slots=G.ep * G.local_slots, ep_size=G.ep)
     home = geometry.home_layout()
     new = home.copy()
