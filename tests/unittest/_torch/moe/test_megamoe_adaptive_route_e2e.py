@@ -245,12 +245,98 @@ def _run() -> list:
                 )
             _assert_on_all_ranks(problem)
 
-        # The route tables a runtime install rewrites in place (fixed address), and a replicated version.
+        # The server's order: a forward whose first layer routes as a DeepSeek-V4 hash layer does (no router's
+        # route: the staged launch's kernel) and whose other layers take the router's route, all on one bucket's
+        # shared workspace; eager forwards (counted fences and host time per layer call, rank 0 records), then
+        # the CUDA graph runner's warmup step and its capture, replayed against eager.
+        from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+
+        class _CountedFences(set):
+            fences = 0
+
+            def add(self, key):
+                type(self).fences += 1
+                super().add(key)
+
+        megamoe_op._MEGAMOE_FENCED_KEYS = _CountedFences(megamoe_op._MEGAMOE_FENCED_KEYS)
+        use_router(True)
+        backends[0].routes_adaptive_in_router = lambda num_tokens: False
+        for rows in (64, 1024):
+            counts = [rows] * world_size
+            x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
+            forward(adaptive, x, counts)
+            torch.cuda.synchronize()
+            hosts, fences = [], _CountedFences.fences
+            for _ in range(_REPS):
+                MPI.COMM_WORLD.Barrier()
+                begin = time.perf_counter()
+                for layer in adaptive:
+                    layer(x, all_rank_num_tokens=counts)
+                torch.cuda.synchronize()
+                hosts.append((time.perf_counter() - begin) / _LAYERS * 1e6)
+            if rank == 0:
+                results.append(
+                    dict(
+                        rank=rank,
+                        arm="server_order_eager",
+                        rows=rows,
+                        fences_per_forward=(_CountedFences.fences - fences) / _REPS,
+                        host_us_per_layer=statistics.median(hosts),
+                        layers=_LAYERS,
+                    )
+                )
+                print(json.dumps(results[-1]), flush=True)  # also when the capture below fails
+            for _ in range(CUDAGraphRunner.WARMUP_STEPS):
+                want = [layer(x, all_rank_num_tokens=counts).clone() for layer in adaptive]
+            torch.cuda.synchronize()
+            graph, problem = torch.cuda.CUDAGraph(), None
+            try:
+                with torch.cuda.graph(graph):
+                    got = [layer(x, all_rank_num_tokens=counts).clone() for layer in adaptive]
+            except RuntimeError as error:
+                problem = f"{rows} rows: capture after the eager warmup failed: {error}"
+            if problem is None:
+                graph.replay()
+                torch.cuda.synchronize()
+                if not all(torch.equal(a, b) for a, b in zip(got, want)):
+                    problem = f"{rows} rows: the captured mixed forward differs from eager"
+            del graph
+            _assert_on_all_ranks(problem)
+        use_router(True)
+
+        # A runtime install rewrites a layer's route table row in place: a graph captured on the home
+        # tables replays the replicated ones as an eager forward routes them (replica slots hold no
+        # copied weights here, so the check is replay against eager, not against the plain layer).
         tables = balancer.route_tables(device)
         home_tables = tables.clone()
         replica_tables = torch.stack(
             [_replica_row(home_tables[i].tolist()) for i in range(_LAYERS)]
         ).to(device)
+        use_router(True)
+        for rows in (64, 1024):
+            counts = [rows] * world_size
+            x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
+            for _ in range(2):
+                adaptive[0](x, all_rank_num_tokens=counts)
+            torch.cuda.synchronize()
+            graph, slot = torch.cuda.CUDAGraph(), None
+            with torch.cuda.graph(graph):
+                slot = adaptive[0](x, all_rank_num_tokens=counts).clone()
+            tables.copy_(replica_tables)
+            torch.cuda.synchronize()
+            slot.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            eager = adaptive[0](x, all_rank_num_tokens=counts).clone()
+            torch.cuda.synchronize()
+            same = torch.equal(slot, eager)
+            tables.copy_(home_tables)
+            del graph
+            _assert_on_all_ranks(
+                None if same else f"{rows} rows: the replay after an install differs from eager"
+            )
+
         # Kernels per layer call (torch profiler): the router's route launches no route op or staging.
         names = {}
         for arm, router in (("adaptive_staged", False), ("adaptive_router", True)):
@@ -406,37 +492,6 @@ def _run() -> list:
         tables.copy_(home_tables)
         if rank == 0:
             results.append(dict(rank=rank, kernel_us_per_layer_call=kernel_times))
-
-        # Last, after every eager pairing has run (as the executor captures after its warmup): a graph captured
-        # on the home tables replays an install's replicated tables as an eager forward routes them (replica
-        # slots hold no copied weights here, so the check is replay against eager, not against the plain layer).
-        tables.copy_(home_tables)
-        use_router(True)
-        inputs = {}
-        for rows in (64, 1024):
-            inputs[rows] = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
-            for _ in range(2):
-                adaptive[0](inputs[rows], all_rank_num_tokens=[rows] * world_size)
-        torch.cuda.synchronize()
-        graphs = {}
-        for rows, x in inputs.items():
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                slot = adaptive[0](x, all_rank_num_tokens=[rows] * world_size).clone()
-            graphs[rows] = (graph, slot)
-        tables.copy_(replica_tables)
-        torch.cuda.synchronize()
-        for rows, (graph, slot) in graphs.items():
-            slot.fill_(float("nan"))
-            graph.replay()
-            torch.cuda.synchronize()
-            eager = adaptive[0](inputs[rows], all_rank_num_tokens=[rows] * world_size).clone()
-            torch.cuda.synchronize()
-            same = torch.equal(slot, eager)
-            _assert_on_all_ranks(
-                None if same else f"{rows} rows: the replay after an install differs from eager"
-            )
-        del graphs
         tables.copy_(home_tables)
         use_router(True)
     return results
