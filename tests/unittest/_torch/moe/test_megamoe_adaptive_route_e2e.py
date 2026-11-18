@@ -317,6 +317,94 @@ def _run() -> list:
                             tables="home" if table is None else "replicas",
                         )
                     )
+        # Where the host time of a layer call goes: cProfile of a chain of calls per arm at 8 rows (rank 0
+        # records), top functions by own time, and the frames only the adaptive arms run, by cumulative time.
+        import cProfile
+        import pstats
+
+        def frames(profile):
+            stats = pstats.Stats(profile).stats
+            return {
+                f"{path.rsplit('/', 1)[-1]}:{line}:{name}": (calls[1], own * 1e6, total * 1e6)
+                for (path, line, name), calls in ((k, v) for k, v in stats.items())
+                for own, total in [(calls[2], calls[3])]
+            }
+
+        profiles = {}
+        counts = [8] * world_size
+        x = torch.randn((8, _HIDDEN_SIZE), dtype=torch.bfloat16)
+        for arm, (layers, router, _) in arms.items():
+            if router is not None:
+                use_router(router)
+            tables.copy_(home_tables)
+            for _ in range(2):
+                layers[0](x, all_rank_num_tokens=counts)
+            torch.cuda.synchronize()
+            MPI.COMM_WORLD.Barrier()
+            profile = cProfile.Profile()
+            profile.enable()
+            for call in range(_CHAIN):
+                layers[call % _LAYERS](x, all_rank_num_tokens=counts)
+            profile.disable()
+            torch.cuda.synchronize()
+            profiles[arm] = frames(profile)
+        if rank == 0:
+            top = {
+                arm: sorted(
+                    (
+                        (k, round(v[1] / _CHAIN, 2), round(v[2] / _CHAIN, 2), v[0])
+                        for k, v in f.items()
+                    ),
+                    key=lambda item: -item[1],
+                )[:30]
+                for arm, f in profiles.items()
+            }
+            plain_keys = set(profiles["fused_no_balancer"])
+            only = {
+                arm: sorted(
+                    (
+                        (k, round(v[2] / _CHAIN, 2), round(v[1] / _CHAIN, 2), v[0])
+                        for k, v in f.items()
+                        if k not in plain_keys
+                    ),
+                    key=lambda item: -item[1],
+                )[:30]
+                for arm, f in profiles.items()
+                if arm != "fused_no_balancer"
+            }
+            results.append(
+                dict(
+                    rank=rank,
+                    host_profile_us_per_call=dict(top_by_own=top, adaptive_only_by_cumulative=only),
+                )
+            )
+
+        # route_us per kernel: every CUDA kernel of one layer call on the router's route, home against
+        # replicated tables (torch profiler, rank 0 records names and microseconds).
+        use_router(True)
+        kernel_times = {}
+        for rows in (8, 128, 1024, 4096):
+            counts = [rows] * world_size
+            x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
+            for name, table in (("home", home_tables), ("replicas", replica_tables)):
+                tables.copy_(table)
+                for _ in range(2):
+                    adaptive[0](x, all_rank_num_tokens=counts)
+                torch.cuda.synchronize()
+                with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CUDA]
+                ) as prof:
+                    adaptive[0](x, all_rank_num_tokens=counts)
+                    torch.cuda.synchronize()
+                kernel_times[f"{rows}/{name}"] = [
+                    (event.name[:160], round(event.device_time, 2))
+                    for event in prof.events()
+                    if event.device_type == torch.autograd.DeviceType.CUDA
+                ][:40]
+        tables.copy_(home_tables)
+        if rank == 0:
+            results.append(dict(rank=rank, kernel_us_per_layer_call=kernel_times))
+
         # Last, after every eager pairing has run (as the executor captures after its warmup): a graph captured
         # on the home tables replays an install's replicated tables as an eager forward routes them (replica
         # slots hold no copied weights here, so the check is replay against eager, not against the plain layer).
