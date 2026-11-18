@@ -14,13 +14,16 @@ Prints one ``APPLY_MARKS_SUMMARY`` line per rank: per step, the median and maxim
 
 import json
 import os
+import pickle
 import statistics
 import sys
 import time
 
+import cloudpickle
 import numpy as np
 import pytest
 import torch
+from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
 _WORLD_SIZE = 4
@@ -29,6 +32,10 @@ _FORWARDS, _OPEN_AFTER = 8, 4
 _WINDOWS = 24
 _EXPERT_BYTES = 37158924  # one DeepSeek-V4 NVFP4 expert
 _RPC_S = 0.0004  # the decision process's answer
+
+# The workers run this module's functions by value (the module is not importable by name there).
+cloudpickle.register_pickle_by_value(sys.modules[__name__])
+MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
 
 def _init_worker(path):
@@ -165,9 +172,9 @@ def test_publish_marks_on_four_ranks():
         pytest.skip("Spawns its own worker processes")
     with MPIPoolExecutor(
         max_workers=_WORLD_SIZE, initializer=_init_worker, initargs=(sys.path,)
-    ) as ex:
-        futures = [ex.submit(_rank_run) for _ in range(_WORLD_SIZE)]
-        summaries = [f.result() for f in futures]
+    ) as executor:
+        futures = [executor.submit(_rank_run) for _ in range(_WORLD_SIZE)]
+        summaries = [future.result() for future in futures]
     for summary in summaries:
         print("APPLY_MARKS_SUMMARY " + json.dumps(summary), flush=True)
         # every install and retire window publishes (unchanged windows never reach the main thread)
