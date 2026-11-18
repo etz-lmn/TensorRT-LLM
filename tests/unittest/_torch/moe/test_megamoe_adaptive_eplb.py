@@ -148,3 +148,38 @@ def test_staged_routes_are_taken_only_after_a_route_staging_hand_out():
     # Routes in a tensor of the caller's own are staged by run_moe as before.
     own = torch.zeros(4, 6, dtype=torch.int32)
     assert not IMPL._routes_staged(backend, bufs, own, 4, 6, None)
+
+
+def test_router_route_ranks_and_rows_are_the_balancers():
+    """The router picks a replicated expert's copy by the EP rank the kernel launches as (the op's local_rank,
+    the symmetric buffer's rank) and the pick's row in the launch bucket; router_route.py by the balancer's
+    ep_rank and the row of the forward's routes. Both ranks are the mapping's moe_ep_rank, every launch passes
+    the backend's ep_rank, and the fused route writes routes row for row into the bucket's leading rows."""
+    import ast
+    import inspect
+
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
+    from tensorrt_llm._torch.moe.fused_moe import impl_base, moe_load_balancer
+
+    tree = ast.parse(inspect.getsource(mm))
+    launches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_launch_megamoe_kernel"
+    ]
+    assert launches
+    for call in launches:
+        rank = next(k.value for k in call.keywords if k.arg == "local_rank")
+        assert ast.unparse(rank) == "self.ep_rank", ast.unparse(call)
+    # The backend's and the balancer's ranks are the mapping's moe_ep_rank.
+    assert "module.ep_rank = model_config.mapping.moe_ep_rank" in inspect.getsource(impl_base)
+    assert "ep_rank = model_config.mapping.moe_ep_rank" in inspect.getsource(
+        moe_load_balancer.maybe_create_moe_load_balancer
+    )
+    # The kernel's rank is the op's local_rank: the symmetric buffer handed to the router carries it.
+    assert "rank=int(self.local_rank)" in inspect.getsource(op)
+    # The fused route stages the forward's routes in the bucket's leading rows, row for row.
+    source = inspect.getsource(mm.TrtllmCutedslMegaMoeNvfp4Impl.try_fused_route_quant)
+    assert "staged=bucket" in source and "slot_of_expert=None if bucket is None else table" in source
