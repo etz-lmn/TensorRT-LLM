@@ -29,7 +29,6 @@ class PerLayerDynamicMoeLayerLoadBalancer:
 
     # ``route`` publishes a ``MoEReplicaPlan`` that the caller must finish.
     produces_replica_plan = True
-    stages_routes = False
 
     def __init__(
         self,

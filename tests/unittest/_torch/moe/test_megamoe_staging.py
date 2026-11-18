@@ -72,7 +72,7 @@ def test_empty_preparation_preserves_staging_identity_and_launches_peer_work(
     backend._routes_staged = types.MethodType(IMPL._routes_staged, backend)
 
     def prepare():
-        return IMPL._stage_bf16_inputs(backend, x, ids, weights, None)
+        return IMPL._stage_bf16_inputs(backend, x, ids, weights)
 
     def run(inputs):
         return IMPL._run_moe(
@@ -242,7 +242,7 @@ def test_run_moe_launches_from_the_staging_only_the_rows_quantize_input_put_ther
             run(*inputs)
         assert backend._quantized_into is None  # consumed by the launch it was meant for
     assert stage_activation == [False, True]
-    # Routes a load balancer wrote into the staging (route_staging) are not staged again: after
+    # Routes the one-launch staging wrote into the bucket are not staged again: after
     # quantize_input nothing is staged, otherwise only the activation rows are copied.
     assert all(dtype == torch.int32 for dtype in mapped_dtypes)
     mapped_before_handout = len(mapped_dtypes)

@@ -2411,9 +2411,7 @@ class _ChunkRoutes:
         self.name = name
 
 
-@pytest.mark.parametrize(
-    "mode", ["per_layer_dynamic", "standard", "off", "deferred", "deferred_recording"]
-)
+@pytest.mark.parametrize("mode", ["per_layer_dynamic", "standard", "off"])
 @pytest.mark.parametrize("has_dtype_hint", [False, True])
 def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, has_dtype_hint):
     source = _TORCH_ROOT / "moe/fused_moe/moe_scheduler.py"
@@ -2444,9 +2442,8 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
         "ExpertStatistic": ExpertStatistic,
         "get_calibrator": lambda: SimpleNamespace(
             maybe_collect_or_replay_slots=maybe_collect_or_replay_slots,
-            mode=SimpleNamespace(name="COLLECT" if mode == "deferred_recording" else "NONE"),
+            mode=SimpleNamespace(name="NONE"),
         ),
-        "functools": functools,
         "get_active_route_capture": lambda: None,
         "torch": SimpleNamespace(int32="int32", float32="float32"),
         "Fp4QuantizedTensor": type("Fp4QuantizedTensor", (), {}),
@@ -2455,7 +2452,6 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
     }
     _extract_function(source, "_record_routes", namespace)
     _extract_function(source, "_leading_rows", namespace)
-    _extract_function(source, "_routes_recorded", namespace)
     _extract_function(source, "_num_rows", namespace)
     _extract_class(source, "MoEScheduler", {"_try_fused_route_quant"}, namespace)
     scheduler_cls = _extract_class(
@@ -2469,18 +2465,15 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
         else SimpleNamespace(
             produces_replica_plan=mode == "per_layer_dynamic",
             require_replica_plan=lambda: plan,
-            stages_routes=True,
         )
     )
 
-    def route(routes, use_dp, token_final_scales=None, **quantize):
-        trace.append(("route", routes.name, *quantize.values()))
+    def route(routes, use_dp):
+        trace.append(("route", routes.name))
         return _ChunkRoutes("physical" if mode == "per_layer_dynamic" else "slots")
 
     def run_moe(ctx):
         trace.append(("run_moe", ctx.token_selected_experts.name, ctx.replica_plan))
-        if ctx.route is not None:  # the route the backend launches with its input staging
-            trace.append(("staged", ctx.x_sf, ctx.route(quantize="q").name))
         return "out"
 
     moe = SimpleNamespace(
@@ -2517,7 +2510,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
             set_adaptive_launch_tokens=lambda tokens: trace.append(("bucket", tokens)),
             set_adaptive_launch_output_dtype=lambda dtype: forwarded_dtype.append(dtype),
             run_moe=run_moe,
-            supports_fused_prepare=lambda: mode in ("deferred", "deferred_recording"),
+            supports_fused_prepare=lambda: False,
         ),
     )
     scheduler = scheduler_cls()
@@ -2552,7 +2545,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
             ("run_moe", "physical", plan),
             "start_set_cpu",
         ]
-    elif mode in ("standard", "deferred_recording"):
+    elif mode == "standard":
         expected = [
             "start_wait_gpu",
             ("bucket", 6),
@@ -2561,26 +2554,11 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
             ("route", "logical"),
             ("statistic", "slots"),
             ("calibrator", "slots"),
-            *(([("quantize", {})]) if mode == "standard" else []),
+            ("quantize", {}),
             # The fused kernel must not run alongside the statistic allreduce;
             # quantization and staging before it still overlap it.
             "wait_statistic",
             ("run_moe", "replayed slots", None),
-            "start_set_cpu",
-            "done_set_cpu",
-        ]
-    elif mode == "deferred":
-        # A balancer that stages routes, under a backend that stages its inputs in one launch:
-        # run_moe launches the route, with the quantization, and gets the activation unquantized.
-        expected = [
-            "start_wait_gpu",
-            ("bucket", 6),
-            "done_wait_gpu",
-            ("update_statistic", "logical"),
-            "wait_statistic",
-            ("run_moe", "logical", None),
-            ("route", "logical", "q"),
-            ("staged", None, "slots"),
             "start_set_cpu",
             "done_set_cpu",
         ]
@@ -2597,9 +2575,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
         ]
     assert trace == expected
     # Routes recorded before the route are expert IDs; after it, slots.
-    assert labels == (
-        [] if mode == "deferred" else [16, 16] if mode == "per_layer_dynamic" else [24, 24]
-    )
+    assert labels == ([16, 16] if mode == "per_layer_dynamic" else [24, 24])
 
 
 def test_base_worker_finalizes_rank_follower_pyexecutor():

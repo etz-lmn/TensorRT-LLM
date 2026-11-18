@@ -73,7 +73,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -409,20 +409,6 @@ class MegaMoECuteDslWeightView:
     # (slots,) fp32; FC1-output (= FC2-input) NVFP4 quant norm_const, one
     # reciprocal raw w2.input_scale per local expert slot.
     fc1_norm_const: torch.Tensor
-
-
-class MegaMoeRouteStaging(NamedTuple):
-    """The route staging of one bucket a caller may fill in place of ``run_moe``
-    (:meth:`MegaMoECuteDsl.route_staging`)."""
-
-    topk_idx: torch.Tensor
-    """``[bucket, top_k]`` slot ids in the kernel's index dtype; -1 past the live rows."""
-    topk_weights: torch.Tensor
-    """``[bucket, top_k]`` float32 gate weights; 0 past the live rows."""
-    bucket: int
-    live_row_word: Optional[torch.Tensor]
-    """The forward's live-row word (``moe/live_rows.py``) when the bucket's kernel drops the rows
-    of padding requests, else None: the rows the staging keeps, and the statistics count."""
 
 
 @dataclass(frozen=True)
@@ -959,34 +945,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and bucket in self._genphase_direct_input_buckets
         )
 
-    def route_staging(
-        self, num_tokens: int, top_k: int, device: torch.device
-    ) -> Optional[MegaMoeRouteStaging]:
-        """The index and weight staging of the bucket the next ``run_moe`` selects, for a
-        load balancer that writes slot ids and gate weights straight into it.
-
-        The bucket is the one ``set_adaptive_launch_tokens`` hinted (so the hint precedes the
-        route). The caller writes rows ``[0, num_tokens)`` as ``trtllm::megamoe_stage_routes``
-        stages them under the returned ``live_row_word``: the slots and float32 gate weights of
-        the live rows, -1 and 0 in the rows of padding requests and in rows ``[num_tokens,
-        bucket)``. It then passes ``topk_idx[:num_tokens]`` as the run's
-        ``token_selected_experts``: ``run_moe`` recognises its own staging by address and does
-        not stage the routes again. Returns None when that ``run_moe`` does not stage routes (no
-        hint yet, tactic autotuning, a bucket whose inputs are read in place, buffers not built);
-        the caller then routes into a tensor of its own.
-        """
-        if top_k != self.routing_method.experts_per_token:
-            return None
-        bufs = self._staging_of_next_run(num_tokens, device)
-        if bufs is None:
-            return None
-        bucket = bufs.topk_idx_local.shape[0]
-        # run_moe takes routes found in this staging only after this hand-out (whose caller
-        # writes the gate weights beside the slots): _routes_staged.
-        self._handed_out_route_staging = bufs.topk_idx_local.data_ptr()
-        word = live_rows.current_word(device) if bucket in self._padding_drop_buckets else None
-        return MegaMoeRouteStaging(bufs.topk_idx_local, bufs.topk_weights, bucket, word)
-
     def _routes_staged(
         self,
         bufs: "_MegaMoeBuffers",
@@ -996,7 +954,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         replica_plan: Optional[object],
     ) -> bool:
         """Whether the routes of this launch are the live rows of the bucket's index staging, written
-        by a caller of :meth:`route_staging` together with the gate weights beside them.
+        by the one-launch staging (:meth:`_stage_bf16_inputs`) together with the gate weights beside
+        them.
 
         The launch then reads both from the staging, so routes found there without that hand-out
         (gate weights possibly stale) and routes a replica plan would rewrite are refused."""
@@ -1009,12 +968,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if not staged:
             if handed_out is not None:
                 raise ValueError(
-                    "routes from route_staging must retain the bucket's row-view identity"
+                    "routes the staging wrote must retain the bucket's row-view identity"
                 )
             return False
         if handed_out != bufs.topk_idx_local.data_ptr():
             raise ValueError(
-                "routes in the MegaMoE route staging must come from route_staging, which writes "
+                "routes in the MegaMoE route staging must come from the one-launch staging, which writes "
                 "the gate weights beside them"
             )
         if replica_plan is not None:
@@ -1736,16 +1695,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         x: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        route: Optional[Callable[..., torch.Tensor]],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Quantize ``x`` and stage the routes in one launch, into the staging of the bucket the
-        next launch selects: ``megamoe_stage_inputs``, or with ``route`` (a load balancer's,
-        ``MoERunContext.route``) the balancer's route launch, which maps the expert ids
-        ``topk_idx`` to slots there.
+        """Quantize ``x`` and stage the routes in one ``megamoe_stage_inputs`` launch, into the
+        staging of the bucket the next launch selects.
 
         Returns the activation, its scale factors and the routes, which ``_run_moe`` finds staged.
         Without a staging (inputs read in place, tactic autotuning, SF rows that need padding)
-        the route and the quantization launch apart.
+        it quantizes alone and ``_run_moe`` stages the routes.
         """
         num_tokens, top_k = topk_idx.shape
         hidden = x.shape[1]
@@ -1753,8 +1709,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if megamoe_activation_sf_bytes_per_row(hidden) == ceil_div(hidden, 16):
             staged = self._staging_of_next_run(num_tokens, x.device)
         if staged is None:
-            if route is not None:
-                topk_idx = route()
             return (*self.quantize_input(x), topk_idx)
         bufs = staged
         x_fp4, x_sf = bufs.activation[:num_tokens], bufs.activation_sf[:num_tokens]
@@ -1766,8 +1720,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 x.to(torch.bfloat16).contiguous(), shared_target[1], shared_target[2]
             )
             self._shared_quantized = (shared_target[0], num_tokens)
-        if route is not None:
-            return x_fp4, x_sf, route(quantize=quantize)
         if self._slot_of_expert is not None:
             topk_idx = self.slots_of_experts(topk_idx)
         torch.ops.trtllm.megamoe_stage_inputs(
@@ -1780,7 +1732,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             if bufs.topk_idx_local.shape[0] in self._padding_drop_buckets
             else None,
         )
-        # The routes are staged with their gate weights, as a route_staging caller stages them.
+        # The routes are staged with their gate weights: _routes_staged accepts them.
         self._handed_out_route_staging = bufs.topk_idx_local.data_ptr()
         staged_routes = bufs.topk_idx_local[:num_tokens]
         # Static IDs have already been mapped above; do not map the staged slots again.
@@ -1844,7 +1796,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         token_final_scales = ctx.token_final_scales
         x_sf = ctx.x_sf
         replica_plan = getattr(ctx, "replica_plan", None)
-        route = getattr(ctx, "route", None)
         output_dtype = ctx.output_dtype
         if output_dtype is None:
             output_dtype = self.dtype or torch.bfloat16
@@ -1883,10 +1834,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             topk_weights_f32 = topk_weights_f32.to(torch.float32).contiguous()
         if x_sf is None:
             x, x_sf, token_selected_experts = self._stage_bf16_inputs(
-                x, token_selected_experts, topk_weights_f32, route
+                x, token_selected_experts, topk_weights_f32
             )
-        elif route is not None:
-            token_selected_experts = route()
 
         # Routes stay as produced: the route staging widens int32 to the
         # kernel's index dtype, and it is the first route reader.

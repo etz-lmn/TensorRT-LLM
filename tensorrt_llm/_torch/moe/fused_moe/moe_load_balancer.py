@@ -311,7 +311,6 @@ class SingleLayerMoeLoadBalancer:
 
     # Standard EPLB routes to slot IDs and has no per-invocation replica plan.
     produces_replica_plan = False
-    stages_routes = False
 
     def __init__(
             self,

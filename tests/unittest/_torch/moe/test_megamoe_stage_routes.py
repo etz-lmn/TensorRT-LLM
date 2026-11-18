@@ -277,7 +277,7 @@ def test_bf16_inputs_stage_in_one_launch_as_in_two(rows, bucket, monkeypatch):
     monkeypatch.setattr(live_rows, "current_word", lambda device: word)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        got = MegaMoECuteDsl._stage_bf16_inputs(moe, x, ids, weights, None)
+        got = MegaMoECuteDsl._stage_bf16_inputs(moe, x, ids, weights)
     for view, full in zip(got, (fused.activation, fused.activation_sf, fused.topk_idx_local)):
         assert view.untyped_storage().data_ptr() == full.untyped_storage().data_ptr()
         assert view.storage_offset() == full.storage_offset()
@@ -304,7 +304,7 @@ def test_bf16_inputs_stage_in_one_launch_as_in_two(rows, bucket, monkeypatch):
 @pytest.mark.cpu_only
 def test_bf16_inputs_launch_apart_where_the_next_run_stages_nothing(monkeypatch):
     """Without a staging (inputs read in place, tactic autotuning, SF rows that need padding) the fused
-    prepare launches a load balancer's route alone, then quantize_input; a layer whose balancer
+    prepare quantizes alone and leaves the routes to _run_moe's staging; a layer whose balancer
     plans replicas keeps quantize_input, which leaves SMs to the plan's HALO-Q/TMA kernel."""
     calls = []
     moe = SimpleNamespace(
@@ -313,17 +313,13 @@ def test_bf16_inputs_launch_apart_where_the_next_run_stages_nothing(monkeypatch)
     )
     ids = torch.zeros(4, TOP_K, dtype=torch.int32)
 
-    def route(quantize=None):
-        calls.append(("route", quantize))
-        return "slots"
-
     for hidden, looked in (
         (7168, ["staging"]),
         (2080, []),
     ):  # 2080 / 16 = 130 SF bytes, padded to 132
         calls.clear()
-        got = MegaMoECuteDsl._stage_bf16_inputs(moe, torch.zeros(4, hidden), ids, None, route)
-        assert got == ("fp4", "sf", "slots") and calls == looked + [("route", None), "quantize"]
+        got = MegaMoECuteDsl._stage_bf16_inputs(moe, torch.zeros(4, hidden), ids, None)
+        assert got == ("fp4", "sf", ids) and calls == looked + ["quantize"]
     monkeypatch.setattr(torch.ops.trtllm, "megamoe_stage_inputs", object(), raising=False)
     for balancer, dynamic, fused in (
         (None, False, True),

@@ -790,33 +790,20 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         from .moe_warmup_placement import count_routing
         count_routing(token_selected_experts, counters, router_logits)
 
-    def _load_balancer_route(self,
-                             token_selected_experts: torch.Tensor,
-                             use_dp: bool,
-                             token_final_scales: Optional[torch.Tensor] = None,
-                             quantize: Optional[tuple] = None) -> torch.Tensor:
-        """Route tokens and enqueue a per-layer dynamic replica plan when enabled.
-
-        ``token_final_scales`` lets a balancer that stages routes for the
-        backend write the gate weights beside the slots; a balancer that does
-        not take them is called without them. ``quantize`` (a backend's
-        ``(x, global_scale, x_fp4, x_sf)``) is quantized in the route's launch
-        by such a balancer.
-        """
+    def _load_balancer_route(self, token_selected_experts: torch.Tensor,
+                             use_dp: bool) -> torch.Tensor:
+        """Route tokens and enqueue a per-layer dynamic replica plan when enabled."""
         if not self.layer_load_balancer:
             return token_selected_experts
 
-        kwargs = {}
-        if token_final_scales is not None and self.layer_load_balancer.stages_routes:
-            kwargs["token_final_scales"] = token_final_scales
-        if quantize is not None:
-            kwargs["quantize"] = quantize
         overlap_fn = self._load_balancer_overlap_fn
-        if overlap_fn is not None:
-            self._load_balancer_overlap_fn = None
-            kwargs["overlap_fn"] = overlap_fn
-        return self.layer_load_balancer.route(token_selected_experts, use_dp,
-                                              **kwargs)
+        if overlap_fn is None:
+            return self.layer_load_balancer.route(token_selected_experts,
+                                                  use_dp)
+        self._load_balancer_overlap_fn = None
+        return self.layer_load_balancer.route(token_selected_experts,
+                                              use_dp,
+                                              overlap_fn=overlap_fn)
 
     def _load_balancer_uses_replica_plan(self) -> bool:
         """Whether routing is produced by the per-layer dynamic device planner."""

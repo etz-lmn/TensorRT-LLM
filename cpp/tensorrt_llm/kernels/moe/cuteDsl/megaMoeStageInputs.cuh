@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-// One launch stages a MegaMoE launch's inputs. Its first blocks run a route writer (the route staging, or a load
-// balancer's route into the staging) and the others quantize the activation into the staging. Both jobs read only
+// One launch stages a MegaMoE launch's inputs. Its first blocks run the route staging and the others quantize the
+// activation into the staging. Both jobs read only
 // the stream's earlier work, so their latencies overlap instead of adding up as two small kernels in series.
 
 #pragma once
@@ -120,9 +120,9 @@ __device__ __forceinline__ void megaMoeQuantize(MegaMoeQuantize const& q, int64_
 #endif
 }
 
-template <typename Writer>
+template <typename IdT, typename OutT>
 __global__ void __launch_bounds__(kMegaMoeStageThreads)
-    megaMoeStageInputsKernel(MegaMoeQuantize quantize, Writer writer)
+    megaMoeStageInputsKernel(MegaMoeQuantize quantize, MegaMoeStageWriter<IdT, OutT> writer)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     cudaGridDependencySynchronize(); // launched early under PDL: the routes and the activation are earlier work
@@ -141,32 +141,30 @@ __global__ void __launch_bounds__(kMegaMoeStageThreads)
 #endif
 }
 
-//! Launch writer.blocks writer blocks with sharedBytes of dynamic shared memory each (a writer that needs more than
-//! the default raises the kernel's limit first) and as many quantization blocks as stay resident on the device, at
+//! Launch writer.blocks route staging blocks and as many quantization blocks as stay resident on the device, at
 //! most one per item. The quantization grid does not shrink by the writer's blocks: those finish almost at once, and a
 //! large bucket would otherwise leave the quantization a few blocks.
-template <typename Writer>
+template <typename IdT, typename OutT>
 void launchMegaMoeStageInputs(
-    MegaMoeQuantize const& quantize, Writer const& writer, size_t sharedBytes, cudaStream_t stream)
+    MegaMoeQuantize const& quantize, MegaMoeStageWriter<IdT, OutT> const& writer, cudaStream_t stream)
 {
-    auto const kernel = megaMoeStageInputsKernel<Writer>;
+    auto const kernel = megaMoeStageInputsKernel<IdT, OutT>;
     int device = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
     int resident = 0;
     {
         static std::mutex mutex;
-        static std::unordered_map<int64_t, int> residentOf; // by device and shared bytes
+        static std::unordered_map<int, int> residentOf; // by device
         std::lock_guard<std::mutex> lock(mutex);
-        int64_t const key = (static_cast<int64_t>(device) << 32) | static_cast<int64_t>(sharedBytes);
-        auto it = residentOf.find(key);
+        auto it = residentOf.find(device);
         if (it == residentOf.end())
         {
             int perSm = 0;
             int sms = 0;
-            TLLM_CUDA_CHECK(
-                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, kernel, kMegaMoeStageThreads, sharedBytes));
+            TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &perSm, kernel, kMegaMoeStageThreads, /*dynamicSMemSize=*/0));
             TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-            it = residentOf.emplace(key, perSm * sms).first;
+            it = residentOf.emplace(device, perSm * sms).first;
         }
         resident = it->second;
     }
@@ -175,7 +173,7 @@ void launchMegaMoeStageInputs(
     if (writer.blocks + quantizeBlocks > 0)
     {
         common::launchWithPdlWhenEnabled("megaMoeStageInputs", kernel, dim3(writer.blocks + quantizeBlocks),
-            dim3(kMegaMoeStageThreads), sharedBytes, stream, quantize, writer);
+            dim3(kMegaMoeStageThreads), /*dynamicShmSize=*/0, stream, quantize, writer);
     }
 }
 

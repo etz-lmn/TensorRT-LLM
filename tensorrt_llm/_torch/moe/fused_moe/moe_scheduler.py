@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import functools
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
@@ -131,11 +130,6 @@ def _record_backend_slots(moe: "ConfigurableMoE", expert_ids: torch.Tensor) -> t
     return expert_ids if recorded is slots else moe.backend.experts_of_slots(recorded)
 
 
-def _routes_recorded() -> bool:
-    """Whether ``_record_routes`` reads or replaces the slots (expert statistics, the calibrator)."""
-    return ExpertStatistic.get() is not None or get_calibrator().mode.name != "NONE"
-
-
 def _wait_input_ready(event: Optional[torch.cuda.Event]) -> None:
     """Join a pending ``input_ready_event`` before the first read of ``x``.
 
@@ -204,7 +198,6 @@ class MoEScheduler(ABC):
             routing_aux is not None
             or moe.apply_router_weight_on_input
             or moe._using_dynamic_load_balancer()
-            or getattr(moe.layer_load_balancer, "stages_routes", False)
             or not moe.backend.fused_route_quant_enabled
         ):
             return None
@@ -1872,7 +1865,6 @@ class FusedCommMoEScheduler(MoEScheduler):
         # drives both arms.
         statistic_allreduce_pending = False
         fused_prepare = getattr(moe.backend, "supports_fused_prepare", lambda: False)()
-        deferred_route = None
         if uses_replica_plan:
             token_selected_experts = _record_routes(moe, token_selected_experts, moe.num_experts)
             token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
@@ -1896,25 +1888,8 @@ class FusedCommMoEScheduler(MoEScheduler):
                     is_last_call,
                     ignore_allreduce=False,
                 )
-                if (
-                    fused_prepare
-                    and fused_result is None
-                    and moe.layer_load_balancer.stages_routes
-                    and not _routes_recorded()
-                ):
-                    # run_moe launches the route with its input staging; nothing reads the slots before.
-                    deferred_route = functools.partial(
-                        moe._load_balancer_route,
-                        token_selected_experts,
-                        moe.use_dp,
-                        token_final_scales=token_final_scales,
-                    )
-                    token_selected_slots = token_selected_experts
-                else:
-                    token_selected_slots = moe._load_balancer_route(
-                        token_selected_experts, moe.use_dp, token_final_scales=token_final_scales
-                    )
-                    token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
+                token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+                token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
             elif maps_expert_slots:
                 # A static placement the backend applies itself (into the launch bucket when the
                 # routing launch wrote it): it takes expert IDs, recorded as the slots they go to.
@@ -1964,7 +1939,6 @@ class FusedCommMoEScheduler(MoEScheduler):
                 x_sf=x_sf,
                 output_dtype=output_dtype,
                 replica_plan=replica_plan,
-                route=deferred_route,
             )
         )
 
