@@ -333,6 +333,10 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
 
     input_requirement = descriptor.input_requirement
 
+    # run_moe issues MoERunContext.before_launch itself: after megamoe_prepare
+    # (or the copies) and before the kernel, tile priming included.
+    takes_before_launch = True
+
     _SUPPORTED_ACTIVATION_DTYPES = frozenset({torch.bfloat16})
 
     # ActivationType -> the DeepGEMM library's own ``activation`` argument. The
@@ -839,7 +843,7 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
             situ_linear_beta=self.act_beta,
         )
 
-    def _prime_kernels(self) -> None:
+    def _prime_kernels(self, before_launch=None) -> None:
         """Compile each reachable DeepGEMM tile with all expert routes masked.
 
         Tile selection is not monotonic in the token count. Query the bundled
@@ -869,6 +873,9 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         if key in _MEGA_MOE_PRIMED_TILES:
             self._kernels_primed = True
             return
+        # The ladder launches the fused kernel too (MoERunContext.before_launch).
+        if before_launch is not None:
+            before_launch()
         buf.x.zero_()
         buf.x_sf.zero_()
         buf.topk_weights.zero_()
@@ -925,8 +932,9 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
             f"{self.max_num_tokens}. Raise model_config.moe_max_num_tokens."
         )
 
+        before_launch = getattr(ctx, "before_launch", None)
         if not self._kernels_primed:
-            self._prime_kernels()
+            self._prime_kernels(before_launch)
 
         if num_tokens > 0:
             if x_sf is None:
@@ -948,6 +956,9 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
                 buf.topk_weights[:num_tokens].copy_(token_final_scales.to(torch.float32))
 
         y = torch.empty((num_tokens, self.hidden_size), dtype=torch.bfloat16, device=buf.x.device)
+        # After the input preparation above, so it overlaps what the wait joins.
+        if before_launch is not None:
+            before_launch()
         self._launch_kernel(y)
         return y.to(output_dtype)
 

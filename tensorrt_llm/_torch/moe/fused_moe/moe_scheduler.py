@@ -1730,10 +1730,13 @@ class FusedCommMoEScheduler(MoEScheduler):
         EPLB hook ordering (matches ``ExternalCommMoEScheduler._forward_chunk_impl``):
         ``start_wait_gpu_stage`` -> routing -> ``done_wait_gpu_stage`` ->
         ``update_statistic(ignore_allreduce=False)`` -> ``route`` ->
-        quantize -> ``wait_for_statistic_allreduce`` -> ``run_moe`` ->
-        ``start_set_cpu_stage`` -> ``done_set_cpu_stage``. The statistic
-        AllReduce runs on the load balancer's auxiliary stream under
-        multi-stream; the fused kernel must not run alongside it.
+        quantize -> ``run_moe`` -> ``start_set_cpu_stage`` ->
+        ``done_set_cpu_stage``. The statistic AllReduce runs on the load
+        balancer's auxiliary stream under multi-stream and the fused kernel
+        must not run alongside it: ``run_moe`` of a backend that declares
+        ``takes_before_launch`` joins it (``MoERunContext.before_launch``)
+        after its own input preparation, right before the fused launch; for
+        any other backend the scheduler joins it before ``run_moe``.
         ``start/done_set_cpu_stage`` are placed AFTER ``run_moe``; otherwise
         dynamic-EPLB weight migration would race with the fused kernel using
         those weights. A per-layer dynamic EPLB layer has no CPU stage and no
@@ -1869,7 +1872,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 # for an external stats gather. The base helper runs its own
                 # EP-wide AllReduce, gated to is_last_call=True, on the load
                 # balancer's auxiliary stream under multi-stream; it is joined
-                # before run_moe below.
+                # before the fused launch (see MoE compute below).
                 moe._load_balancer_update_statistic(
                     token_selected_experts,
                     is_first_call,
@@ -1910,11 +1913,17 @@ class FusedCommMoEScheduler(MoEScheduler):
         # ----- MoE compute -----
         # The fused kernel waits for the other ranks inside the kernel, so it
         # must not run alongside the statistic allreduce on the load
-        # balancer's auxiliary stream (eager or replayed). Routing and the
-        # quantization above overlap it; input preparation inside run_moe
-        # (a backend that ``supports_fused_prepare``) runs after this wait.
+        # balancer's auxiliary stream (eager or replayed). A backend that
+        # takes ``before_launch`` issues the wait after its own input
+        # preparation (DeepGEMM's megamoe_prepare, CuteDSL's staging), so that
+        # preparation overlaps the allreduce too; for any other backend the
+        # wait is issued here.
+        before_launch = None
         if statistic_allreduce_pending:
-            moe._load_balancer_wait_for_statistic_allreduce()
+            if getattr(moe.backend, "takes_before_launch", False):
+                before_launch = moe._load_balancer_wait_for_statistic_allreduce
+            else:
+                moe._load_balancer_wait_for_statistic_allreduce()
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's
         # ``num_experts`` template parameter (SymmBuffer / weights sized to
         # num_slots in quantization.py).
@@ -1928,6 +1937,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 x_sf=x_sf,
                 output_dtype=output_dtype,
                 replica_plan=replica_plan,
+                before_launch=before_launch,
             )
         )
 

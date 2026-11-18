@@ -2376,7 +2376,8 @@ class _ChunkRoutes:
 
 
 @pytest.mark.parametrize("mode", ["per_layer_dynamic", "standard", "off"])
-def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
+@pytest.mark.parametrize("takes_before_launch", [False, True])
+def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, takes_before_launch):
     source = _TORCH_ROOT / "moe/fused_moe/moe_scheduler.py"
     trace = []
     labels = []
@@ -2431,6 +2432,10 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
 
     def run_moe(ctx):
         trace.append(("run_moe", ctx.token_selected_experts.name, ctx.replica_plan))
+        before_launch = getattr(ctx, "before_launch", None)
+        assert before_launch is None or takes_before_launch
+        if before_launch is not None:  # the backend's own launch path issues the wait
+            before_launch()
         return "out"
 
     moe = SimpleNamespace(
@@ -2466,6 +2471,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             quantize_input=lambda x, **kwargs: trace.append(("quantize", kwargs)) or ("x", "sf"),
             set_adaptive_launch_tokens=lambda tokens: trace.append(("bucket", tokens)),
             run_moe=run_moe,
+            takes_before_launch=takes_before_launch,
         ),
     )
     scheduler = scheduler_cls()
@@ -2506,9 +2512,12 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             ("calibrator", "slots"),
             ("quantize", {}),
             # The fused kernel must not run alongside the statistic allreduce
-            # the update above started on the balancer's auxiliary stream.
-            "wait_statistic",
+            # the update above started on the balancer's auxiliary stream. A
+            # backend that takes the wait issues it inside run_moe, after its
+            # own input preparation; for any other backend the scheduler waits.
+            *([] if takes_before_launch else ["wait_statistic"]),
             ("run_moe", "replayed slots", None),
+            *(["wait_statistic"] if takes_before_launch else []),
             "start_set_cpu",
             "done_set_cpu",
         ]
