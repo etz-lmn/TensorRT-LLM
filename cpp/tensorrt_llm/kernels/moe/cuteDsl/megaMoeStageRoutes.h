@@ -49,9 +49,11 @@ __host__ __device__ inline int64_t megaMoeLiveRows(int32_t word, int64_t n)
 //! Stages one MegaMoE launch's routes into its bucket in one launch. Of the n route rows, the live ones (all n, or
 //! megaMoeLiveRows(*liveRowWord, n) when liveRowWord is not null) go to rows [0, live) of the contiguous [rows, topK]
 //! buffers as expert ids (converted to OutT) and float32 gate weights; rows [live, rows) get id -1 and weight 0.
+//! liveIds writes the live rows' ids, rest everything else (their weights and the other rows), so a caller can stage
+//! the rest before the ids are final and only the ids after.
 template <typename IdT, typename OutT>
 void megaMoeStageRoutes(IdT const* ids, float const* weights, int64_t n, int32_t const* liveRowWord, OutT* idsOut,
-    float* weightsOut, int64_t rows, int topK, cudaStream_t stream);
+    float* weightsOut, int64_t rows, int topK, cudaStream_t stream, bool liveIds = true, bool rest = true);
 
 //! The NVFP4 quantization of a MegaMoE launch's activation into its bucket staging: [rows, cols] bfloat16 in, scaled
 //! by globalScale[0], to [rows, cols / 2] bytes of E2M1 pairs (out) and [rows, cols / 16] UE4M3 scale factors (sfOut,

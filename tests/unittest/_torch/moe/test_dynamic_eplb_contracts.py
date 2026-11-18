@@ -1788,12 +1788,16 @@ def test_executors_of_one_engine_share_the_execution_stream():
         assert isinstance(stream, ast.Name) and stream.id == "execution_stream"
 
 
-def test_route_wait_occurs_after_independent_staging():
+@pytest.mark.parametrize("plan", [None, "plan"])
+def test_route_wait_occurs_after_independent_staging(plan):
     source = _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py"
     trace = []
 
-    def stage_routes(ids, weights, ids_out, weights_out, live_row_word=None):
-        trace.append(f"stage_routes:{ids_out.name},{weights_out.name}")
+    def stage_routes(
+        ids, weights, ids_out, weights_out, live_row_word=None, live_ids=True, rest=True
+    ):
+        parts = "+".join(name for name, on in (("ids", live_ids), ("rest", rest)) if on)
+        trace.append(f"stage_routes:{ids_out.name},{weights_out.name}:{parts}")
 
     impl = _extract_class(
         source,
@@ -1824,15 +1828,26 @@ def test_route_wait_occurs_after_independent_staging():
         num_tokens=4,
         top_k=6,
         stage_activation=True,
+        replica_plan=plan,
     )
-    # The activation stages before the wait; one op after it writes the slot ids and
-    # gate weights of the whole bucket.
-    assert trace == [
-        "copy:activation",
-        "copy:activation_sf",
-        "wait",
-        "stage_routes:topk_idx_local,topk_weights",
-    ]
+    if plan is None:
+        # No route wait: one op writes the slot ids and gate weights of the whole bucket.
+        assert trace == [
+            "copy:activation",
+            "copy:activation_sf",
+            "wait",
+            "stage_routes:topk_idx_local,topk_weights:ids+rest",
+        ]
+    else:
+        # The gate weights and both tails stage while HALO-Q runs; only the live rows' slot
+        # ids wait for its routes.
+        assert trace == [
+            "copy:activation",
+            "copy:activation_sf",
+            "stage_routes:topk_idx_local,topk_weights:rest",
+            "wait",
+            "stage_routes:topk_idx_local,topk_weights:ids",
+        ]
 
 
 @pytest.mark.parametrize("has_sm_budget", [True, False])

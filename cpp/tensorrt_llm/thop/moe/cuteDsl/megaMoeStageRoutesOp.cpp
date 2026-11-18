@@ -65,11 +65,11 @@ void checkStaging(at::Tensor const& ids, at::Tensor const& weights, at::Tensor c
 
 template <typename IdT, typename OutT>
 void launchStageRoutes(at::Tensor const& ids, at::Tensor const& weights, int32_t const* liveRowWord, at::Tensor& idsOut,
-    at::Tensor& weightsOut)
+    at::Tensor& weightsOut, bool liveIds, bool rest)
 {
     kernels::megaMoeStageRoutes<IdT, OutT>(ids.data_ptr<IdT>(), weights.data_ptr<float>(), ids.size(0), liveRowWord,
         idsOut.data_ptr<OutT>(), weightsOut.data_ptr<float>(), idsOut.size(0), static_cast<int>(idsOut.size(1)),
-        at::cuda::getCurrentCUDAStream(idsOut.get_device()));
+        at::cuda::getCurrentCUDAStream(idsOut.get_device()), liveIds, rest);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -78,9 +78,10 @@ void launchStageRoutes(at::Tensor const& ids, at::Tensor const& weights, int32_t
 // ids: [n, top_k] int32 or int64 expert ids; weights: [n, top_k] float32. ids_out: [rows, top_k] int32 or int64 with
 // rows >= n; weights_out: [rows, top_k] float32. All contiguous on one device. Rows [0, live) of the outputs get the
 // ids and weights, rows [live, rows) id -1 and weight 0, where live is n, or with live_row_word (one int32 on the same
-// device) kernels::megaMoeLiveRows of it and n.
+// device) kernels::megaMoeLiveRows of it and n. live_ids writes the live rows' ids, rest everything else: a caller
+// stages the rest before the routes are final (a replica plan's route wait) and only the live ids after.
 void megaMoeStageRoutes(at::Tensor const& ids, at::Tensor const& weights, at::Tensor& idsOut, at::Tensor& weightsOut,
-    std::optional<at::Tensor> const& liveRowWord)
+    std::optional<at::Tensor> const& liveRowWord, bool liveIds, bool rest)
 {
     checkStaging(ids, weights, idsOut, weightsOut, liveRowWord);
     auto const n = ids.size(0);
@@ -89,10 +90,16 @@ void megaMoeStageRoutes(at::Tensor const& ids, at::Tensor const& weights, at::Te
     {
         // The reference staging, in torch ops: copy_ widens the ids.
         auto const live = liveRowWord.has_value() ? kernels::megaMoeLiveRows(liveRowWord->item<int32_t>(), n) : n;
-        idsOut.narrow(0, 0, live).copy_(ids.narrow(0, 0, live));
-        idsOut.narrow(0, live, rows - live).fill_(-1);
-        weightsOut.narrow(0, 0, live).copy_(weights.narrow(0, 0, live));
-        weightsOut.narrow(0, live, rows - live).zero_();
+        if (liveIds)
+        {
+            idsOut.narrow(0, 0, live).copy_(ids.narrow(0, 0, live));
+        }
+        if (rest)
+        {
+            idsOut.narrow(0, live, rows - live).fill_(-1);
+            weightsOut.narrow(0, 0, live).copy_(weights.narrow(0, 0, live));
+            weightsOut.narrow(0, live, rows - live).zero_();
+        }
         return;
     }
     c10::cuda::CUDAGuard const deviceGuard(idsOut.device());
@@ -100,13 +107,13 @@ void megaMoeStageRoutes(at::Tensor const& ids, at::Tensor const& weights, at::Te
     bool const wideIds = ids.scalar_type() == at::kLong;
     if (idsOut.scalar_type() == at::kLong)
     {
-        wideIds ? launchStageRoutes<int64_t, int64_t>(ids, weights, word, idsOut, weightsOut)
-                : launchStageRoutes<int32_t, int64_t>(ids, weights, word, idsOut, weightsOut);
+        wideIds ? launchStageRoutes<int64_t, int64_t>(ids, weights, word, idsOut, weightsOut, liveIds, rest)
+                : launchStageRoutes<int32_t, int64_t>(ids, weights, word, idsOut, weightsOut, liveIds, rest);
     }
     else
     {
-        wideIds ? launchStageRoutes<int64_t, int32_t>(ids, weights, word, idsOut, weightsOut)
-                : launchStageRoutes<int32_t, int32_t>(ids, weights, word, idsOut, weightsOut);
+        wideIds ? launchStageRoutes<int64_t, int32_t>(ids, weights, word, idsOut, weightsOut, liveIds, rest)
+                : launchStageRoutes<int32_t, int32_t>(ids, weights, word, idsOut, weightsOut, liveIds, rest);
     }
 }
 
@@ -149,7 +156,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "weights, Tensor(c!) ids_out, Tensor(d!) weights_out, Tensor? live_row_word=None) -> ()");
     m.def(
         "megamoe_stage_routes(Tensor ids, Tensor weights, Tensor(a!) ids_out, Tensor(b!) weights_out, "
-        "Tensor? live_row_word=None) -> ()");
+        "Tensor? live_row_word=None, bool live_ids=True, bool rest=True) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CPU, m)

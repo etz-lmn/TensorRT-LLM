@@ -1815,8 +1815,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     def _wait_rebalance_routes(self, replica_plan=None) -> None:
         """Order route consumers after HALO-Q.
 
-        Only the activation staging runs before this wait; the route staging, tails included,
-        runs after it."""
+        The activation, the gate weights and both tails stage before this wait, overlapping the
+        HALO-Q copy; only the live rows' slot ids stage after it."""
         if replica_plan is not None:
             replica_plan.wait_for_routes()
 
@@ -2123,6 +2123,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         the op reads it on the device and stages only the leading live
         rows' routes; the rows of padding requests get ``-1`` and ``0.0``
         like the tail, so the kernel neither routes nor computes them.
+
+        With a ``replica_plan`` the staging splits around its route wait:
+        the gate weights and both tails before it, the live rows' slot ids
+        (at most ``num_tokens`` rows) after it.
         """
         if topk_idx.shape[0] != num_tokens:
             raise ValueError(
@@ -2131,9 +2135,30 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if stage_activation and num_tokens > 0:
             bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
             bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
+        if replica_plan is None:
+            self._wait_rebalance_routes(replica_plan)  # nothing to wait for
+            torch.ops.trtllm.megamoe_stage_routes(
+                topk_idx, topk_weights, bufs.topk_idx_local, bufs.topk_weights, live_row_word
+            )
+            return
+        # A replica plan's HALO-Q kernel rewrites the routes: the gate weights and both tails
+        # stage while it runs, and only the live rows' slot ids wait for its routes.
+        torch.ops.trtllm.megamoe_stage_routes(
+            topk_idx,
+            topk_weights,
+            bufs.topk_idx_local,
+            bufs.topk_weights,
+            live_row_word,
+            live_ids=False,
+        )
         self._wait_rebalance_routes(replica_plan)
         torch.ops.trtllm.megamoe_stage_routes(
-            topk_idx, topk_weights, bufs.topk_idx_local, bufs.topk_weights, live_row_word
+            topk_idx,
+            topk_weights,
+            bufs.topk_idx_local,
+            bufs.topk_weights,
+            live_row_word,
+            rest=False,
         )
 
     def _launch_megamoe_kernel(

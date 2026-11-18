@@ -713,7 +713,9 @@ def _register_fake():
           weights: torch.Tensor,
           ids_out: torch.Tensor,
           weights_out: torch.Tensor,
-          live_row_word: Optional[torch.Tensor] = None) -> None:
+          live_row_word: Optional[torch.Tensor] = None,
+          live_ids: bool = True,
+          rest: bool = True) -> None:
         return None
 
     @torch.library.register_fake("trtllm::megamoe_stage_inputs")

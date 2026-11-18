@@ -110,6 +110,37 @@ def test_stage_routes_stages_only_the_live_rows_of_the_word(device):
             assert torch.equal(weights_out.view(torch.uint8), want_weights.view(torch.uint8))
 
 
+@pytest.mark.parametrize("device", _DEVICES)
+def test_stage_routes_in_two_parts_writes_what_one_launch_writes(device):
+    """A replica plan stages the rest (gate weights and both tails) before its route wait and
+    only the live rows' ids after it: together the bytes of one launch, and the ids part writes
+    no row past the live ones."""
+    gen = torch.Generator().manual_seed(1)
+    n = 12
+    ids = torch.randint(0, 384, (n, TOP_K), dtype=torch.int32, generator=gen).to(device)
+    weights = torch.rand(n, TOP_K, generator=gen).to(device)
+    for value in (live_rows.ALL_ROWS, live_rows.encode(3, 4)):
+        word = torch.tensor([value], dtype=torch.int64).to(torch.int32).to(device)
+        whole_ids = _garbage((ROWS, TOP_K), torch.int64, gen, device)
+        whole_weights = _garbage((ROWS, TOP_K), torch.float32, gen, device)
+        torch.ops.trtllm.megamoe_stage_routes(ids, weights, whole_ids, whole_weights, word)
+
+        ids_out = _garbage((ROWS, TOP_K), torch.int64, gen, device)
+        weights_out = _garbage((ROWS, TOP_K), torch.float32, gen, device)
+        before_ids = ids_out.clone()
+        torch.ops.trtllm.megamoe_stage_routes(
+            ids, weights, ids_out, weights_out, word, live_ids=False
+        )
+        live = live_rows.live_row_count(value, n)
+        assert torch.equal(ids_out[:live], before_ids[:live])  # the ids wait for the routes
+        assert torch.equal(ids_out[live:], whole_ids[live:])
+        assert torch.equal(weights_out.view(torch.uint8), whole_weights.view(torch.uint8))
+        after_rest = weights_out.clone()
+        torch.ops.trtllm.megamoe_stage_routes(ids, weights, ids_out, weights_out, word, rest=False)
+        assert torch.equal(ids_out, whole_ids), hex(value)
+        assert torch.equal(weights_out.view(torch.uint8), after_rest.view(torch.uint8))
+
+
 @pytest.mark.cpu_only
 def test_stage_routes_refuses_a_word_it_cannot_read():
     ids, weights = torch.zeros(2, TOP_K, dtype=torch.int64), torch.zeros(2, TOP_K)
