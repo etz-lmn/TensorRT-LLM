@@ -4,10 +4,11 @@
 
 A fused-communication scheduler hands a backend that declares
 ``takes_before_launch`` the wait for the EPLB statistic allreduce instead of
-issuing it before ``run_moe``. The backend must issue it after its own input
-preparation, so that preparation overlaps the allreduce, and before every
-launch of its fused kernel, bucket priming included, because that kernel must
-not run alongside the allreduce. The real ``run_moe`` paths run here on CPU
+issuing it before ``run_moe``. The backend must issue it before every launch of
+its fused kernel, bucket priming included, because that kernel must not run
+alongside the allreduce. CuteDSL issues it after its staging, which then
+overlaps the allreduce; DeepGEMM issues it before ``megamoe_prepare``, which
+beside the allreduce slows it. The real ``run_moe`` paths run here on CPU
 tensors with the kernels and preparation ops replaced by recorders.
 """
 
@@ -73,9 +74,7 @@ def _deepgemm(trace, *, primed: bool):
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("priming", [False, True], ids=["primed", "priming"])
 @pytest.mark.parametrize("takes_wait", [True, False], ids=["wait", "no_wait"])
-def test_deepgemm_waits_after_megamoe_prepare_and_before_each_launch(
-    monkeypatch, priming, takes_wait
-):
+def test_deepgemm_waits_before_megamoe_prepare_and_each_launch(monkeypatch, priming, takes_wait):
     trace = []
     _tuning(deepgemm, monkeypatch, True)
     monkeypatch.setattr(deepgemm, "_MEGA_MOE_PRIMED_TILES", set())
@@ -97,8 +96,8 @@ def test_deepgemm_waits_after_megamoe_prepare_and_before_each_launch(
 
     wait = ["wait"] if takes_wait else []
     # The ladder primes every tile with masked routes, one launch per tile.
-    prime = [*wait, ("launch", 0)] if priming else []
-    assert trace == [*prime, "prepare", *wait, ("launch", 2)]
+    prime = [("launch", 0)] if priming else []
+    assert trace == [*wait, *prime, "prepare", ("launch", 2)]
 
 
 def _cute_dsl_staging(trace, wait):
