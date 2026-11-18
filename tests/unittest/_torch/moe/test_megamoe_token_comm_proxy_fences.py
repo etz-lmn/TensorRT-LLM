@@ -44,6 +44,7 @@ _GLOBAL_FENCE = "cute.arch.fence_proxy('async.global')"
 # The methods that wait for fc2_done, per file: a wait that moves elsewhere has to be listed here.
 _WAITING_METHODS = {
     "token_comm.py": {"_token_back_multi_stage", "token_back"},
+    "token_comm_dedup.py": {"token_back"},
 }
 
 
@@ -108,10 +109,10 @@ def test_tma_reads_of_fc2_rows_follow_a_proxy_fence(source: str) -> None:
     assert not unfenced, "\n".join(unfenced)
 
 
-def _token_in_metadata_waits() -> list[tuple[int, list[str]]]:
-    """Each wait for metadata_ready in token_comm.py's token_in as (line, the statement after it)."""
+def _token_in_metadata_waits(source: str) -> list[tuple[int, list[str]]]:
+    """Each wait for metadata_ready in the source's token_in as (line, the statement after it)."""
     waits = []
-    tree = ast.parse((_NVLINK_DOMAIN / "token_comm.py").read_text())
+    tree = ast.parse((_NVLINK_DOMAIN / source).read_text())
     for function in ast.walk(tree):
         if not isinstance(function, ast.FunctionDef) or function.name != "token_in":
             continue
@@ -131,11 +132,12 @@ def _token_in_metadata_waits() -> list[tuple[int, list[str]]]:
     return waits
 
 
-def test_token_in_fences_the_rows_metadata_ready_publishes() -> None:
-    waits = _token_in_metadata_waits()
-    assert waits, "token_comm.py: token_in no longer waits for metadata_ready"
+@pytest.mark.parametrize("source", sorted(_WAITING_METHODS))
+def test_token_in_fences_the_rows_metadata_ready_publishes(source: str) -> None:
+    waits = _token_in_metadata_waits(source)
+    assert waits, f"{source}: token_in no longer waits for metadata_ready"
     unfenced = [
-        f"token_comm.py:{lineno} token_in pulls the peers' rows with TMA unfenced"
+        f"{source}:{lineno} token_in pulls the peers' rows with TMA unfenced"
         for lineno, after in waits
         if after != ["fence_proxy_async_global()"]
     ]

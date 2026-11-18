@@ -439,7 +439,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "isSfSwizzledLayout=True, int reserved_sms=0) -> (Tensor, Tensor)");
     m.def(
         "fp4_quantize.into(Tensor input, Tensor? globalScale, Tensor(a!) out, Tensor(b!) out_sf, bool "
-        "isSfSwizzledLayout=True, int reservedSms=0) -> ()");
+        "isSfSwizzledLayout=True, int reserved_sms=0) -> ()");
     m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
     m.def(
         "fp4_quantize_with_reorder_residual(Tensor X, Tensor input_scale, Tensor reorder_index, int KE, bool is_act) "

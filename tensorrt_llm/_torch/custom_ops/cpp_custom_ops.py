@@ -705,7 +705,7 @@ def _register_fake():
               out: torch.Tensor,
               out_sf: torch.Tensor,
               isSfSwizzledLayout: bool = True,
-              reservedSms: int = 0) -> None:
+              reserved_sms: int = 0) -> None:
             return None
 
     @torch.library.register_fake("trtllm::megamoe_stage_routes")

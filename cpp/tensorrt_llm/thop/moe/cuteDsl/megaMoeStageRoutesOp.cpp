@@ -21,6 +21,7 @@
 // replayed graph follows the word of each forward.
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moe/cuteDsl/megaMoeStageRoutes.h"
 #include "tensorrt_llm/thop/moe/cuteDsl/megaMoeStageInputsOp.h"
 
@@ -125,7 +126,10 @@ void megaMoeStageInputs(at::Tensor const& x, at::Tensor const& globalScale, at::
     checkStaging(ids, weights, idsOut, weightsOut, liveRowWord);
     TORCH_CHECK(idsOut.device() == x.device(), "the staging must be on x's device");
     auto const quantize = megaMoeQuantizeOf(x, globalScale, xFp4, xSf);
+    TORCH_CHECK(x.size(0) == ids.size(0), "x and ids must have the same rows");
     c10::cuda::CUDAGuard const deviceGuard(x.device());
+    // The quantization compiles to nothing below SM100 (megaMoeQuantize).
+    TORCH_CHECK(common::getSMVersion() >= 100, "megamoe_stage_inputs needs SM100 or newer");
     int32_t const* word = liveRowWord.has_value() ? liveRowWord->data_ptr<int32_t>() : nullptr;
     auto launch = [&]<typename IdT, typename OutT>()
     {
