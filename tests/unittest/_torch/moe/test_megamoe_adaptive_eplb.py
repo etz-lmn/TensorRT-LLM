@@ -97,9 +97,14 @@ def test_a_calibration_prices_any_gpu_and_its_identity_resolves_tactics_without_
     monkeypatch.setattr(mm, "get_sm_version", lambda: 103)
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
 
-    tactic = repr(op._unpack_tactic(op._MEGAMOE_NONBULK_STANDALONE_TACTIC))
-    identity = IMPL.decode_calibration_identity(backend, [32, 1024])
-    assert identity["tactics"] == {"32": tactic, "1024": tactic} and identity["top_k"] == 6
+    # A quantized (NVFP4) combine resolves to the quantized-combine tactic, and from the bulk
+    # threshold's tokens per rank on to the bulk-store tactic, as the launch does.
+    small = repr(op._unpack_tactic(op._MEGAMOE_QUANTIZED_COMBINE_TACTIC))
+    bulk = repr(op._unpack_tactic(op._MEGAMOE_NVFP4_COMBINE_BULK_TACTIC))
+    tokens = [32, 1024, op._MEGAMOE_NVFP4_COMBINE_BULK_MIN_TOKENS]
+    identity = IMPL.decode_calibration_identity(backend, tokens)
+    assert identity["tactics"] == dict(zip(map(str, tokens), (small, small, bulk)))
+    assert identity["top_k"] == 6
     backend.tactic_autotune = True
     assert IMPL.decode_calibration_identity(backend, [32])["tactics"] == {"32": "autotune"}
 
