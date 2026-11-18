@@ -373,3 +373,133 @@ def test_live_row_word_writes_are_stream_ordered(
         int(unsupported.tensor(device).item()) == live_rows.ALL_ROWS
         and not unsupported._stream_writes_supported
     )
+
+
+def _median_us(launch, iters: int = 20, warmup: int = 3) -> float:
+    """Median microseconds of ``launch`` over ``iters`` CUDA-event timed calls."""
+    for _ in range(warmup):
+        launch()
+    times = []
+    for _ in range(iters):
+        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        begin.record()
+        launch()
+        end.record()
+        end.synchronize()
+        times.append(begin.elapsed_time(end) * 1e3)
+    return sorted(times)[len(times) // 2]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="needs a Blackwell CUDA device",
+)
+@pytest.mark.parametrize("bucket", [4096, 16384, 32768])
+def test_stage_inputs_one_launch_against_two_large_buckets(bucket, record_property):
+    """megamoe_stage_inputs (quantize + route staging in one launch) writes the bytes of
+    fp4_quantize.into + megamoe_stage_routes at the large prefill buckets, and its quantization
+    grid does not shrink with the bucket: both launches' median times are recorded."""
+    hidden, top_k = 7168, 8
+    gen = torch.Generator(device="cuda").manual_seed(bucket)
+    x = (torch.randn(bucket, hidden, device="cuda", generator=gen) * 3).to(torch.bfloat16)
+    scale = torch.tensor([448 * 6 / 7.5], device="cuda")
+    ids = torch.randint(0, 384, (bucket, top_k), dtype=torch.int32, device="cuda", generator=gen)
+    weights = torch.rand(bucket, top_k, device="cuda", generator=gen)
+
+    def buffers():
+        return (
+            torch.empty(bucket, hidden // 2, dtype=torch.uint8, device="cuda"),
+            torch.empty(bucket, hidden // 16, dtype=torch.uint8, device="cuda"),
+            torch.empty(bucket, top_k, dtype=torch.int64, device="cuda"),
+            torch.empty(bucket, top_k, device="cuda"),
+        )
+
+    one, two = buffers(), buffers()
+
+    def one_launch():
+        torch.ops.trtllm.megamoe_stage_inputs(
+            x, scale, one[0], one[1], ids, weights, one[2], one[3]
+        )
+
+    def two_launches():
+        torch.ops.trtllm.fp4_quantize.into(x, scale, two[0], two[1], False)
+        torch.ops.trtllm.megamoe_stage_routes(ids, weights, two[2], two[3])
+
+    one_us, two_us = _median_us(one_launch), _median_us(two_launches)
+    for a, b in zip(one, two):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    record_property(f"bucket{bucket}_one_launch_us", round(one_us, 2))
+    record_property(f"bucket{bucket}_two_launches_us", round(two_us, 2))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("num_tokens,bucket", [(8192, 8192), (1024, 8192)])
+def test_replica_plan_stages_only_the_slot_ids_after_the_route_wait(
+    num_tokens, bucket, record_property
+):
+    """With a replica plan, the gate weights and both tails stage before the route wait and only
+    the live rows' slot ids after it: the bucket's bytes equal one staging after the wait, and the
+    time from the end of the wait to the end of the staging (the launch's critical path behind
+    HALO-Q) is recorded for both forms."""
+    top_k = 6
+    gen = torch.Generator(device="cuda").manual_seed(num_tokens)
+    ids = torch.randint(
+        0, 384, (num_tokens, top_k), dtype=torch.int32, device="cuda", generator=gen
+    )
+    weights = torch.rand(num_tokens, top_k, device="cuda", generator=gen)
+    side = torch.cuda.Stream()
+
+    def staging():
+        return SimpleNamespace(
+            topk_idx_local=torch.empty(bucket, top_k, dtype=torch.int64, device="cuda"),
+            topk_weights=torch.empty(bucket, top_k, device="cuda"),
+        )
+
+    def after_wait_us(stage) -> float:
+        """Microseconds from the emulated HALO-Q kernel's end to the end of the staging."""
+        times = []
+        for _ in range(10):
+            routes_ready = torch.cuda.Event(enable_timing=True)
+            staged = torch.cuda.Event(enable_timing=True)
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                torch.cuda._sleep(2_000_000)  # the replica plan's copy kernel, still running
+                routes_ready.record()
+            plan = SimpleNamespace(
+                wait_for_routes=lambda: torch.cuda.current_stream().wait_event(routes_ready)
+            )
+            stage(plan)
+            staged.record()
+            staged.synchronize()
+            times.append(routes_ready.elapsed_time(staged) * 1e3)
+        return sorted(times)[len(times) // 2]
+
+    split, whole = staging(), staging()
+    owner = SimpleNamespace()
+    owner._wait_rebalance_routes = MegaMoECuteDsl._wait_rebalance_routes.__get__(owner)
+
+    def split_stage(plan):
+        MegaMoECuteDsl._stage_inputs(
+            owner,
+            bufs=split,
+            x=None,
+            x_sf=None,
+            topk_idx=ids,
+            topk_weights=weights,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            stage_activation=False,
+            replica_plan=plan,
+        )
+
+    def whole_stage(plan):  # every route write after the wait
+        plan.wait_for_routes()
+        torch.ops.trtllm.megamoe_stage_routes(
+            ids, weights, whole.topk_idx_local, whole.topk_weights
+        )
+
+    split_us, whole_us = after_wait_us(split_stage), after_wait_us(whole_stage)
+    assert torch.equal(split.topk_idx_local, whole.topk_idx_local)
+    assert torch.equal(split.topk_weights.view(torch.uint8), whole.topk_weights.view(torch.uint8))
+    record_property(f"tokens{num_tokens}_after_wait_split_us", round(split_us, 2))
+    record_property(f"tokens{num_tokens}_after_wait_whole_us", round(whole_us, 2))

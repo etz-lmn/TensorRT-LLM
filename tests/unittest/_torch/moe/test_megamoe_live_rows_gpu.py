@@ -65,8 +65,8 @@ _REAL_REQUESTS = (8, 5, 0, 3)
 # The top-k reduce has one store path per combine wire format; each must zero the dropped rows.
 _COMBINE_FORMATS = ("bf16", "32e4m3xe8m0", "16e2m1xbf16")
 # DeepSeek-V4 routing takes the fused route+quant launch, which stages the bucket itself; its
-# kernel routes a multiple of 32 experts (and the rest of the CI shape).
-_DSV4_SHAPE = (64, 6, 2048, 1408)
+# reference routing (gate_forward) takes 256 or 384 experts (and the rest of the CI shape).
+_DSV4_SHAPE = (256, 6, 2048, 1408)
 _ROUTINGS = ("renormalize", "dsv4")
 
 
@@ -175,7 +175,15 @@ def _drop_worker(real_requests_by_rank: tuple, combine_format: str, routing: str
         patch.stopall()  # the pool's workers serve the module's other cases
 
 
-def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str, routing: str) -> None:
+@contextmanager
+def _megamoe_layer(
+    combine_format: str,
+    routing: str,
+    rows: int = _REQUESTS * _ROWS_PER_REQUEST,
+    parallel_mode: str = "DEP",
+):
+    """One MegaMoE CuteDSL layer on this rank of the 4-GPU pool, the same inputs and weights on every
+    rank: ``(layer, x, router_logits, routing_method, rank)``."""
     from _torch.moe.moe_test_utils import MoeBackendType
     from _torch.moe.quantize_utils import get_test_quant_params
     from _torch.moe.test_moe_module import (
@@ -190,23 +198,21 @@ def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str, routing
         create_moe,
     )
     from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
-    from tensorrt_llm._torch.moe.fused_moe.mega_moe import mega_moe_cute_dsl
     from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod
     from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
-    from tensorrt_llm._torch.utils import ActivationType, model_extra_attrs
+    from tensorrt_llm._torch.utils import ActivationType
     from tensorrt_llm.models.modeling_utils import QuantAlgo
 
     os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
     os.environ["MEGAMOE_COMBINE_FORMAT"] = combine_format
     rank = mpi_rank()
-    mapping = _create_mapping_for_parallel_mode(_WORLD, "DEP")
+    mapping = _create_mapping_for_parallel_mode(_WORLD, parallel_mode)
     mapping.rank = rank
     torch.cuda.set_device(rank)
     backend_name = MoeBackendType.MEGAMOE_CUTEDSL.value
     _ensure_dist_for_megamoe(backend_name, rank, _WORLD)
     dsv4 = routing == "dsv4"
     num_experts, top_k, hidden_size, intermediate_size = _DSV4_SHAPE if dsv4 else _SHAPE
-    rows = _REQUESTS * _ROWS_PER_REQUEST
     dtype = torch.bfloat16
 
     with torch.device(f"cuda:{rank}"):
@@ -273,65 +279,81 @@ def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str, routing
             fused_moe.load_weights([quantize_util.create_weights(**quant_kwargs)])
             fused_moe.post_load_weights()
             fused_moe.cuda(f"cuda:{rank}")
+            yield fused_moe, x, router_logits, routing_method, rank
 
-            word = live_rows.LiveRowWord()
-            attrs = {live_rows.LIVE_ROW_WORD_ATTR: word}
-            # DeepSeek-V4's fused route+quant must stage the bucket under the word itself.
-            fused_words = []
-            fused = mega_moe_cute_dsl.dsv4_route_nvfp4_quant
 
-            def spy(*args, **kwargs):
-                fused_words.append(kwargs.get("live_row_word"))
-                return fused(*args, **kwargs)
+def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str, routing: str) -> None:
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe import mega_moe_cute_dsl
+    from tensorrt_llm._torch.utils import model_extra_attrs
 
-            patcher = patch.object(mega_moe_cute_dsl, "dsv4_route_nvfp4_quant", spy)
-            patcher.start()
+    rows = _REQUESTS * _ROWS_PER_REQUEST
+    dsv4 = routing == "dsv4"
+    num_experts = (_DSV4_SHAPE if dsv4 else _SHAPE)[0]
+    with _megamoe_layer(combine_format, routing) as (
+        fused_moe,
+        x,
+        router_logits,
+        routing_method,
+        rank,
+    ):
+        word = live_rows.LiveRowWord()
+        attrs = {live_rows.LIVE_ROW_WORD_ATTR: word}
+        # DeepSeek-V4's fused route+quant must stage the bucket under the word itself.
+        fused_words = []
+        fused = mega_moe_cute_dsl.dsv4_route_nvfp4_quant
 
-            def forward(value: int) -> tuple:
-                word.write(value)
-                from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
+        def spy(*args, **kwargs):
+            fused_words.append(kwargs.get("live_row_word"))
+            return fused(*args, **kwargs)
 
-                with (
-                    torch.inference_mode(),
-                    model_extra_attrs(attrs),
-                    _forward_kernels(op.Sm100MegaMoENvfp4Runner) as kernels,
-                ):
-                    output = fused_moe.forward(
-                        x, router_logits, all_rank_num_tokens=[rows] * _WORLD
-                    ).clone()
-                torch.cuda.synchronize()
-                return output, _published_counts(fused_moe, rank, rows, kernels)
+        patcher = patch.object(mega_moe_cute_dsl, "dsv4_route_nvfp4_quant", spy)
+        patcher.start()
 
-            real = real_requests_by_rank[rank]
-            requests = [SimpleNamespace(is_dummy=index >= real) for index in range(_REQUESTS)]
-            value = live_rows.forward_word(
-                requests,
-                num_contexts=0,
-                seq_lens=torch.full((_REQUESTS,), _ROWS_PER_REQUEST, dtype=torch.int32),
-            )
-            live = live_rows.live_row_count(value, rows)
-            assert live == real * _ROWS_PER_REQUEST
+        def forward(value: int) -> tuple:
+            word.write(value)
+            from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
 
-            out_all, counts_all = forward(live_rows.ALL_ROWS)
-            out_again, _ = forward(live_rows.ALL_ROWS)
-            assert torch.equal(out_all, out_again), "the launch must be deterministic"
-            out_drop, counts_drop = forward(value)
+            with (
+                torch.inference_mode(),
+                model_extra_attrs(attrs),
+                _forward_kernels(op.Sm100MegaMoENvfp4Runner) as kernels,
+            ):
+                output = fused_moe.forward(
+                    x, router_logits, all_rank_num_tokens=[rows] * _WORLD
+                ).clone()
+            torch.cuda.synchronize()
+            return output, _published_counts(fused_moe, rank, rows, kernels)
 
-            with torch.inference_mode():
-                routes, _ = routing_method.apply(router_logits)
-            routes = routes.long().cpu()
-            histogram_all = torch.bincount(routes.flatten(), minlength=num_experts).to(torch.int32)
-            histogram_live = torch.bincount(routes[:live].flatten(), minlength=num_experts).to(
-                torch.int32
-            )
-            assert torch.equal(counts_all, histogram_all)
-            assert torch.equal(counts_drop, histogram_live)
-            assert torch.equal(out_drop[:live], out_all[:live])
-            assert not out_drop[live:].any()
-            if dsv4:
-                assert fused_words and all(w is not None for w in fused_words), fused_words
-            else:
-                assert not fused_words
+        real = real_requests_by_rank[rank]
+        requests = [SimpleNamespace(is_dummy=index >= real) for index in range(_REQUESTS)]
+        value = live_rows.forward_word(
+            requests,
+            num_contexts=0,
+            seq_lens=torch.full((_REQUESTS,), _ROWS_PER_REQUEST, dtype=torch.int32),
+        )
+        live = live_rows.live_row_count(value, rows)
+        assert live == real * _ROWS_PER_REQUEST
+
+        out_all, counts_all = forward(live_rows.ALL_ROWS)
+        out_again, _ = forward(live_rows.ALL_ROWS)
+        assert torch.equal(out_all, out_again), "the launch must be deterministic"
+        out_drop, counts_drop = forward(value)
+
+        with torch.inference_mode():
+            routes, _ = routing_method.apply(router_logits)
+        routes = routes.long().cpu()
+        histogram_all = torch.bincount(routes.flatten(), minlength=num_experts).to(torch.int32)
+        histogram_live = torch.bincount(routes[:live].flatten(), minlength=num_experts).to(
+            torch.int32
+        )
+        assert torch.equal(counts_all, histogram_all)
+        assert torch.equal(counts_drop, histogram_live)
+        assert torch.equal(out_drop[:live], out_all[:live])
+        assert not out_drop[live:].any()
+        if dsv4:
+            assert fused_words and all(w is not None for w in fused_words), fused_words
+        else:
+            assert not fused_words
 
 
 @requires_blackwell
@@ -351,3 +373,91 @@ def test_megamoe_cutedsl_drops_padding_rows(
         )
     )
     assert results == [None] * _WORLD
+
+
+# Rows per rank of the timing layer: below the layer's 256-row bucket, so the launch stages its inputs
+# (an exact-size bucket may read them in place); at EP4 every launch takes the metadata-push router
+# (the one-round router needs 16 or more ranks).
+_TIMED_ROWS = 200
+_TIMED_FORWARDS = 8
+
+
+def _layer_worker(mode: str) -> dict:
+    try:
+        return _layer_worker_impl(mode)
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        patch.stopall()
+
+
+def _layer_worker_impl(mode: str) -> dict:
+    """One DeepSeek-V4-routed MegaMoE layer timed over repeated forwards: attention DP with the
+    bucket hint (``hinted``), or attention TP without one (``no_hint``), whose launches take the full
+    bucket. Returns this rank's output digest, whether the forwards repeat it, the median forward
+    microseconds and the staging launches per forward after the bucket's first launch."""
+    import hashlib
+    import importlib
+
+    parallel_mode = "DEP" if mode == "hinted" else "TEP"
+    with _megamoe_layer("16e2m1xbf16", "dsv4", rows=_TIMED_ROWS, parallel_mode=parallel_mode) as (
+        fused_moe,
+        x,
+        router_logits,
+        _,
+        rank,
+    ):
+        staged = []
+        trtllm_ops = importlib.import_module("torch").ops.trtllm
+        for name in ("megamoe_stage_inputs", "megamoe_stage_routes", "fp4_quantize"):
+            if hasattr(trtllm_ops, name):
+                op = getattr(trtllm_ops, name)
+                patch.object(
+                    trtllm_ops,
+                    name,
+                    lambda *a, _op=op, _name=name, **k: staged.append(_name) or _op(*a, **k),
+                ).start()
+        counts = [_TIMED_ROWS] * _WORLD if mode == "hinted" else None
+        outputs, times = [], []
+        with torch.inference_mode():
+            fused_moe.forward(x, router_logits, all_rank_num_tokens=counts)  # builds the bucket
+            torch.cuda.synchronize()
+            staged.clear()
+            for _ in range(_TIMED_FORWARDS):
+                begin = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                begin.record()
+                out = fused_moe.forward(x, router_logits, all_rank_num_tokens=counts)
+                end.record()
+                end.synchronize()
+                times.append(begin.elapsed_time(end) * 1e3)
+                outputs.append(out.clone())
+        digest = hashlib.sha256(outputs[0].contiguous().view(torch.uint8).cpu().numpy().tobytes())
+        return dict(
+            rank=rank,
+            digest=digest.hexdigest(),
+            repeats=all(torch.equal(out, outputs[0]) for out in outputs),
+            forward_us=sorted(times)[len(times) // 2],
+            staging_launches=len(staged) / _TIMED_FORWARDS,
+        )
+
+
+@requires_blackwell
+@pytest.mark.skipif(torch.cuda.device_count() < _WORLD, reason=f"needs {_WORLD} GPUs")
+@pytest.mark.threadleak(enabled=False)  # the pool's manager thread persists by design
+@pytest.mark.parametrize("mode", ["hinted", "no_hint"])
+def test_megamoe_cutedsl_layer_digest_time_and_staging_launches(
+    moe_multi_gpu_executor, mode: str, record_property
+) -> None:
+    """A MegaMoE layer on four ranks (the metadata-push router, so the token-in path) repeats its
+    output bit for bit; its digest and median forward time are recorded per rank, for an A/B of two
+    builds on the same inputs. Without a bucket hint (attention TP) the staging still takes one
+    launch per forward, as with the hint."""
+    results = list(moe_multi_gpu_executor.map(_layer_worker, [mode] * _WORLD))
+    for result in results:
+        record_property(f"rank{result['rank']}_digest", result["digest"])
+        record_property(f"rank{result['rank']}_forward_us", round(result["forward_us"], 2))
+        record_property(f"rank{result['rank']}_staging_launches", result["staging_launches"])
+    assert all(result["repeats"] for result in results)
+    assert all(result["staging_launches"] <= 1 for result in results), results
