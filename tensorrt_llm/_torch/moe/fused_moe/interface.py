@@ -741,7 +741,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
     def _load_balancer_wait_for_statistic_allreduce(self) -> None:
         """Order the current stream after the statistic allreduce.
 
-        Called by a fused-communication scheduler right before the MoE kernel
+        Called by a fused-communication scheduler before the MoE kernel
         launch; see SingleLayerMoeLoadBalancer.wait_for_statistic_allreduce.
         """
         if self._using_dynamic_load_balancer():

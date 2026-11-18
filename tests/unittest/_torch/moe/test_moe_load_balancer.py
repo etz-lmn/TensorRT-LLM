@@ -606,8 +606,7 @@ def _statistic_layer(trace: list) -> SingleLayerMoeLoadBalancer:
     return layer
 
 
-def _patch_streams(monkeypatch: pytest.MonkeyPatch, trace: list,
-                   capturing: bool) -> None:
+def _patch_streams(monkeypatch: pytest.MonkeyPatch, trace: list) -> None:
 
     @contextlib.contextmanager
     def stream(name):
@@ -622,8 +621,6 @@ def _patch_streams(monkeypatch: pytest.MonkeyPatch, trace: list,
         lambda: True)
     monkeypatch.setattr(torch.cuda, "stream", stream)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing",
-                        lambda: capturing)
     monkeypatch.setattr(torch.ops.trtllm,
                         "moe_hierarchical_statistic_update",
                         lambda *args: trace.append("update"),
@@ -631,16 +628,16 @@ def _patch_streams(monkeypatch: pytest.MonkeyPatch, trace: list,
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("capturing", [False, True], ids=["eager", "capturing"])
 def test_statistic_allreduce_overlaps_on_the_aux_stream_and_records_its_end(
-        monkeypatch: pytest.MonkeyPatch, capturing: bool) -> None:
+        monkeypatch: pytest.MonkeyPatch) -> None:
     """Under multi-stream the EP-wide statistic allreduce runs on the auxiliary
-    stream and records an event when it ends, the same way whether the stream
-    is being captured or not; update_statistic_with_local_ids does not join it,
-    so routing, quantization and staging overlap it."""
+    stream and records an event when it ends; update_statistic_with_local_ids
+    does not join it, so the work the current stream does next overlaps it.
+    The code takes no capture-specific branch; the replay test below covers a
+    captured graph on real streams."""
     trace = []
     layer = _statistic_layer(trace)
-    _patch_streams(monkeypatch, trace, capturing)
+    _patch_streams(monkeypatch, trace)
 
     layer.update_statistic_with_local_ids(
         "expert_ids",
@@ -655,15 +652,14 @@ def test_statistic_allreduce_overlaps_on_the_aux_stream_and_records_its_end(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("capturing", [False, True], ids=["eager", "capturing"])
 def test_a_fused_moe_launch_waits_for_the_statistic_allreduce(
-        monkeypatch: pytest.MonkeyPatch, capturing: bool) -> None:
+        monkeypatch: pytest.MonkeyPatch) -> None:
     """wait_for_statistic_allreduce makes the current stream wait for the
-    event the allreduce recorded, in an eager forward and while capturing, so a
-    fused-communication kernel launched next never runs alongside it."""
+    event the allreduce recorded, so a fused-communication kernel launched
+    next never runs alongside it."""
     trace = []
     layer = _statistic_layer(trace)
-    _patch_streams(monkeypatch, trace, capturing)
+    _patch_streams(monkeypatch, trace)
 
     layer.wait_for_statistic_allreduce()
 

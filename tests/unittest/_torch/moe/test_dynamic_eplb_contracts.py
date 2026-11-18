@@ -2555,8 +2555,8 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
             ("statistic", "slots"),
             ("calibrator", "slots"),
             ("quantize", {}),
-            # The fused kernel must not run alongside the statistic allreduce;
-            # quantization and staging before it still overlap it.
+            # The fused kernel must not run alongside the statistic allreduce
+            # the update above started on the balancer's auxiliary stream.
             "wait_statistic",
             ("run_moe", "replayed slots", None),
             "start_set_cpu",
