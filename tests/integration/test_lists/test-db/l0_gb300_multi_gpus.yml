@@ -86,6 +86,9 @@ l0_gb300_multi_gpus:
   - unittest/_torch/moe/test_moe_routing.py
   # MegaMoE on four ranks: padding rows are dropped, the live-row word is written in stream order.
   - unittest/_torch/moe/test_megamoe_live_rows_gpu.py
+  # Adaptive EPLB on four ranks: the dispatch router's route bit for bit against the staged route and a layer
+  # without the balancer, a graph replayed after an install, and the per-layer cost of each path.
+  - unittest/_torch/moe/test_megamoe_adaptive_route_e2e.py
   # Adaptive EPLB: expert copies between four local ranks over MNNVL memory (torchrun).
   - unittest/_torch/moe/multi_gpu/test_adaptive_eplb_transport_peer.py
   - unittest/_torch/modeling -k "modeling_llama"

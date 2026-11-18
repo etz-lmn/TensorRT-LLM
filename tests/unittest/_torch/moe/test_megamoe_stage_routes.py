@@ -33,6 +33,42 @@ def _garbage(shape, dtype, generator, device):
     return raw.view(dtype).view(shape).to(device)
 
 
+def _cuda_last_error() -> int:
+    """cudaPeekAtLastError of the CUDA runtime this process loaded (0: none pending), without clearing it."""
+    import ctypes
+
+    path = next(
+        line.split()[-1]
+        for line in open("/proc/self/maps")
+        if "libcudart.so" in line and line.split()[-1].startswith("/")
+    )
+    return int(ctypes.CDLL(path).cudaPeekAtLastError())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_stage_routes_first_launch_of_the_process_leaves_no_error(record_property):
+    """The first route staging of the process, of a launch without rows (an empty grid of routes, a full bucket of
+    -1 and 0): no CUDA error is pending before it, none after it, and it stages what torch fills. Records where an
+    error first shows (before / after) for a run that fails."""
+    torch.zeros(1, device="cuda").add_(1)
+    torch.cuda.synchronize()
+    before = _cuda_last_error()
+    ids = torch.empty((0, TOP_K), dtype=torch.int32, device="cuda")
+    weights = torch.empty((0, TOP_K), device="cuda")
+    ids_out = torch.full((ROWS, TOP_K), 7, dtype=torch.int64, device="cuda")
+    weights_out = torch.full((ROWS, TOP_K), 7.0, device="cuda")
+    error = None
+    try:
+        torch.ops.trtllm.megamoe_stage_routes(ids, weights, ids_out, weights_out)
+        torch.cuda.synchronize()
+    except Exception as exc:  # noqa: BLE001 - recorded, then re-raised by the assertion below
+        error = repr(exc)
+    after = _cuda_last_error()
+    record_property("first_stage_routes_launch", f"before={before} after={after} error={error}")
+    assert before == 0 and error is None and after == 0, (before, error, after)
+    assert (ids_out == -1).all() and (weights_out == 0).all()
+
+
 @pytest.mark.parametrize("device", _DEVICES)
 @pytest.mark.parametrize(
     "id_dtype,out_dtype",

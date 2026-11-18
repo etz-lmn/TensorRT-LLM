@@ -64,6 +64,27 @@ def _assert_on_all_ranks(problem: Optional[str]) -> None:
     assert not any(problems), problems
 
 
+def _replica_row(packed: list) -> torch.Tensor:
+    """A route table row with replicas, as an install publishes one: the 128 spare slots each take a copy of one
+    of 32 hot experts, with shares that include 0 and 1 copies (policy.build_route_tables)."""
+    from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
+        ExpertGeometry,
+        build_route_tables,
+    )
+
+    geometry = ExpertGeometry(_NUM_EXPERTS, _NUM_SLOTS, _WORLD_SIZE)
+    layout = geometry.home_layout().tolist()
+    free = [slot for slot, expert in enumerate(layout) if expert < 0]
+    for k, slot in enumerate(free):
+        layout[slot] = (k * 12) % _NUM_EXPERTS
+    shares = [1.0] * _NUM_SLOTS
+    for k, slot in enumerate(free):
+        shares[slot] = (0.0, 1.0, 0.5, 2.0)[k % 4]
+    return torch.tensor(
+        build_route_tables(layout, shares, _NUM_EXPERTS, _NUM_SLOTS).packed(), dtype=torch.int32
+    )
+
+
 def _run() -> list:
     from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.transport import (
         find_backends,
@@ -222,19 +243,74 @@ def _run() -> list:
                 )
             _assert_on_all_ranks(problem)
 
-        # Timed arms, interleaved per round.
+        # A runtime install rewrites a layer's route table row in place: a graph captured on the home
+        # tables replays the replicated ones as an eager forward routes them (replica slots hold no
+        # copied weights here, so the check is replay against eager, not against the plain layer).
+        tables = balancer.route_tables(device)
+        home_tables = tables.clone()
+        replica_tables = torch.stack(
+            [_replica_row(home_tables[i].tolist()) for i in range(_LAYERS)]
+        ).to(device)
+        use_router(True)
+        for rows in (64, 1024):
+            counts = [rows] * world_size
+            x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
+            for _ in range(2):
+                adaptive[0](x, all_rank_num_tokens=counts)
+            torch.cuda.synchronize()
+            graph, slot = torch.cuda.CUDAGraph(), None
+            with torch.cuda.graph(graph):
+                slot = adaptive[0](x, all_rank_num_tokens=counts).clone()
+            tables.copy_(replica_tables)
+            torch.cuda.synchronize()
+            slot.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            eager = adaptive[0](x, all_rank_num_tokens=counts).clone()
+            torch.cuda.synchronize()
+            same = torch.equal(slot, eager)
+            tables.copy_(home_tables)
+            del graph
+            _assert_on_all_ranks(
+                None if same else f"{rows} rows: the replay after an install differs from eager"
+            )
+
+        # Kernels per layer call (torch profiler): the router's route launches no route op or staging.
+        names = {}
+        for arm, router in (("adaptive_staged", False), ("adaptive_router", True)):
+            use_router(router)
+            x = torch.randn((64, _HIDDEN_SIZE), dtype=torch.bfloat16)
+            adaptive[0](x, all_rank_num_tokens=[64] * world_size)
+            torch.cuda.synchronize()
+            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+                adaptive[0](x, all_rank_num_tokens=[64] * world_size)
+                torch.cuda.synchronize()
+            names[arm] = sorted(
+                e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+            )
+        staged_only = [
+            n for n in names["adaptive_router"] if "StageInputs" in n or "adaptiveEplbRoute" in n
+        ]
+        _assert_on_all_ranks(
+            None if not staged_only else f"the router's route still launches {staged_only}"
+        )
+        results.append(dict(rank=rank, kernels_per_layer_call=names))
+
+        # Timed arms, interleaved per round; the router's route also on replicated tables (its route_us).
         arms = {
-            "fused_no_balancer": (plain, None),
-            "adaptive_staged": (adaptive, False),
-            "adaptive_router": (adaptive, True),
+            "fused_no_balancer": (plain, None, None),
+            "adaptive_staged": (adaptive, False, None),
+            "adaptive_router": (adaptive, True, None),
+            "adaptive_router_replicas": (adaptive, True, replica_tables),
         }
         for rows in (*_DECODE_ROWS, *_PREFILL_ROWS):
             counts = [rows] * world_size
             x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
             for round_ in range(_ROUNDS):
-                for arm, (layers, router) in arms.items():
+                for arm, (layers, router, table) in arms.items():
                     if router is not None:
                         use_router(router)
+                    tables.copy_(home_tables if table is None else table)
                     for _ in range(2):  # warm: compile and settle the bucket
                         layers[0](x, all_rank_num_tokens=counts)
                     torch.cuda.synchronize()
@@ -264,9 +340,10 @@ def _run() -> list:
                             host_us_per_layer=statistics.median(hosts),
                             experts=_NUM_EXPERTS,
                             slots=_NUM_SLOTS if layers is adaptive else _NUM_EXPERTS,
-                            tables="home",
+                            tables="home" if table is None else "replicas",
                         )
                     )
+        tables.copy_(home_tables)
         use_router(True)
     return results
 

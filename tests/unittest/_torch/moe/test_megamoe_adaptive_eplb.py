@@ -190,3 +190,40 @@ def test_router_route_ranks_and_rows_are_the_balancers():
     assert (
         "staged=bucket" in source and "slot_of_expert=None if bucket is None else table" in source
     )
+
+
+@pytest.mark.parametrize("balancer", [None, "static"])
+def test_a_layer_without_an_adaptive_balancer_launches_the_fused_route_as_before(balancer):
+    """Without an adaptive balancer (none, or one that does not route through the dispatch router), the
+    fused-comm scheduler's route asks the backend exactly as before the router's route: the backend's
+    fused route+quant with the input and the logits and nothing else, never the router question."""
+    from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import FusedCommMoEScheduler
+
+    calls, asked = [], []
+
+    class Backend:
+        fused_route_quant_enabled = True
+
+        def try_fused_route_quant(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return "fused"
+
+        def routes_adaptive_in_router(self, num_tokens):
+            asked.append(num_tokens)
+            return True
+
+    layer_balancer = None if balancer is None else SimpleNamespace(stages_routes=False)
+    scheduler = object.__new__(FusedCommMoEScheduler)
+    scheduler.moe = SimpleNamespace(
+        layer_load_balancer=layer_balancer,
+        backend=Backend(),
+        apply_router_weight_on_input=False,
+        _using_dynamic_load_balancer=lambda: False,
+        _load_balancer_uses_replica_plan=lambda: False,
+    )
+    x, logits = torch.zeros(4, 8), torch.zeros(4, 16)
+    got = scheduler._try_fused_route_quant(x, logits, None, None, first=True, adaptive=True)
+    assert got == "fused"
+    assert len(calls) == 1 and calls[0][1] == {}
+    assert calls[0][0][0] is x and calls[0][0][1] is logits and len(calls[0][0]) == 2
+    assert asked == []
