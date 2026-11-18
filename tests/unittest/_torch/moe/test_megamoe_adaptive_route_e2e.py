@@ -23,7 +23,6 @@ from typing import Optional
 import cloudpickle
 import pytest
 import torch
-from _torch.moe.quantize_utils import NVFP4QuantizeUtil
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from transformers import PretrainedConfig
@@ -86,6 +85,9 @@ def _replica_row(packed: list) -> torch.Tensor:
 
 
 def _run() -> list:
+    # Here, not at module level: quantize_utils needs parameterized, which only the GPU image has.
+    from _torch.moe.quantize_utils import NVFP4QuantizeUtil
+
     from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.transport import (
         find_backends,
         prepare_layers,
