@@ -2450,6 +2450,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode, ha
     _extract_function(source, "_num_rows", namespace)
     base_methods = {
         "_try_fused_route_quant",
+        "_router_route",
         "_route_quant_eligible",
         "_partials_route",
         "_route_only",
