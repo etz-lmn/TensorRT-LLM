@@ -31,7 +31,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4MoE
 from tensorrt_llm._torch.utils import AuxStreamType
-from tensorrt_llm._utils import mpi_allgather, mpi_rank, mpi_world_size
+from tensorrt_llm._utils import get_sm_version, mpi_allgather, mpi_rank, mpi_world_size
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -348,13 +348,17 @@ def _run() -> list:
     return results
 
 
+@pytest.mark.threadleak(enabled=False)
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < _WORLD_SIZE,
     reason=f"Requires {_WORLD_SIZE} GPUs",
 )
+@pytest.mark.skipif(get_sm_version() not in (100, 103), reason="MegaMoE CuteDSL on SM100/SM103")
 def test_megamoe_adaptive_route_matches_and_is_timed(record_property) -> None:
+    # The workers spawn before this process touches CUDA, as test_megamoe_e2e's do: the run lists this
+    # module first and nothing here launches work on the parent's device.
     if mpi_world_size() > 1:
-        pytest.skip("starts its own ranks")
+        pytest.skip("Spawns its own worker processes")
     with MPIPoolExecutor(
         max_workers=_WORLD_SIZE, initializer=_init_worker, initargs=(sys.path,)
     ) as executor:
