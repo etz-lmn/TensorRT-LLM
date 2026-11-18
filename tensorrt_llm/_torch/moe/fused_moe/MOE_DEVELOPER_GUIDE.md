@@ -213,16 +213,19 @@ A model that runs other work on a side stream while the routed experts run (e.g.
 `FusedCommMoEScheduler._forward_chunk` runs per chunk:
 
 ```text
-[EPLB start_wait_gpu] → routing → [EPLB done_wait_gpu + update_statistic + route]
-  → backend.set_adaptive_launch_tokens(max(all_rank_num_tokens))
-  → backend.quantize_input (may quantize into that bucket's staging)
+[EPLB start_wait_gpu]
+  → backend.set_adaptive_launch_tokens(max(all_rank_num_tokens)) / set_adaptive_launch_output_dtype
+  → routing (or the fused route+quant, which writes the launch bucket)
+  → [EPLB done_wait_gpu + update_statistic + route]
+  → backend.quantize_input (skipped after the fused route+quant and under supports_fused_prepare)
+  → [EPLB wait_for_statistic_allreduce]
   → backend.run_moe (fused dispatch+GEMM+act+GEMM+combine)
   → [EPLB start_set_cpu + done_set_cpu]
 ```
 
 No external `Communication.dispatch` / `.combine`. Zero-token chunks still launch the kernel so peer EP ranks can cross the in-kernel NVLink barrier.
 
-Padding rows: the decoder runner writes how many of a forward's requests are real into a live-row word (`moe/live_rows.py`). The MegaMoE CuteDSL route staging (`trtllm::megamoe_stage_routes`) reads it on the device and stages the rows after them as expert -1 with weight 0, for buckets whose kernel's top-k reduce masks such routes (`masks_invalid_combine_slots`, the SM100/SM103 kernel): the kernel neither routes nor computes those rows and writes them zero. The word holds only for a launch over the rank's whole forward, rows request-major with padding last. A launch over part of a forward runs inside `live_rows.part_of_the_forward()` (the scheduler does this for every chunk when a forward splits into several), and under Helix CP + attention DP, where each CP rank's MoE runs on a slice of the rows, the engine registers no word. EPLB statistics still count the dropped rows. For debugging, `TRTLLM_MEGAMOE_KEEP_PADDING_ROWS=1` (read when the engine is built) registers no word either, so every row is kept without a rebuild.
+Padding rows: the decoder runner writes how many of a forward's requests are real into a live-row word (`moe/live_rows.py`). Every MegaMoE CuteDSL path that stages a bucket reads it on the device and stages the rows after them as expert -1 with weight 0: the default one-launch staging (`trtllm::megamoe_stage_inputs`), the route staging of the copy path (`trtllm::megamoe_stage_routes`) and the DeepSeek-V4 fused route+quant (`dsv4_route_nvfp4_quant(live_row_word=...)`), for buckets whose kernel's top-k reduce masks such routes (`masks_invalid_combine_slots`, the SM100/SM103 kernel): the kernel neither routes nor computes those rows and writes them zero. The word holds only for a launch over the rank's whole forward, rows request-major with padding last. A launch over part of a forward runs inside `live_rows.part_of_the_forward()` (the scheduler does this for every chunk when a forward splits into several), and under Helix CP + attention DP, where each CP rank's MoE runs on a slice of the rows, the engine registers no word. EPLB statistics still count the dropped rows. For debugging, `TRTLLM_MEGAMOE_KEEP_PADDING_ROWS=1` (read when the engine is built) registers no word either, so every row is kept without a rebuild.
 
 The DeepGEMM kernel's in-kernel barriers trap when a peer is late; their timeout is relaxed during warmup, see [Communication timeouts](#communication-timeouts).
 
@@ -1181,9 +1184,19 @@ set wrong has a test that catches it:
 ### Scheduler / EPLB Constraints
 
 - `FUSED_COMM` backends (`DeepgemmCudaW4a8Mxfp4Mxfp8Impl`, `TrtllmCutedslMegaMoeNvfp4Impl`) **must not** layer host-side `Communication.dispatch` / `.combine` on top of the fused kernel — `ConfigurableMoE._create_comm_strategy_auto` returns `None` for them.
-- `FusedCommMoEScheduler` calls `backend.quantize_input(...)` for every chunk including zero-token chunks (so peer ranks can cross the in-kernel NVLink barrier). Each fused-comm backend therefore MUST make `quantize_input` tolerate `x.shape[0] == 0` and return its own empty tensor layout; the scheduler does NOT synthesize backend-specific empty tensors.
+- `FusedCommMoEScheduler` calls `backend.quantize_input(...)` for every chunk, zero-token chunks included (so peer ranks can cross the in-kernel NVLink barrier), except after the fused route+quant and for a backend that `supports_fused_prepare` (it quantizes inside `run_moe`). Each fused-comm backend therefore MUST make `quantize_input` tolerate `x.shape[0] == 0` and return its own empty tensor layout; the scheduler does NOT synthesize backend-specific empty tensors.
 - Dynamic EPLB requires backend and quantization-method support; backends gate wrapper-level constraints in `validate_configurable_moe`. `MegaMoEDeepGemm` routes to slot IDs and migrates the transformed DG weights its quantization method registers (`num_slots % ep_size == 0`). `TrtllmCutedslMegaMoeNvfp4Impl` declares `supports_eplb=True`; its quantization method registers the MegaMoE-format derived params and `fc1_norm_const` with the load balancer alongside the raw NVFP4 family, so per-slot migration stays byte-consistent.
+- Online EPLB migrates an expert from a host copy, so an EPLB-supporting
+  quantization method keeps one for every per-expert tensor its kernels read,
+  scales and alphas included. The copy covers
+  `layer_load_balancer.get_load_expert_ids()` and is indexed by position in that
+  list, which on a multi-node run can be longer than the local slots, and it is
+  registered in the `weight_fns` passed to
+  `register_all_parameter_slot_and_to_fix_weight_fns`. A tensor left out keeps
+  the previous expert's values after a migration, with no error; extend
+  `tests/unittest/_torch/moe/test_w4a16_nvfp4_eplb.py` for a new one.
 - `FUSED_COMM` backends call the EPLB statistic update with `ignore_allreduce=False`: the fused kernel has no side channel for an external statistics gather, so the load balancer runs its own EP-wide AllReduce, on its auxiliary stream under multi-stream (CUDA graph warm-up and capture) and inline otherwise. `FusedCommMoEScheduler` waits for it (`wait_for_statistic_allreduce`) right before `run_moe`, in eager forwards and captured graphs alike, because the fused kernel fills the GPU and synchronizes across ranks inside the kernel: run alongside the AllReduce, which of the two kernels becomes resident first can differ between ranks and every rank hangs. Routing, quantization and staging still overlap the AllReduce.
+- Warmup expert placement (`MoeLoadBalancerConfig.warmup_placement`, standard mode only; `moe_warmup_placement.py`) learns the placement of the static balancer layers from the live rows of real requests: each round swaps at most `max_moved_fraction` of a layer's slots between heavy and light ranks and moves their per-slot tensors GPU to GPU in place (captured CUDA graphs stay valid); the placement freezes after `max_migrations` rounds. With extra slots (`num_slots > num_experts`) a layer keeps copies of experts, which hold the same bytes, so outputs are unchanged; each round also moves the copies towards hot experts (cold experts take the extra slots a layer does not need). A backend that `counts_routes` adds the picks in its routing launch; otherwise the schedulers issue a separate count launch. Only a backend that implements `on_expert_placement_changed` is re-placed: `TrtllmCutedslMegaMoeNvfp4Impl` applies a static placement itself (`maps_expert_slots`), so `FusedCommMoEScheduler` hands it expert ids and its route + quantize launch writes slots into the launch bucket. Layers on other backends keep their configured placement, and a model whose MoE layers all run other backends is rejected at load.
 - A MegaMoE CuteDSL launch stages its routes under the forward's live-row word (see [Fused-comm execution flow](#fused-comm-execution-flow-megamoe-style)): a new launch over part of a forward (another split, a model fast path) must enter `live_rows.part_of_the_forward()`, or it drops real rows.
 - Per-layer dynamic EPLB uses `MoeConfig.load_balancer.mode=per_layer_dynamic` with
   `num_slots` greater than the model expert count. Backend resolution selects
