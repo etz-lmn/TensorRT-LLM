@@ -398,7 +398,6 @@ def _layer_worker_impl(mode: str) -> dict:
     bucket. Returns this rank's output digest, whether the forwards repeat it, the median forward
     microseconds and the staging launches per forward after the bucket's first launch."""
     import hashlib
-    import importlib
 
     parallel_mode = "DEP" if mode == "hinted" else "TEP"
     with _megamoe_layer("16e2m1xbf16", "dsv4", rows=_TIMED_ROWS, parallel_mode=parallel_mode) as (
@@ -409,7 +408,9 @@ def _layer_worker_impl(mode: str) -> dict:
         rank,
     ):
         staged = []
-        trtllm_ops = importlib.import_module("torch").ops.trtllm
+        # Read by name: an attribute named ``ops`` next to the global ``torch`` makes cloudpickle ship
+        # torch.ops, which is not a module, as a submodule of this worker.
+        trtllm_ops = getattr(torch, "ops").trtllm
         for name in ("megamoe_stage_inputs", "megamoe_stage_routes", "fp4_quantize"):
             if hasattr(trtllm_ops, name):
                 op = getattr(trtllm_ops, name)
@@ -441,6 +442,14 @@ def _layer_worker_impl(mode: str) -> dict:
             forward_us=sorted(times)[len(times) // 2],
             staging_launches=len(staged) / _TIMED_FORWARDS,
         )
+
+
+@pytest.mark.cpu_only
+def test_the_workers_pickle_for_the_mpi_pool() -> None:
+    """The workers this module submits to the shared MPI pool pickle by value (cloudpickle), the torch.ops
+    namespace kept out of what they carry."""
+    for worker in (_drop_worker, _layer_worker):
+        cloudpickle.dumps(worker)
 
 
 @requires_blackwell
