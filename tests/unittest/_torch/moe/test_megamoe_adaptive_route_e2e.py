@@ -11,8 +11,13 @@ live rows, nothing while the recording flag is clear.
 Timed (eager, per layer, reported as JUnit properties; judged by the reader, not here): the fused route without a
 balancer, the adaptive layer on the staged route, and on the router's route. Wall per layer is a chain of the
 layers between two CUDA events; host per layer is the launch loop up to its synchronization.
+
+Device time (graph replay, per slot count, reported only): each arm's chain of layer calls captured as one CUDA
+graph and replayed between CUDA events, so the host is off the clock; the adaptive arms with the recording flag
+clear and set; rank 0's kernels per layer call (torch profiler over replays).
 """
 
+import contextlib
 import json
 import pickle
 import statistics
@@ -49,6 +54,9 @@ _LAYERS = 8  # distinct layers per arm; a timed chain calls them in turn
 _CHAIN = 61  # layer calls per timed chain, the model's MoE layers
 _REPS = 20
 _ROUNDS = 3
+# Rows per rank of the replayed chains: 4-16 as at EP32, 32-128 as EP32's picks per expert.
+_GRAPH_ROWS = (4, 8, 16, 32, 64, 128)
+_PROFILE_REPLAYS = 3
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
@@ -84,7 +92,136 @@ def _replica_row(packed: list) -> torch.Tensor:
     )
 
 
-def _run() -> list:
+def _rank0_cuda_kernels(rank: int, run) -> dict:
+    """Rank 0's CUDA kernels of ``run()`` (torch profiler) as {name: [launches, median us]}; every rank runs it."""
+    profiler = (
+        torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
+        if rank == 0
+        else contextlib.nullcontext()
+    )
+    with profiler as prof:
+        run()
+        torch.cuda.synchronize()
+    if rank != 0:
+        return {}
+    calls = {}
+    for event in prof.events():
+        if event.device_type == torch.autograd.DeviceType.CUDA:
+            calls.setdefault(event.name[:120], []).append(event.device_time)
+    return {k: [len(v), round(statistics.median(v), 2)] for k, v in sorted(calls.items())}
+
+
+def _graph_device_times(
+    plain, adaptive, balancer, use_router, record, world_size, rank, num_slots
+) -> list:
+    """Device microseconds per layer call of each arm's chain of _CHAIN calls, captured as one CUDA graph and
+    replayed back to back between CUDA events (median over _REPS replays), with rank 0's kernels of one eager layer
+    call and of the replays, and what the replays added to the statistics (none while the flag is clear). Each arm
+    warms up eagerly, captures, replays and drops its graph before the next arm, so no eager forward of another arm
+    runs between a capture and its replays (the shared-workspace fence of the server-order check)."""
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+
+    stats = balancer.statistics(torch.device("cuda", rank))
+    arms = (
+        ("fused_no_balancer", plain, None, (False,)),
+        ("adaptive_staged", adaptive, False, (False, True)),
+        ("adaptive_router", adaptive, True, (False, True)),
+    )
+    results, problem = [], None
+    for rows in _GRAPH_ROWS:
+        counts = [rows] * world_size
+        torch.manual_seed(3000 + rows + rank)
+        x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
+        for round_ in range(_ROUNDS):
+            for arm, layers, router, flags in arms:
+                slots = num_slots if layers is adaptive else _NUM_EXPERTS
+                if router is not None:
+                    use_router(router)
+                record(False)
+                for _ in range(CUDAGraphRunner.WARMUP_STEPS):
+                    for layer in layers:
+                        layer(x, all_rank_num_tokens=counts)
+                torch.cuda.synchronize()
+                if round_ == 0:  # which route the arm takes: its kernels of one eager layer call
+                    kernels = _rank0_cuda_kernels(
+                        rank, lambda: layers[0](x, all_rank_num_tokens=counts)
+                    )
+                    if rank == 0:
+                        results.append(
+                            dict(rank=rank, rows=rows, arm=arm, slots=slots, eager_kernels=kernels)
+                        )
+                MPI.COMM_WORLD.Barrier()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    for call in range(_CHAIN):
+                        last = layers[call % _LAYERS](x, all_rank_num_tokens=counts)
+                for flag in flags:
+                    record(flag)  # the device flag the captured statistics read at every replay
+                    torch.cuda.synchronize()
+                    before = (stats["forwards"].sum().item(), stats["rows"].sum().item())
+                    MPI.COMM_WORLD.Barrier()
+                    graph.replay()  # lead-in: the ranks meet on the device before the clock starts
+                    events = [torch.cuda.Event(enable_timing=True) for _ in range(_REPS + 1)]
+                    events[0].record()
+                    for i in range(_REPS):
+                        graph.replay()
+                        events[i + 1].record()
+                    torch.cuda.synchronize()
+                    per_layer = [
+                        events[i].elapsed_time(events[i + 1]) * 1000.0 / _CHAIN
+                        for i in range(_REPS)
+                    ]
+                    name = arm + ("_stats" if flag else "")
+                    results.append(
+                        dict(
+                            rank=rank,
+                            rows=rows,
+                            arm=name,
+                            round=round_,
+                            slots=slots,
+                            graph_us_per_layer=statistics.median(per_layer),
+                            graph_us_per_layer_min=min(per_layer),
+                            counted_forwards=stats["forwards"].sum().item() - before[0],
+                            counted_rows=stats["rows"].sum().item() - before[1],
+                        )
+                    )
+                    if round_ == _ROUNDS - 1:
+                        MPI.COMM_WORLD.Barrier()
+
+                        def replays(_graph=graph):
+                            for _ in range(_PROFILE_REPLAYS):
+                                _graph.replay()
+
+                        kernels = _rank0_cuda_kernels(rank, replays)
+                        if rank == 0:
+                            # name: [launches per layer call, median us per launch]
+                            for value in kernels.values():
+                                value[0] = round(value[0] / (_PROFILE_REPLAYS * _CHAIN), 3)
+                            results.append(
+                                dict(
+                                    rank=rank,
+                                    rows=rows,
+                                    arm=name,
+                                    slots=slots,
+                                    graph_kernels=kernels,
+                                )
+                            )
+                # The replayed chain against eager: its last call's output, then the same layer eagerly.
+                graph.replay()
+                torch.cuda.synchronize()
+                replayed = last.clone()
+                eager = layers[(_CHAIN - 1) % _LAYERS](x, all_rank_num_tokens=counts)
+                torch.cuda.synchronize()
+                if problem is None and not torch.equal(replayed, eager):
+                    problem = f"{rows} rows, {arm}: the replayed chain differs from eager"
+                del graph, last
+    record(False)
+    use_router(True)
+    _assert_on_all_ranks(problem)
+    return results
+
+
+def _run(num_slots: int = _NUM_SLOTS, graph_only: bool = False) -> list:
     # Here, not at module level: quantize_utils needs parameterized, which only the GPU image has.
     from _torch.moe.quantize_utils import NVFP4QuantizeUtil
 
@@ -138,7 +275,7 @@ def _run() -> list:
             moe_max_num_tokens=_MAX_NUM_TOKENS,
         )
         if adaptive:
-            config.moe_load_balancer = MoeAdaptiveLoadBalancerConfig(num_slots=_NUM_SLOTS)
+            config.moe_load_balancer = MoeAdaptiveLoadBalancerConfig(num_slots=num_slots)
         return config
 
     results = []
@@ -202,6 +339,11 @@ def _run() -> list:
         def forward(layers, x, counts):
             return [layer(x, all_rank_num_tokens=counts).clone() for layer in layers[:2]]
 
+        if graph_only:
+            return _graph_device_times(
+                plain, adaptive, balancer, use_router, record, world_size, rank, num_slots
+            )
+
         # Bit for bit, decode and prefill sizes, with the statistics of the router's route.
         for rows in (*_DECODE_ROWS, *_PREFILL_ROWS):
             counts = [rows] * world_size
@@ -245,98 +387,12 @@ def _run() -> list:
                 )
             _assert_on_all_ranks(problem)
 
-        # The server's order: a forward whose first layer routes as a DeepSeek-V4 hash layer does (no router's
-        # route: the staged launch's kernel) and whose other layers take the router's route, all on one bucket's
-        # shared workspace; eager forwards (counted fences and host time per layer call, rank 0 records), then
-        # the CUDA graph runner's warmup step and its capture, replayed against eager.
-        from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
-        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
-
-        class _CountedFences(set):
-            fences = 0
-
-            def add(self, key):
-                type(self).fences += 1
-                super().add(key)
-
-        megamoe_op._MEGAMOE_FENCED_KEYS = _CountedFences(megamoe_op._MEGAMOE_FENCED_KEYS)
-        use_router(True)
-        backends[0].routes_adaptive_in_router = lambda num_tokens: False
-        for rows in (64, 1024):
-            counts = [rows] * world_size
-            x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
-            forward(adaptive, x, counts)
-            torch.cuda.synchronize()
-            hosts, fences = [], _CountedFences.fences
-            for _ in range(_REPS):
-                MPI.COMM_WORLD.Barrier()
-                begin = time.perf_counter()
-                for layer in adaptive:
-                    layer(x, all_rank_num_tokens=counts)
-                torch.cuda.synchronize()
-                hosts.append((time.perf_counter() - begin) / _LAYERS * 1e6)
-            if rank == 0:
-                results.append(
-                    dict(
-                        rank=rank,
-                        arm="server_order_eager",
-                        rows=rows,
-                        fences_per_forward=(_CountedFences.fences - fences) / _REPS,
-                        host_us_per_layer=statistics.median(hosts),
-                        layers=_LAYERS,
-                    )
-                )
-                print(json.dumps(results[-1]), flush=True)  # also when the capture below fails
-            for _ in range(CUDAGraphRunner.WARMUP_STEPS):
-                want = [layer(x, all_rank_num_tokens=counts).clone() for layer in adaptive]
-            torch.cuda.synchronize()
-            graph, problem = torch.cuda.CUDAGraph(), None
-            try:
-                with torch.cuda.graph(graph):
-                    got = [layer(x, all_rank_num_tokens=counts).clone() for layer in adaptive]
-            except RuntimeError as error:
-                problem = f"{rows} rows: capture after the eager warmup failed: {error}"
-            if problem is None:
-                graph.replay()
-                torch.cuda.synchronize()
-                if not all(torch.equal(a, b) for a, b in zip(got, want)):
-                    problem = f"{rows} rows: the captured mixed forward differs from eager"
-            del graph
-            _assert_on_all_ranks(problem)
-        use_router(True)
-
-        # A runtime install rewrites a layer's route table row in place: a graph captured on the home
-        # tables replays the replicated ones as an eager forward routes them (replica slots hold no
-        # copied weights here, so the check is replay against eager, not against the plain layer).
+        # The route tables a runtime install rewrites in place (fixed address), and a replicated version.
         tables = balancer.route_tables(device)
         home_tables = tables.clone()
         replica_tables = torch.stack(
             [_replica_row(home_tables[i].tolist()) for i in range(_LAYERS)]
         ).to(device)
-        use_router(True)
-        for rows in (64, 1024):
-            counts = [rows] * world_size
-            x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
-            for _ in range(2):
-                adaptive[0](x, all_rank_num_tokens=counts)
-            torch.cuda.synchronize()
-            graph, slot = torch.cuda.CUDAGraph(), None
-            with torch.cuda.graph(graph):
-                slot = adaptive[0](x, all_rank_num_tokens=counts).clone()
-            tables.copy_(replica_tables)
-            torch.cuda.synchronize()
-            slot.fill_(float("nan"))
-            graph.replay()
-            torch.cuda.synchronize()
-            eager = adaptive[0](x, all_rank_num_tokens=counts).clone()
-            torch.cuda.synchronize()
-            same = torch.equal(slot, eager)
-            tables.copy_(home_tables)
-            del graph
-            _assert_on_all_ranks(
-                None if same else f"{rows} rows: the replay after an install differs from eager"
-            )
-
         # Kernels per layer call (torch profiler): the router's route launches no route op or staging.
         names = {}
         for arm, router in (("adaptive_staged", False), ("adaptive_router", True)):
@@ -492,6 +548,116 @@ def _run() -> list:
         tables.copy_(home_tables)
         if rank == 0:
             results.append(dict(rank=rank, kernel_us_per_layer_call=kernel_times))
+
+        # Last, after every eager pairing has run (as the executor captures after its warmup): a graph captured
+        # on the home tables replays an install's replicated tables as an eager forward routes them (replica
+        # slots hold no copied weights here, so the check is replay against eager, not against the plain layer).
+        tables.copy_(home_tables)
+        use_router(True)
+        inputs = {}
+        for rows in (64, 1024):
+            inputs[rows] = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
+            for _ in range(2):
+                adaptive[0](inputs[rows], all_rank_num_tokens=[rows] * world_size)
+        torch.cuda.synchronize()
+        graphs = {}
+        for rows, x in inputs.items():
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                slot = adaptive[0](x, all_rank_num_tokens=[rows] * world_size).clone()
+            graphs[rows] = (graph, slot)
+        tables.copy_(replica_tables)
+        torch.cuda.synchronize()
+        for rows, (graph, slot) in graphs.items():
+            slot.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            eager = adaptive[0](inputs[rows], all_rank_num_tokens=[rows] * world_size).clone()
+            torch.cuda.synchronize()
+            same = torch.equal(slot, eager)
+            _assert_on_all_ranks(
+                None if same else f"{rows} rows: the replay after an install differs from eager"
+            )
+        del graphs
+        # The server's order: a forward whose first layer routes as a DeepSeek-V4 hash layer does (no router's
+        # route: the staged launch's kernel) and whose other layers take the router's route, all on one bucket's
+        # shared workspace; eager forwards (counted fences and host time per layer call, rank 0 records), then
+        # the CUDA graph runner's warmup step and its capture, replayed against eager. It runs after every eager
+        # arm: the layers without a balancer may get the same shared workspace with another local layout (rank 0
+        # records whether they do), and an eager fence of theirs after a capture would zero a captured one.
+        shared_of = {
+            name: {
+                bucket: provider.get_regions().shared_workspace.data_ptr()
+                for bucket, provider in layers[0].experts.backend._symm_providers.items()
+            }
+            for name, layers in (("plain", plain), ("adaptive", adaptive))
+        }
+        if rank == 0:
+            results.append(
+                dict(
+                    rank=rank,
+                    shared_workspace_shared_by_plain_and_adaptive={
+                        bucket: ptr == shared_of["plain"].get(bucket)
+                        for bucket, ptr in shared_of["adaptive"].items()
+                    },
+                )
+            )
+            print(json.dumps(results[-1]), flush=True)
+        from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+
+        class _CountedFences(set):
+            fences = 0
+
+            def add(self, key):
+                type(self).fences += 1
+                super().add(key)
+
+        megamoe_op._MEGAMOE_FENCED_KEYS = _CountedFences(megamoe_op._MEGAMOE_FENCED_KEYS)
+        use_router(True)
+        backends[0].routes_adaptive_in_router = lambda num_tokens: False
+        for rows in (64, 1024):
+            counts = [rows] * world_size
+            x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
+            forward(adaptive, x, counts)
+            torch.cuda.synchronize()
+            hosts, fences = [], _CountedFences.fences
+            for _ in range(_REPS):
+                MPI.COMM_WORLD.Barrier()
+                begin = time.perf_counter()
+                for layer in adaptive:
+                    layer(x, all_rank_num_tokens=counts)
+                torch.cuda.synchronize()
+                hosts.append((time.perf_counter() - begin) / _LAYERS * 1e6)
+            if rank == 0:
+                results.append(
+                    dict(
+                        rank=rank,
+                        arm="server_order_eager",
+                        rows=rows,
+                        fences_per_forward=(_CountedFences.fences - fences) / _REPS,
+                        host_us_per_layer=statistics.median(hosts),
+                        layers=_LAYERS,
+                    )
+                )
+                print(json.dumps(results[-1]), flush=True)  # also when the capture below fails
+            for _ in range(CUDAGraphRunner.WARMUP_STEPS):
+                want = [layer(x, all_rank_num_tokens=counts).clone() for layer in adaptive]
+            torch.cuda.synchronize()
+            graph, problem = torch.cuda.CUDAGraph(), None
+            try:
+                with torch.cuda.graph(graph):
+                    got = [layer(x, all_rank_num_tokens=counts).clone() for layer in adaptive]
+            except RuntimeError as error:
+                problem = f"{rows} rows: capture after the eager warmup failed: {error}"
+            if problem is None:
+                graph.replay()
+                torch.cuda.synchronize()
+                if not all(torch.equal(a, b) for a, b in zip(got, want)):
+                    problem = f"{rows} rows: the captured mixed forward differs from eager"
+            del graph
+            _assert_on_all_ranks(problem)
+        use_router(True)
         tables.copy_(home_tables)
         use_router(True)
     return results
@@ -515,3 +681,23 @@ def test_megamoe_adaptive_route_matches_and_is_timed(record_property) -> None:
         rows = [row for future in futures for row in future.result()]
     record_property("adaptive_route_timings", json.dumps(rows))
     print("ADAPTIVE_ROUTE_TIMINGS " + json.dumps(rows))
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < _WORLD_SIZE,
+    reason=f"Requires {_WORLD_SIZE} GPUs",
+)
+@pytest.mark.skipif(get_sm_version() not in (100, 103), reason="MegaMoE CuteDSL on SM100/SM103")
+@pytest.mark.parametrize("num_slots", [_NUM_SLOTS, _NUM_EXPERTS], ids=["slots512", "slots384"])
+def test_megamoe_adaptive_route_graph_device_time(num_slots, record_property) -> None:
+    # 384 slots: the adaptive layer with no spare slot, the same routing and local slot count as the plain one.
+    if mpi_world_size() > 1:
+        pytest.skip("Spawns its own worker processes")
+    with MPIPoolExecutor(
+        max_workers=_WORLD_SIZE, initializer=_init_worker, initargs=(sys.path,)
+    ) as executor:
+        futures = [executor.submit(_run, num_slots, True) for _ in range(_WORLD_SIZE)]
+        rows = [row for future in futures for row in future.result()]
+    record_property("adaptive_route_graph_timings", json.dumps(rows))
+    print("ADAPTIVE_ROUTE_GRAPH_TIMINGS " + json.dumps(rows))
