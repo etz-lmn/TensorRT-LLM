@@ -14,6 +14,7 @@ imports this module with only torch, numpy and this package available, so import
 from __future__ import annotations
 
 import atexit
+import contextlib
 import dataclasses
 import hashlib
 import math
@@ -24,6 +25,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -124,6 +126,11 @@ class LayoutUpdate:
     tables: dict[int, np.ndarray] = field(default_factory=dict)
     moved: list[int] = field(default_factory=list)
     digest: int = 0
+
+    @property
+    def empty(self) -> bool:
+        """Whether the update publishes no route tables and moves no layer: it changes nothing."""
+        return not self.tables and not self.moved
 
     def fingerprint(self) -> int:
         """48-bit digest (exact in a float64) of the tables and moved layers every rank shares."""
@@ -412,10 +419,27 @@ class _WorkerThread(threading.Thread):
         self.jobs: queue.Queue = queue.Queue()
         self.inbox: deque[tuple] = deque()
         self.failure: BaseException | None = None
+        self._held: list | None = None
         self.start()
 
     def post(self, job: Callable[[], tuple | None]) -> None:
-        self.jobs.put(job)
+        """Queue ``job``; inside :meth:`holding`, at the end of it."""
+        if self._held is not None:
+            self._held.append(job)
+        else:
+            self.jobs.put(job)
+
+    @contextlib.contextmanager
+    def holding(self):
+        """Hold the jobs posted inside, and queue them in order when it ends: a woken worker thread
+        competes with the poster for the interpreter, so the poster finishes its own work first."""
+        self._held = []
+        try:
+            yield
+        finally:
+            held, self._held = self._held, None
+            for job in held:
+                self.jobs.put(job)
 
     def run(self) -> None:
         for job in iter(self.jobs.get, None):
@@ -496,6 +520,9 @@ class AdaptiveRuntime:
         # Timing event pairs of the publishes: one comes back here once the worker read its time
         # (creating two CUDA events costs the main thread more than the rest of a publish).
         self._apply_event_pairs: deque = deque()
+        # Diagnostics: the host time of every step of a publish on the main thread, logged per
+        # publish (TLLM_ADAPTIVE_EPLB_APPLY_MARKS=1); off, a publish only tests this flag.
+        self._apply_marks = os.environ.get("TLLM_ADAPTIVE_EPLB_APPLY_MARKS") == "1"
         self._storage = statistics["storage"]
         pin = torch.device(device).type == "cuda" and prefer_pinned()
         self._own_stats = torch.zeros(decision.stats.shape[1], pin_memory=pin)
@@ -564,7 +591,8 @@ class AdaptiveRuntime:
             self.worker.inbox.clear()
             return
         try:
-            self._boundary()
+            with self.worker.holding():  # the jobs this call posts go out after its own work
+                self._boundary()
         except Exception as error:  # noqa: BLE001 - an optional optimization never stops serving
             self._stop(error)
 
@@ -713,7 +741,29 @@ class AdaptiveRuntime:
         rows = torch.zeros(len(self._gathered), len(ROW), dtype=torch.float64)
         self._gathers_run += 1
         self.gather(torch.tensor(row, dtype=torch.float64), list(rows), self.leave)
-        return ("copied", update, rows.numpy())
+        rows = rows.numpy()
+        if update.empty and self._agreed(update, rows):
+            return self._settle_empty(update, rows)
+        return ("copied", update, rows)
+
+    @staticmethod
+    def _agreed(update: LayoutUpdate, rows: np.ndarray) -> bool:
+        """Whether every rank's row is its completion of ``update``: the same digest, from a call
+        (the zero row a stopped rank sends at its close is none, and goes to the main thread)."""
+        return bool(
+            (rows[:, ROW.index("digest")] == update.digest).all()
+            and (rows[:, ROW.index("copied_call")] > 0).all()
+        )
+
+    def _settle_empty(self, update: LayoutUpdate, rows: np.ndarray) -> tuple:
+        """Worker thread: every rank decided an update that changes nothing, so it gets the
+        decision process's schedule here and never goes through the main thread's copies-done and
+        publish. Ranks that decided differently go to the main thread's check, which stops them."""
+        apply_call = int(rows[:, ROW.index("copied_call")].max()) + 1
+        self._event("copied", window=update.window, apply_call=apply_call, rows=rows)
+        if not self._apply_events:  # else the earlier publish's own timing is still to be read
+            self.last_applied = (float(update.window), 0.0, 0.0)  # publishing nothing takes no time
+        return self.decision.ask(("copied", update.window, rows))
 
     def _apply_tables(self, call: int, update: LayoutUpdate) -> None:
         """Install the update's route tables with one timed copy of the span of layers it changes
@@ -721,20 +771,50 @@ class AdaptiveRuntime:
         later forwards route by them."""
         # The previous copy from the pinned host tables finished before the window after it closed.
         assert not self._apply_events, "the previous route tables' copy is still in flight"
+        marks = [("start", time.perf_counter_ns())] if self._apply_marks else None
         host_tables = self._host_tables_np
         for layer, tables in update.tables.items():
             host_tables[layer] = tables
             self.applied_window[layer] = update.window
+        if marks is not None:
+            marks.append(("host_tables", time.perf_counter_ns()))
         if self._apply_event_pairs:
             begin, end = self._apply_event_pairs.popleft()
+            created = False
         else:
             begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            created = True
+        if marks is not None:
+            marks.append(("event_pair", time.perf_counter_ns()))
         begin.record()
+        if marks is not None:
+            marks.append(("begin_record", time.perf_counter_ns()))
         if update.tables:
             first, stop = min(update.tables), max(update.tables) + 1
             self.tables[first:stop].copy_(self._host_tables[first:stop], non_blocking=True)
             self.installs += 1
             self.installed_layers += len(update.tables)
+        if marks is not None:
+            marks.append(("table_copy", time.perf_counter_ns()))
         end.record()
+        if marks is not None:
+            marks.append(("end_record", time.perf_counter_ns()))
         self._apply_events.append((update.window, len(update.tables), begin, end))
         self._event("applied", window=update.window, call=call, layers=sorted(update.tables))
+        if marks is not None:
+            marks.append(("event", time.perf_counter_ns()))
+            self._log_apply_marks(update, created, marks)
+
+    @staticmethod
+    def _log_apply_marks(update: LayoutUpdate, created: bool, marks: list) -> None:
+        """Log the host time of each step of one publish (:attr:`_apply_marks`)."""
+        from tensorrt_llm.logger import logger
+
+        steps = " ".join(
+            f"{name}={(t - marks[i][1]) / 1e3:.1f}us" for i, (name, t) in enumerate(marks[1:])
+        )
+        total = (marks[-1][1] - marks[0][1]) / 1e3
+        logger.info(
+            f"adaptive EPLB apply marks: window={update.window} layers={len(update.tables)} "
+            f"new_events={created} {steps} total={total:.1f}us"
+        )
