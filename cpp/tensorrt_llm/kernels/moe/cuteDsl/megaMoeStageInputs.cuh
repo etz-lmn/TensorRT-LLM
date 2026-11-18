@@ -86,7 +86,7 @@ __device__ __forceinline__ void megaMoeQuantize(MegaMoeQuantize const& q, int64_
     constexpr int kThreadsPerSf = 16 / CVT_ELTS_PER_THREAD;
     int const vecs = q.cols / CVT_ELTS_PER_THREAD;
     int const parts = (vecs + kMegaMoeQuantizeItemVecs - 1) / kMegaMoeQuantizeItemVecs;
-    float const scale = q.globalScale == nullptr ? 1.0f : q.globalScale[0];
+    float const scale = q.globalScale == nullptr ? 1.0F : q.globalScale[0];
     auto const* in = reinterpret_cast<Vec const*>(q.in);
     for (int64_t item = first; item < static_cast<int64_t>(q.rows) * parts; item += stride)
     {

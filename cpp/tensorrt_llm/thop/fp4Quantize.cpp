@@ -196,8 +196,8 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_sm_budget(at::Tensor const& self
     std::optional<at::Tensor> const& globalScale, int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout,
     int64_t reservedSms)
 {
-    return fp4QuantizeImpl(
-        self, globalScale, sfVecSize, sfUseUE8M0, isSfSwizzledLayout, reservedSms, std::nullopt, std::nullopt);
+    return fp4QuantizeImpl(self, globalScale, sfVecSize, sfUseUE8M0, isSfSwizzledLayout, reservedSms,
+        /*out=*/std::nullopt, /*outSf=*/std::nullopt);
 }
 
 // NVFP4 into caller-owned buffers, e.g. an MoE backend's activation staging, so the rows are not copied afterwards.

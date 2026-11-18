@@ -51,9 +51,8 @@ inline kernels::MegaMoeQuantize megaMoeQuantizeOf(
     TORCH_CHECK(xSf.device() == x.device() && xSf.is_contiguous() && xSf.scalar_type() == at::kByte && xSf.dim() == 2
             && xSf.size(0) == m && xSf.size(1) == k / 16,
         "x_sf must be contiguous uint8 [M, K / 16] on x's device");
-    return {reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr()), globalScale.data_ptr<float>(),
-        reinterpret_cast<uint32_t*>(xFp4.data_ptr()), xSf.data_ptr<uint8_t>(), static_cast<int>(m),
-        static_cast<int>(k)};
+    return {static_cast<__nv_bfloat16 const*>(x.data_ptr()), globalScale.data_ptr<float>(),
+        static_cast<uint32_t*>(xFp4.data_ptr()), xSf.data_ptr<uint8_t>(), static_cast<int>(m), static_cast<int>(k)};
 }
 
 } // namespace torch_ext
