@@ -757,6 +757,9 @@ class MoEFusedRouteQuant:
     routing_tables: Optional[MoERoutingTables] = None
     # The launch also added its picks to the warmup expert placement's counters.
     routes_counted: bool = False
+    # The backend's dispatch router maps the staged expert ids to an adaptive balancer's slots and
+    # counts its statistics (``try_fused_route_quant``'s ``adaptive_route``).
+    routes_mapped: bool = False
 
 
 @dataclass(frozen=True)

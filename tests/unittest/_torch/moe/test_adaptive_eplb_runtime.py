@@ -657,12 +657,17 @@ def test_layers_go_home_without_a_copy_once_their_rows_even_out(monkeypatch):
         decider.schedule(w, np.array([[10 + 20 * w, 0, 0.0, 0]] * R))
 
 
-def test_a_draining_batch_prices_the_rows_one_window_ahead(monkeypatch):
+@pytest.mark.parametrize("before,after,ahead", [(40, 2, 0.2), (48, 121.5, 243.0)])
+def test_a_draining_batch_prices_the_rows_one_window_ahead(monkeypatch, before, after, ahead):
     monkeypatch.setattr(rt, "solve_shares", even_split)
-    decider = after_window_0(requests=40)
-    # A fall from 80 to 4 requests forecasts too few rows to repay replica weight streams.
-    window_stats(decider.stats, live=0, requests=2)
+    decider = after_window_0(requests=before)
+    # A rise from 96 to 243 requests is priced at the 243 requests at the close, not carried past them.
+    window_stats(decider.stats, live=0, requests=after)
     update = decider.decide(1)
+    assert decider.kept[-1][2] == pytest.approx(ahead)
+    if after > before:
+        return
+    # A fall from 80 to 4 requests forecasts too few rows to repay replica weight streams.
     assert sorted(update.tables) == [0, 1] and update.moved == [] and (decider.layout == HOME).all()
 
 
@@ -685,6 +690,21 @@ def test_one_slow_copy_does_not_price_the_next_installs_out(monkeypatch):
     # GPU 1's experts hot: the correction repays 0.5 ms, not 50.
     window_stats(decider.stats, (4, 5), live=0, remaining=800)
     assert decider.decide(1).moved == [0, 1]
+
+
+def test_copies_timed_in_service_price_the_installs_after_them(monkeypatch):
+    monkeypatch.setattr(rt, "solve_shares", even_split)
+    costs = []
+    monkeypatch.setattr(
+        rt, "choose_layers_to_install", lambda *args: costs.append(args[2]) or REAL_CHOOSE(*args)
+    )
+    decider = after_window_0(4.0, remaining=800)  # start-up 0.5 ms per replica; then 4 ms over 4
+    window_stats(decider.stats, (4, 5), live=0, remaining=800)
+    assert decider.decide(1).moved == [0, 1]
+    decider.schedule(1, np.array([[30, 2, 4.0, 0]] * R))  # 1 ms per replica again
+    window_stats(decider.stats, live=1, remaining=8)  # one step left: both copies are past it
+    decider.decide(2)
+    assert costs[-1] == {layer: 2 * cost for layer, cost in costs[0].items()}
 
 
 def test_decision_process_answers_and_reports_its_failure():
@@ -831,3 +851,45 @@ def test_a_window_prices_at_the_scale_of_the_bucket_its_busiest_rank_pads_to(mon
         gains.append(seen["gains"][0])
     # 100.75 rows per forward on the busiest rank pad to the 200-row bucket: its scale 3.
     assert gains[1] == pytest.approx({layer: 3.0 * gain for layer, gain in gains[0].items()})
+
+
+def test_statistics_count_only_inside_the_windows_the_runtime_schedules(host_cuda, monkeypatch):
+    """The recording flag is set from a window's open to its close and clear between windows, on the
+    runtime's own schedule; the counts a window closes with equal the counts of always-on recording
+    since its open, and the calls between windows count nothing."""
+    balancer = manager()
+    flag = balancer.recording_flag("cpu")
+    balancer.observe_scheduled_batch(4, True, False, lambda start, stop: (0, 0, 0))
+    assert balancer.recording and flag.item() == 1, (
+        "without a runtime every recorded forward counts"
+    )
+    seen, clock, _, ranks = spied_ranks(monkeypatch)
+    runtime = ranks[0]
+    runtime.on_window = balancer._set_window_open
+    per_call = torch.arange(E, dtype=torch.float32)
+    gated = torch.zeros(E)
+    always = torch.zeros(E)
+    opened_calls, closed = [], []
+    for _ in range(4 * FORWARDS + 8):
+        was_open = runtime.close_at is not None
+        run(ranks, clock, 1)
+        if runtime.close_at is not None and not was_open:
+            opened_calls.append(runtime.call)
+            gated.zero_()
+            always.zero_()
+        if was_open and runtime.close_at is None and opened_calls:
+            # The window closed at this call: its forwards were the calls since its open.
+            closed.append((gated.clone(), always.clone()))
+        # The forward of this call: the statistics ops add the routes while the flag is set.
+        always += per_call
+        if flag.item():
+            gated += per_call
+        if runtime.close_at is None:
+            assert flag.item() == 0, f"call {runtime.call} counts outside a window"
+        elif opened_calls:
+            assert flag.item() == 1, f"call {runtime.call} of an open window does not count"
+    assert opened_calls and closed
+    for counted, reference in closed:
+        assert torch.equal(counted, reference)
+    balancer.observe_scheduled_batch(0, True, False, lambda start, stop: (0, 0, 0))
+    assert flag.item() == 0

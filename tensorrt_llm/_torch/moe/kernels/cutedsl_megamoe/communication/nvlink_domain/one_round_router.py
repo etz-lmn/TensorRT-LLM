@@ -44,6 +44,7 @@ from ...helpers.smem_workspace import SmemWorkspace
 from ...helpers.utils import ceil_div, round_up
 from ...quant_def import QuantKind
 from ..token_protocol import TokenSrcMetadata
+from .adaptive_route import AdaptiveRouteMixin
 from .symmetric_buffer import SymmetricBufferDevice
 
 
@@ -156,7 +157,7 @@ def fence_proxy_async_global(*, loc=None, ip=None) -> None:
     )
 
 
-class _OneRoundRouter(KernelComponent):
+class _OneRoundRouter(AdaptiveRouteMixin, KernelComponent):
     """One-round push dispatch with the ``_MetadataPushRouter`` output contract (see the module docstring)."""
 
     threads_per_cta: ClassVar[int] = 512
@@ -214,6 +215,9 @@ class _OneRoundRouter(KernelComponent):
         return {
             "token_padding_block": int,
             "one_round_cta_count": OptionalRequirement(int),
+            # > 0: the staged ids are this many experts' ids, which the router maps to slots through an adaptive
+            # load balancer's route tables and counts into its statistics (adaptive_route.py).
+            "adaptive_route_experts": OptionalRequirement(int),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -227,6 +231,7 @@ class _OneRoundRouter(KernelComponent):
         self.apply_topk_at_fc1 = problem_desc["apply_topk_at_fc1"]
         self.token_padding_block = impl_desc["token_padding_block"]
         self.one_round_cta_count = int(impl_desc.get("one_round_cta_count", 2))
+        self.adaptive_route_experts = int(impl_desc.get("adaptive_route_experts", 0) or 0)
         self._validate_configuration()
 
         self.experts_per_rank = self.expert_count // self.world_size
@@ -266,6 +271,8 @@ class _OneRoundRouter(KernelComponent):
             raise NotImplementedError("One-round dispatch packs the local expert into 10 bits.")
         if (self.hidden_size * int(self.quant_kind.activation_dtype.width) // 8) % 16 != 0:
             raise ValueError("One-round dispatch moves activation rows in 16-byte vectors.")
+        if not 0 <= self.adaptive_route_experts <= self.expert_count:
+            raise ValueError("An adaptive route maps at most as many experts as there are slots.")
 
     def worst_case_padded_tokens(self, block: int) -> int:
         """Same pool bound as ``_MetadataPushRouter.worst_case_padded_tokens``."""
@@ -477,9 +484,21 @@ class _OneRoundRouter(KernelComponent):
         peer_rank_ptr_mapper_host,
         device_workspace: DeviceWorkspace,
         stream: cuda.CUstream,
+        adaptive_route: Optional[tuple] = None,
     ) -> None:
         """Launch the push + sort grid. Not PDL: it starts after its predecessor completed, so it may read the
-        staged top-k and activation at entry; it releases the MoE kernel at entry like the metadata-push router."""
+        staged top-k and activation at entry; it releases the MoE kernel at entry like the metadata-push router.
+
+        ``adaptive_route`` (iff ``adaptive_route_experts`` > 0): the device addresses of the layer's packed route
+        table row, its statistics row (float32 per expert) and forward count (int64), the recording flag (int32)
+        and the forward's live-row word (int32), then the forward's token rows and whether it is the forward's
+        first call (Int32 each)."""
+        if cutlass.const_expr((adaptive_route is not None) != (self.adaptive_route_experts > 0)):
+            raise ValueError(
+                "adaptive_route is passed iff the router is built with adaptive_route_experts"
+            )
+        if cutlass.const_expr(adaptive_route is None):
+            adaptive_route = (None,) * 7
         kernel = self._kernel(
             topk_indices,
             topk_scores,
@@ -490,6 +509,7 @@ class _OneRoundRouter(KernelComponent):
             shared_workspace,
             peer_rank_ptr_mapper_host.make_device_object(),
             device_workspace,
+            *adaptive_route,
         )
         kernel.launch(
             grid=[self.one_round_cta_count, 1, 1],
@@ -510,6 +530,13 @@ class _OneRoundRouter(KernelComponent):
         shared_workspace: cute.Pointer,
         peer_rank_ptr_mapper: SymmetricBufferDevice,
         device_workspace: DeviceWorkspace,
+        adaptive_tables: Optional[Int64],
+        adaptive_rows: Optional[Int64],
+        adaptive_forwards: Optional[Int64],
+        adaptive_enabled: Optional[Int64],
+        adaptive_live_word: Optional[Int64],
+        adaptive_num_tokens: Optional[Int32],
+        adaptive_first: Optional[Int32],
     ) -> None:
         cute.arch.griddepcontrol_launch_dependents()
         thread_idx, _, _ = cute.arch.thread_idx()
@@ -534,6 +561,15 @@ class _OneRoundRouter(KernelComponent):
             thread_idx,
             warp_idx,
             lane_idx,
+            (
+                adaptive_tables,
+                adaptive_rows,
+                adaptive_forwards,
+                adaptive_enabled,
+                adaptive_live_word,
+                adaptive_num_tokens,
+                adaptive_first,
+            ),
         )
         if cta_idx == Int32(0):
             self._sort(device_workspace, smem_base, thread_idx, warp_idx, lane_idx)
@@ -554,6 +590,7 @@ class _OneRoundRouter(KernelComponent):
         thread_idx: Int32,
         warp_idx: Int32,
         lane_idx: Int32,
+        adaptive: tuple,
     ) -> None:
         destination_count = self._smem_workspace.tensor(
             self.smem_destination_count_region, smem_base
@@ -577,6 +614,11 @@ class _OneRoundRouter(KernelComponent):
         # the grid (one SM's remote-store rate, ~50-60 GB/s, is what bounds a push).
         global_warp_idx = warp_idx * Int32(self.one_round_cta_count) + cta_idx
 
+        # Adaptive route: the rows this launch counts (the live rows of the forward's token rows, none while the
+        # recording flag is clear), and the forward count, once per forward from one thread of the grid.
+        if cutlass.const_expr(self.adaptive_route_experts > 0):
+            counted_rows = self._adaptive_counted_rows(adaptive, cta_idx, thread_idx)
+
         for token_round in cutlass.range_constexpr(self.token_rounds):
             token = global_warp_idx + Int32(token_round * self.global_warp_count)
             if token < Int32(self.max_tokens_per_rank):
@@ -585,9 +627,21 @@ class _OneRoundRouter(KernelComponent):
                 score_bits = Int32(0)
                 if lane_idx < Int32(self.topk):
                     raw_index = topk_indices[token, lane_idx]
-                    # Int64 ids; a negative one compares as a large unsigned value.
-                    lane_valid = cutlass.Uint64(raw_index) < cutlass.Uint64(self.expert_count)
-                    expert = Int32(raw_index)
+                    if cutlass.const_expr(self.adaptive_route_experts > 0):
+                        # Expert ids: count the live rows' picks, then route each through the layer's tables.
+                        lane_valid = cutlass.Uint64(raw_index) < cutlass.Uint64(
+                            self.adaptive_route_experts
+                        )
+                        expert = Int32(raw_index)
+                        if lane_valid:
+                            expert = self._adaptive_pick(
+                                adaptive, counted_rows, expert, token, local_rank
+                            )
+                            lane_valid = expert >= Int32(0)
+                    else:
+                        # Int64 ids; a negative one compares as a large unsigned value.
+                        lane_valid = cutlass.Uint64(raw_index) < cutlass.Uint64(self.expert_count)
+                        expert = Int32(raw_index)
                     if cutlass.const_expr(self.apply_topk_at_fc1):
                         score_bits = _f32_as_s32(cutlass.Float32(topk_scores[token, lane_idx]))
                 destination = expert // Int32(self.experts_per_rank)

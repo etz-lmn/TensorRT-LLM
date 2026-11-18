@@ -14,6 +14,7 @@ imports this module with only torch, numpy and this package available, so import
 from __future__ import annotations
 
 import atexit
+import contextlib
 import dataclasses
 import hashlib
 import math
@@ -24,6 +25,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -124,6 +126,11 @@ class LayoutUpdate:
     tables: dict[int, np.ndarray] = field(default_factory=dict)
     moved: list[int] = field(default_factory=list)
     digest: int = 0
+
+    @property
+    def empty(self) -> bool:
+        """Whether the update publishes no route tables and moves no layer: it changes nothing."""
+        return not self.tables and not self.moved
 
     def fingerprint(self) -> int:
         """48-bit digest (exact in a float64) of the tables and moved layers every rank shares."""
@@ -239,13 +246,14 @@ class _Decider:
             per_step = total["accepted"] / total["requests"]  # tokens a request accepts per step
             steps_left = total["remaining"] / per_step / total["requests"]
         # A batch that changed between two closes more than it ever did (a steady batch never does, a
-        # draining one keeps doing so) is priced where the new layouts serve it: the requests at this
-        # close carried a window ahead at that rate, over their mean across the window.
+        # draining one keeps doing so) is priced where the new layouts serve it, over its mean across the
+        # window: a draining batch at the requests at this close carried a window ahead at that rate, a
+        # growing one at the requests at this close, as what bounds its growth is outside the server.
         requests, before = total["requests"], self.close_requests
         change = abs(requests / before - 1.0) if min(requests, before) > 0.0 else 0.0
         self.close_requests, ahead = requests, None
         if change > self.largest_change:
-            ahead = requests * requests / before
+            ahead = requests * min(requests / before, 1.0)
             rows = rows * (ahead / ((before + requests) / 2.0))
         self.largest_change = max(self.largest_change, change)
         requests = ahead or ((before + requests) / 2.0 if before > 0.0 else requests)
@@ -279,11 +287,13 @@ class _Decider:
         current = (rows[planned], installed, np.where(refresh[:, None], resolved, old[2]))
         gains = evaluate_gains(*current, new_layout, new_shares, model, geometry)
         # A layer's copy: its busiest receiving GPU's replicas at the lower median of the copy times per
-        # replica within the steps left (one slow copy prices nothing out; the start-up one counts).
+        # replica of every timed copy (one slow copy prices nothing out; the start-up one counts). Not only
+        # those within the steps left: installs are rarer than that, which left the start-up copy, timed
+        # idle, the lower median of every install timed in service.
         fresh = (new_layout >= 0) & (new_layout != installed)
         copied = fresh.reshape(-1, geometry.ep_size, geometry.local_slots).sum(2)
-        recent = [ms for call, ms in self.copy_samples if call >= close - (steps_left or 0.0)]
-        per_replica = sorted(recent)[(len(recent) - 1) // 2] if recent else None
+        timed = sorted(ms for _, ms in self.copy_samples)
+        per_replica = timed[(len(timed) - 1) // 2] if timed else None
         # The home layout is a candidate too: retiring the replicas copies nothing, so the plan stays
         # only where it gains more than the home layout, net of a layer's copy over the steps left.
         home_shares = (home >= 0).astype(np.float64)
@@ -409,10 +419,27 @@ class _WorkerThread(threading.Thread):
         self.jobs: queue.Queue = queue.Queue()
         self.inbox: deque[tuple] = deque()
         self.failure: BaseException | None = None
+        self._held: list | None = None
         self.start()
 
     def post(self, job: Callable[[], tuple | None]) -> None:
-        self.jobs.put(job)
+        """Queue ``job``; inside :meth:`holding`, at the end of it."""
+        if self._held is not None:
+            self._held.append(job)
+        else:
+            self.jobs.put(job)
+
+    @contextlib.contextmanager
+    def holding(self):
+        """Hold the jobs posted inside, and queue them in order when it ends: a woken worker thread
+        competes with the poster for the interpreter, so the poster finishes its own work first."""
+        self._held = []
+        try:
+            yield
+        finally:
+            held, self._held = self._held, None
+            for job in held:
+                self.jobs.put(job)
 
     def run(self) -> None:
         for job in iter(self.jobs.get, None):
@@ -454,11 +481,14 @@ class AdaptiveRuntime:
         device: torch.device,
         tables: torch.Tensor,
         statistics: dict[str, torch.Tensor],
+        on_window: Callable[[bool], None] | None = None,
     ) -> None:
         # Imported here: the decision process imports this module without the rest of the package.
         from tensorrt_llm._utils import prefer_pinned
 
         self.layers = layers
+        # Told when a window opens (True) and closes (False): the statistics count only inside one.
+        self.on_window = on_window
         self.transport = transport
         self.copy_stream = copy_stream
         self.decision = decision
@@ -490,6 +520,9 @@ class AdaptiveRuntime:
         # Timing event pairs of the publishes: one comes back here once the worker read its time
         # (creating two CUDA events costs the main thread more than the rest of a publish).
         self._apply_event_pairs: deque = deque()
+        # Diagnostics: the host time of every step of a publish on the main thread, logged per
+        # publish (TLLM_ADAPTIVE_EPLB_APPLY_MARKS=1); off, a publish only tests this flag.
+        self._apply_marks = os.environ.get("TLLM_ADAPTIVE_EPLB_APPLY_MARKS") == "1"
         self._storage = statistics["storage"]
         pin = torch.device(device).type == "cuda" and prefer_pinned()
         self._own_stats = torch.zeros(decision.stats.shape[1], pin_memory=pin)
@@ -558,7 +591,8 @@ class AdaptiveRuntime:
             self.worker.inbox.clear()
             return
         try:
-            self._boundary()
+            with self.worker.holding():  # the jobs this call posts go out after its own work
+                self._boundary()
         except Exception as error:  # noqa: BLE001 - an optional optimization never stops serving
             self._stop(error)
 
@@ -567,6 +601,8 @@ class AdaptiveRuntime:
         from tensorrt_llm.logger import logger
 
         self.failure = error
+        if self.on_window is not None:
+            self.on_window(False)
         self.pending_updates.clear()
         self.worker.inbox.clear()
         self.open_at = self.close_at = None
@@ -630,8 +666,10 @@ class AdaptiveRuntime:
         logger.debug(f"adaptive EPLB {event}: {', '.join(f'{k}={v}' for k, v in shown.items())}")
 
     def _open_window(self) -> None:
-        """Zero the statistics."""
+        """Zero the statistics and start counting."""
         self._storage.zero_()
+        if self.on_window is not None:
+            self.on_window(True)
 
     def _close_window(self) -> None:
         """Copy the statistics into this rank's window statistics, timing the copies, and have the
@@ -641,6 +679,8 @@ class AdaptiveRuntime:
         self._stats_copy_begin.record()
         self._own_raw.copy_(self._storage, non_blocking=True)
         self._stats_copy_end.record()
+        if self.on_window is not None:
+            self.on_window(False)  # until the next window opens, nothing reads the counts
         self.close_at = None
         progress, window = self._progress, self.window
         self.worker.post(lambda: self._gather_window(progress, window))
@@ -701,7 +741,28 @@ class AdaptiveRuntime:
         rows = torch.zeros(len(self._gathered), len(ROW), dtype=torch.float64)
         self._gathers_run += 1
         self.gather(torch.tensor(row, dtype=torch.float64), list(rows), self.leave)
-        return ("copied", update, rows.numpy())
+        rows = rows.numpy()
+        if update.empty and self._agreed(update, rows):
+            return self._settle_empty(update, rows)
+        return ("copied", update, rows)
+
+    @staticmethod
+    def _agreed(update: LayoutUpdate, rows: np.ndarray) -> bool:
+        """Whether every rank's row is its completion of ``update``: the same digest, from a call
+        (the zero row a stopped rank sends at its close is none, and goes to the main thread)."""
+        return bool(
+            (rows[:, ROW.index("digest")] == update.digest).all()
+            and (rows[:, ROW.index("copied_call")] > 0).all()
+        )
+
+    def _settle_empty(self, update: LayoutUpdate, rows: np.ndarray) -> tuple:
+        """Worker thread: every rank decided an update that changes nothing, so it gets the
+        decision process's schedule here and never goes through the main thread's copies-done and
+        publish. Ranks that decided differently go to the main thread's check, which stops them."""
+        apply_call = int(rows[:, ROW.index("copied_call")].max()) + 1
+        self._event("copied", window=update.window, apply_call=apply_call, rows=rows)
+        # No timing either: the install timings price the publishes that run, which change tables.
+        return self.decision.ask(("copied", update.window, rows))
 
     def _apply_tables(self, call: int, update: LayoutUpdate) -> None:
         """Install the update's route tables with one timed copy of the span of layers it changes
@@ -709,20 +770,50 @@ class AdaptiveRuntime:
         later forwards route by them."""
         # The previous copy from the pinned host tables finished before the window after it closed.
         assert not self._apply_events, "the previous route tables' copy is still in flight"
+        marks = [("start", time.perf_counter_ns())] if self._apply_marks else None
         host_tables = self._host_tables_np
         for layer, tables in update.tables.items():
             host_tables[layer] = tables
             self.applied_window[layer] = update.window
+        if marks is not None:
+            marks.append(("host_tables", time.perf_counter_ns()))
         if self._apply_event_pairs:
             begin, end = self._apply_event_pairs.popleft()
+            created = False
         else:
             begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            created = True
+        if marks is not None:
+            marks.append(("event_pair", time.perf_counter_ns()))
         begin.record()
+        if marks is not None:
+            marks.append(("begin_record", time.perf_counter_ns()))
         if update.tables:
             first, stop = min(update.tables), max(update.tables) + 1
             self.tables[first:stop].copy_(self._host_tables[first:stop], non_blocking=True)
             self.installs += 1
             self.installed_layers += len(update.tables)
+        if marks is not None:
+            marks.append(("table_copy", time.perf_counter_ns()))
         end.record()
+        if marks is not None:
+            marks.append(("end_record", time.perf_counter_ns()))
         self._apply_events.append((update.window, len(update.tables), begin, end))
         self._event("applied", window=update.window, call=call, layers=sorted(update.tables))
+        if marks is not None:
+            marks.append(("event", time.perf_counter_ns()))
+            self._log_apply_marks(update, created, marks)
+
+    @staticmethod
+    def _log_apply_marks(update: LayoutUpdate, created: bool, marks: list) -> None:
+        """Log the host time of each step of one publish (:attr:`_apply_marks`)."""
+        from tensorrt_llm.logger import logger
+
+        steps = " ".join(
+            f"{name}={(t - marks[i][1]) / 1e3:.1f}us" for i, (name, t) in enumerate(marks[1:])
+        )
+        total = (marks[-1][1] - marks[0][1]) / 1e3
+        logger.info(
+            f"adaptive EPLB apply marks: window={update.window} layers={len(update.tables)} "
+            f"new_events={created} {steps} total={total:.1f}us"
+        )

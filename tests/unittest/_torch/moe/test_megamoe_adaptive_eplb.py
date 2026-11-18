@@ -97,9 +97,14 @@ def test_a_calibration_prices_any_gpu_and_its_identity_resolves_tactics_without_
     monkeypatch.setattr(mm, "get_sm_version", lambda: 103)
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
 
-    tactic = repr(op._unpack_tactic(op._MEGAMOE_NONBULK_STANDALONE_TACTIC))
-    identity = IMPL.decode_calibration_identity(backend, [32, 1024])
-    assert identity["tactics"] == {"32": tactic, "1024": tactic} and identity["top_k"] == 6
+    # A quantized (NVFP4) combine resolves to the quantized-combine tactic, and from the bulk
+    # threshold's tokens per rank on to the bulk-store tactic, as the launch does.
+    small = repr(op._unpack_tactic(op._MEGAMOE_QUANTIZED_COMBINE_TACTIC))
+    bulk = repr(op._unpack_tactic(op._MEGAMOE_NVFP4_COMBINE_BULK_TACTIC))
+    tokens = [32, 1024, op._MEGAMOE_NVFP4_COMBINE_BULK_MIN_TOKENS]
+    identity = IMPL.decode_calibration_identity(backend, tokens)
+    assert identity["tactics"] == dict(zip(map(str, tokens), (small, small, bulk)))
+    assert identity["top_k"] == 6
     backend.tactic_autotune = True
     assert IMPL.decode_calibration_identity(backend, [32])["tactics"] == {"32": "autotune"}
 
@@ -148,3 +153,77 @@ def test_staged_routes_are_taken_only_after_a_route_staging_hand_out():
     # Routes in a tensor of the caller's own are staged by run_moe as before.
     own = torch.zeros(4, 6, dtype=torch.int32)
     assert not IMPL._routes_staged(backend, bufs, own, 4, 6, None)
+
+
+def test_router_route_ranks_and_rows_are_the_balancers():
+    """The router picks a replicated expert's copy by the EP rank the kernel launches as (the op's local_rank,
+    the symmetric buffer's rank) and the pick's row in the launch bucket; the reference by the balancer's
+    ep_rank and the row of the forward's routes. Both ranks are the mapping's moe_ep_rank, every launch passes
+    the backend's ep_rank, and the fused route writes routes row for row into the bucket's leading rows."""
+    import ast
+    import inspect
+
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
+    from tensorrt_llm._torch.moe.fused_moe import impl_base, moe_load_balancer
+
+    tree = ast.parse(inspect.getsource(mm))
+    launches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_launch_megamoe_kernel"
+    ]
+    assert launches
+    for call in launches:
+        rank = next(k.value for k in call.keywords if k.arg == "local_rank")
+        assert ast.unparse(rank) == "self.ep_rank", ast.unparse(call)
+    # The backend's and the balancer's ranks are the mapping's moe_ep_rank.
+    assert "module.ep_rank = model_config.mapping.moe_ep_rank" in inspect.getsource(impl_base)
+    assert "ep_rank = model_config.mapping.moe_ep_rank" in inspect.getsource(
+        moe_load_balancer.maybe_create_moe_load_balancer
+    )
+    # The kernel's rank is the op's local_rank: the symmetric buffer handed to the router carries it.
+    assert "rank=int(self.local_rank)" in inspect.getsource(op)
+    # The fused route stages the forward's routes in the bucket's leading rows, row for row.
+    source = inspect.getsource(mm.TrtllmCutedslMegaMoeNvfp4Impl.try_fused_route_quant)
+    assert (
+        "staged=bucket" in source and "slot_of_expert=None if bucket is None else table" in source
+    )
+
+
+@pytest.mark.parametrize("balancer", [None, "static"])
+def test_a_layer_without_an_adaptive_balancer_launches_the_fused_route_as_before(balancer):
+    """Without an adaptive balancer (none, or one that does not route through the dispatch router), the
+    fused-comm scheduler's route asks the backend exactly as before the router's route: the backend's
+    fused route+quant with the input and the logits and nothing else, never the router question."""
+    from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import FusedCommMoEScheduler
+
+    calls, asked = [], []
+
+    class Backend:
+        fused_route_quant_enabled = True
+
+        def try_fused_route_quant(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return "fused"
+
+        def routes_adaptive_in_router(self, num_tokens):
+            asked.append(num_tokens)
+            return True
+
+    layer_balancer = None if balancer is None else SimpleNamespace(stages_routes=False)
+    scheduler = object.__new__(FusedCommMoEScheduler)
+    scheduler.moe = SimpleNamespace(
+        layer_load_balancer=layer_balancer,
+        backend=Backend(),
+        apply_router_weight_on_input=False,
+        _using_dynamic_load_balancer=lambda: False,
+        _load_balancer_uses_replica_plan=lambda: False,
+    )
+    x, logits = torch.zeros(4, 8), torch.zeros(4, 16)
+    got = scheduler._try_fused_route_quant(x, logits, None, None, first=True, adaptive=True)
+    assert got == "fused"
+    assert len(calls) == 1 and calls[0][1] == {}
+    assert calls[0][0][0] is x and calls[0][0][1] is logits and len(calls[0][0]) == 2
+    assert asked == []

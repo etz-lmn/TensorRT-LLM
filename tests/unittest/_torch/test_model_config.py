@@ -781,6 +781,83 @@ def test_a_tactic_spanning_families_for_the_checkpoint_fails_at_load(tmp_path, m
         _load_with_tactic(tmp_path, monkeypatch, "fp8_block_scales", "FP8_BLOCK_SCALES")
 
 
+def test_deepseek_v4_mtp_block_takes_its_own_moe_selection_under_a_tactic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under a tactic the MXFP4 MTP block takes the MTP layers' own selection.
+
+    A tactic pinning the target to NVFP4 implementations names no format an MXFP4 MTP block runs
+    as. The MTP layers select their own implementations (AUTO here), so the block still gets an
+    MXFP4 format and the body keeps NVFP4.
+    """
+    from tensorrt_llm._torch import model_config as model_config_module
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import mxfp4_quant_algo
+
+    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
+    _write_routed_expert_blocks(tmp_path, {"layers.0": "U8", "mtp.0": "I8"})
+
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        types.SimpleNamespace(num_hidden_layers=2, num_nextn_predict_layers=1),
+        str(tmp_path),
+        moe_impl_request(tactic="trtllm.mega_moe"),
+        None,
+        _mtp_one_model_spec_config(1),
+    )
+
+    for layer_idx in range(2):
+        experts = layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"]
+        assert experts.quant_algo == QuantAlgo.NVFP4
+    mtp_experts = layer_quant_config["model.layers.2.mlp.experts"]
+    assert mtp_experts.quant_algo == mxfp4_quant_algo(None, 100)
+    assert mtp_experts.group_size == 32
+
+
+@pytest.mark.parametrize("tactic", ["mega_moe", "trtllm.mega_moe"])
+def test_a_tactic_settles_the_target_backend_without_its_mtp_layers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tactic: str
+) -> None:
+    """A tactic settles the target's literal from the body layers only.
+
+    With one-model MTP on an NVFP4 checkpoint whose MTP block is MXFP4, the MTP layers select
+    their own implementations, so their experts do not narrow the target's tactic.
+    """
+    from tensorrt_llm._torch import model_config as model_config_module
+    from tensorrt_llm._torch.configs.deepseek_v41 import DeepseekV41Config
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe import TrtllmCutedslMegaMoeNvfp4Impl
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import backend_family_of
+
+    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
+    inline = {
+        "producer": {"name": "modelopt"},
+        "quant_algo": "MIXED_PRECISION",
+        "group_size": 16,
+        "exclude_modules": ["*.attn.*", "*.ffn.shared_experts.*", "head", "mtp.*"],
+        "quantized_layers": {"layers.0.ffn.experts": {"quant_algo": "NVFP4", "group_size": 16}},
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [32, 32],
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4",
+    }
+    pretrained = DeepseekV41Config(
+        architectures=["DeepseekV41ForCausalLM"], quantization_config=deepcopy(inline)
+    )
+    monkeypatch.setattr(
+        model_config_module, "load_pretrained_config", lambda *args, **kwargs: pretrained
+    )
+    _write_routed_expert_blocks(tmp_path, {"layers.0": "U8", "mtp.0": "I8"}, [2304, 2560])
+
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path), moe_tactic=tactic, spec_config=_mtp_one_model_spec_config(1)
+    )
+
+    assert model_config.moe_backend == backend_family_of(TrtllmCutedslMegaMoeNvfp4Impl)
+    mtp_layer = pretrained.num_hidden_layers
+    assert model_config.quant_config_dict[f"model.layers.{mtp_layer}.mlp.experts"].group_size == 32
+
+
 _FP8_BLOCK = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
 _MXFP4 = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8)
 _NVFP4 = QuantConfig(quant_algo=QuantAlgo.NVFP4)

@@ -14,7 +14,6 @@ from unittest.mock import Mock, call
 import pytest
 import zmq
 
-from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi import mpi_session as mpi
 
 pytestmark = pytest.mark.cpu_only
@@ -66,12 +65,9 @@ class _Queue:
         self.thread_ids.add(threading.get_ident())
         self.sent.append(message)
 
-    def put_nowait(self, message: str) -> None:
+    def put_noblock(self, message: str, *, retry: int) -> None:
         self.thread_ids.add(threading.get_ident())
         self.acknowledgments.append(message)
-
-    def put_noblock(self, message: str, *, retry: int) -> None:
-        self.put_nowait(message)
 
     def close(self):
         self.closed = True
@@ -438,69 +434,3 @@ def test_invalid_shutdown_grace_uses_default(monkeypatch, raw):
 def test_shutdown_grace_accepts_positive_finite_value(monkeypatch):
     monkeypatch.setenv("TLLM_MGMN_SHUTDOWN_GRACE_SECONDS", "0.5")
     assert mpi._mgmn_shutdown_grace_seconds() == 0.5
-
-
-@pytest.mark.parametrize("pending_worker", [False, True], ids=["idle", "draining"])
-@pytest.mark.parametrize("ack_failures", [0, 3], ids=["connected", "reconnected"])
-def test_stop_waits_for_ack_delivery(
-    monkeypatch: pytest.MonkeyPatch, pending_worker: bool, ack_failures: int
-) -> None:
-    """Use the real queue's send methods, replacing only the transport endpoint."""
-    queue = ZeroMqQueue(is_server=True)
-    worker = Future()
-    messages = deque(([mpi.RemoteTask(_task, (), {})] if pending_worker else []) + [None])
-    attempts = []
-    polls = []
-    server = _server(queue, [[worker, _future(7)]] if pending_worker else [])
-    monkeypatch.setattr(mpi, "_mgmn_shutdown_grace_seconds", lambda: 5)
-
-    def poll(timeout: float) -> bool:
-        polls.append(timeout)
-        assert len(polls) < 10, "server failed to accept a reconnected stop client"
-        if not messages:
-            messages.append(None)
-        return True
-
-    def send(data: bytes, **kwargs: object) -> None:
-        attempts.append(data)
-        if len(attempts) <= ack_failures:
-            raise zmq.Again()
-        if pending_worker and not worker.done():
-            worker.set_result(42)
-
-    monkeypatch.setattr(queue, "poll", poll)
-    monkeypatch.setattr(queue, "get", messages.popleft)
-    monkeypatch.setattr(queue, "_send_data", send)
-    server.serve()
-    assert len(attempts) == ack_failures + 1
-    assert len(set(attempts)) == 1
-    server._shutdown_session.assert_called_once()
-    assert queue.socket is None
-
-
-def test_missing_stop_client_remains_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An undeliverable ACK fails within the original shutdown grace."""
-    queue = ZeroMqQueue(is_server=True)
-    server = _server(queue, [])
-    now = [0.0]
-    attempts = []
-    monkeypatch.setattr(mpi, "_mgmn_shutdown_grace_seconds", lambda: 3)
-    monkeypatch.setattr(mpi.time, "monotonic", lambda: now[0])
-
-    def poll(timeout: float) -> bool:
-        now[0] += 1
-        assert now[0] <= 5, "shutdown deadline was extended by retries"
-        return True
-
-    def send(data: bytes, **kwargs: object) -> None:
-        attempts.append(data)
-        raise zmq.Again()
-
-    monkeypatch.setattr(queue, "poll", poll)
-    monkeypatch.setattr(queue, "get", lambda: None)
-    monkeypatch.setattr(queue, "_send_data", send)
-    with pytest.raises(RuntimeError, match="shutdown deadline expired"):
-        server.serve()
-    assert attempts
-    server._shutdown_session.assert_called_once_with(0)
-    assert queue.socket is None

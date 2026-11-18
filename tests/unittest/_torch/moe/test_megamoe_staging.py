@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests of the MegaMoE CuteDSL backend's staging of the next run."""
 
+import importlib
 import types
 from dataclasses import replace
 from types import SimpleNamespace
@@ -446,3 +447,153 @@ def test_preparation_consumes_handout_before_an_uncached_bucket(
         )
         assert backend.run_moe(context).dtype == torch.bfloat16
     assert backend._handed_out_route_staging is None
+
+
+@pytest.mark.parametrize("static_slots", [False, True])
+def test_routes_replaced_after_the_fused_route_quant_are_staged_without_the_activation(
+    preparation_backend, monkeypatch, static_slots
+):
+    """The DeepSeek-V4 fused route+quant writes the bucket's activation rows and routes. When the
+    scheduler then replaces the routes (``ENABLE_PERFECT_ROUTER=expert_ids``, a calibrator
+    replay), ``run_moe`` keeps the staged activation and stages only the new routes."""
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoERunContext
+
+    rows, top_k, experts = 3, 2, 4
+    backend = preparation_backend
+    backend._fuses_route_quant = True
+    backend.routing_method = SimpleNamespace(
+        experts_per_token=top_k,
+        top_k=top_k,
+        e_score_correction_bias=torch.zeros(experts),
+        routed_scaling_factor=1.0,
+    )
+    if static_slots:
+        backend._slot_of_expert = torch.tensor([3, 2, 1, 0], dtype=torch.int32)
+
+    def route_quant(logits, bias, x, scale, k, scaling, dtype, *, staged, slot_of_expert, **kw):
+        ids_out, weights_out, x_out, sf_out = staged
+        ids = torch.zeros(rows, k, dtype=torch.int32)
+        ids_out[:rows] = ids if slot_of_expert is None else slot_of_expert[ids.long()]
+        ids_out[rows:] = -1
+        weights_out[:rows] = 1.0
+        weights_out[rows:] = 0.0
+        x_out[:rows] = 7
+        sf_out[:rows] = 5
+        return ids, weights_out[:rows], x_out[:rows], sf_out[:rows], None
+
+    staged_routes, stage_activation = [], []
+    monkeypatch.setattr(mm, "dsv4_route_nvfp4_quant", route_quant, raising=False)
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "megamoe_stage_routes",
+        lambda ids, *args: staged_routes.append(ids.clone()),
+        raising=False,
+    )
+    del backend._stage_inputs  # the real staging, down to the route op
+    stage = backend._stage_inputs
+    backend._stage_inputs = lambda **kw: stage_activation.append(kw["stage_activation"]) or stage(
+        **kw
+    )
+    x = torch.zeros(rows, 64, dtype=torch.bfloat16)
+
+    def forward(routes=None):
+        backend.set_adaptive_launch_tokens(8, output_dtype=torch.bfloat16)
+        fused = backend.try_fused_route_quant(x, torch.zeros(rows, experts))
+        context = MoERunContext(
+            x=fused.x,
+            x_sf=fused.x_sf,
+            token_selected_experts=fused.token_selected_experts if routes is None else routes,
+            token_final_scales=fused.token_final_scales,
+            output_dtype=torch.bfloat16,
+        )
+        backend.run_moe(context)
+
+    forward()
+    assert not staged_routes and not stage_activation  # The fused launch staged the bucket.
+    replaced = torch.tensor([[1, 2], [3, 0], [2, 1]], dtype=torch.int32)
+    forward(replaced)
+    assert stage_activation == [False]
+    expected = backend.slots_of_experts(replaced) if static_slots else replaced
+    assert len(staged_routes) == 1 and torch.equal(staged_routes[0], expected)
+    assert backend._quantized_into is None and backend._prestaged is None
+
+
+_GLM_SM107 = (
+    "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
+    "glm_5_2_nvfp4__sm_107__high_throughput"
+)
+
+
+def test_rubin_glm_buckets_read_the_kernel_properties_by_name(monkeypatch):
+    """The GLM-5.2 SM107 wrapper of the kernel-properties query returns the shared record from
+    both its branches, and its provider allocation reads every field, so a multi-rank
+    initialization over buckets outside the generation-phase ones does not fail to unpack it."""
+    from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as shared
+    from tensorrt_llm._torch.utils import ActivationType
+
+    if not shared.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip("the MegaMoE CuteDSL op is not available")
+    try:
+        runner = importlib.import_module(_GLM_SM107 + ".ops.moe.megamoe_runner")
+        megamoe = importlib.import_module(_GLM_SM107 + ".ops.moe.megamoe")
+    except NoTarget as error:
+        pytest.skip(f"this installation does not carry the GLM-5.2 SM107 target: {error}")
+
+    class GenerationPhaseRunner:
+        def __init__(self, local_rank, output_dtype, **kwargs):
+            self.max_tokens_per_rank = kwargs["max_tokens_per_rank"]
+
+        def unique_id(self):
+            return "generation-phase"
+
+        def _resolve_kernel_descriptor(self, tactic, allow_fallback):
+            return SimpleNamespace(get_workspace_sizes=lambda: (0, 2048)), None
+
+    generic = shared.MegaMoeKernelProperties(4096, False, True)
+    monkeypatch.setattr(
+        shared, "query_megamoe_kernel_properties", lambda **kw: generic, raising=False
+    )
+    monkeypatch.setattr(runner, "RubinMegaMoERunner", GenerationPhaseRunner)
+    monkeypatch.setattr(runner, "_default_megamoe_tactic_for_key", lambda key, num_tokens: None)
+    providers = []
+    monkeypatch.setattr(
+        shared,
+        "get_megamoe_symm_provider",
+        lambda **kw: providers.append(kw["shared_workspace_bytes"]) or object(),
+        raising=False,
+    )
+    ladder = (32, 64, 128, 192, 256, 1024, 4096)
+    backend = SimpleNamespace(
+        _ep_pg=object(),
+        routing_method=SimpleNamespace(experts_per_token=8),
+        _maxt_buckets=ladder,
+        _profiling_scratch_provider_ref=None,
+        _launch_buffers={},
+        ep_size=16,
+        ep_rank=0,
+        compute_slot_count=16,
+        hidden_size=6144,
+        intermediate_size_per_partition=2048,
+        expand_intermediate_size_per_partition=4096,
+        apply_topk_in_fc1=True,
+        act_clamp=None,
+        activation_type=ActivationType.Swiglu,
+        act_alpha=None,
+        act_beta=None,
+        _use_in_kernel_fc2_reduce=lambda max_T: False,
+        combine_format="bf16",
+        _genphase_direct_input_buckets=set(),
+        _padding_drop_buckets=set(),
+        dtype=torch.bfloat16,
+        _symm_providers={},
+        tactic_autotune=False,
+    )
+    megamoe.RubinMegaMoE._alloc_symm_provider(backend)
+    generation_phase = set(runner.GEN_TOKEN_BUCKETS) & set(ladder)
+    assert backend._genphase_direct_input_buckets == generation_phase
+    assert backend._padding_drop_buckets == set(ladder) - generation_phase
+    assert providers == [2048 if bucket in generation_phase else 4096 for bucket in ladder]
+    for bucket in (64, 256):
+        properties = runner.query_rubin_kernel_properties(max_tokens_per_rank=bucket)
+        assert isinstance(properties, shared.MegaMoeKernelProperties)

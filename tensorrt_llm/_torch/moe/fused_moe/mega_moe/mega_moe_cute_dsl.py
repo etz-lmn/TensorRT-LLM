@@ -777,6 +777,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._active_launch_output_dtype: Optional[torch.dtype] = None
         # (bucket ids buffer, ids, weights, x, x_sf) written by the last fused route+quant launch.
         self._prestaged: Optional[Tuple[torch.Tensor, ...]] = None
+        # An adaptive balancer's route for the next launch, which its dispatch router maps and counts.
+        self._adaptive_route_launch: Optional[tuple] = None
         # Expert -> slot table of a static placement (built in create_weights), with copies a
         # ``replica_slot_table``, and its slot -> expert assignments.
         self._slot_of_expert: Optional[torch.Tensor] = None
@@ -1449,11 +1451,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._profiling_scratch_provider_ref = None
         self._launch_buffers.clear()
         for max_T in self._maxt_buckets:
-            (
-                shared_workspace_bytes,
-                supports_direct_inputs,
-                masks_invalid_routes,
-            ) = query_megamoe_kernel_properties(
+            properties = query_megamoe_kernel_properties(
                 world_size=self.ep_size,
                 num_topk=top_k,
                 num_experts_per_rank=self.compute_slot_count,
@@ -1478,9 +1476,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
             )
-            if supports_direct_inputs:
+            shared_workspace_bytes = properties.shared_workspace_bytes
+            if properties.supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)
-            if masks_invalid_routes:
+            if properties.masks_invalid_routes:
                 self._padding_drop_buckets.add(max_T)
             provider = get_megamoe_symm_provider(
                 process_group=self._ep_pg,
@@ -1663,18 +1662,45 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         )
         return ids, weights
 
+    def _router_launch_max_tokens(self, num_tokens: int) -> Optional[int]:
+        """The launch bucket a fused route+quant of ``num_tokens`` rows writes, or None."""
+        if self._active_launch_max_tokens is None or self.tactic_autotune or num_tokens == 0:
+            return None
+        launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
+        if num_tokens > launch_max_T or launch_max_T in self._genphase_direct_input_buckets:
+            return None
+        return launch_max_T
+
+    def routes_adaptive_in_router(self, num_tokens: int) -> bool:
+        """Whether a launch of ``num_tokens`` rows can take an adaptive balancer's routes as expert
+        ids, mapped to slots and counted by its dispatch router (either router: the one-round push
+        and the metadata push carry the same adaptive route): the model's fused route+quant writes
+        the launch bucket. Otherwise the balancer stages the slots itself."""
+        if not IS_CUTLASS_DSL_AVAILABLE or self._slot_of_expert is not None:
+            return False
+        if not self._route_quant_fuses():
+            return False
+        return self._router_launch_max_tokens(num_tokens) is not None
+
     def try_fused_route_quant(
         self,
         x: torch.Tensor,
         router_logits: torch.Tensor,
         route_counters: Optional[RouteCounters] = None,
+        adaptive_route: Optional[tuple] = None,
     ) -> Optional[MoEFusedRouteQuant]:
         """Sqrt-softplus routing and NVFP4 input quantization in one launch, written straight into
         the launch bucket's kernel inputs once the scheduler has chosen the bucket; a static
-        placement's slots go into the bucket and ``route_counters`` get the picks."""
+        placement's slots go into the bucket and ``route_counters`` get the picks. With
+        ``adaptive_route`` (an adaptive balancer's ``router_route``) the bucket keeps the expert ids,
+        which the launch's dispatch router maps and counts (``routes_mapped``)."""
         if not self._route_quant_fuses():
             return None
         bucket = self._route_quant_bucket(x.shape[0], self.routing_method.top_k, x.device, x.dtype)
+        if adaptive_route is not None and (
+            bucket is None or not self.routes_adaptive_in_router(x.shape[0])
+        ):
+            return None
         table = self._slot_of_expert
         shared_target = self._shared_activation_target(x.shape[0])
         ids, weights, x_fp4, x_sf, _ = dsv4_route_nvfp4_quant(
@@ -1695,8 +1721,26 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             self._shared_quantized = (shared_target[0], x.shape[0])
         if bucket is not None:
             self._prestaged = (bucket[0], ids, weights, x_fp4, x_sf)
+            # The activation rows are in the bucket as quantize_input leaves them, so a launch
+            # given other routes (perfect router, calibrator replay) re-stages only the routes.
+            self._quantized_into = (bucket[2].data_ptr(), x.shape[0])
+        if adaptive_route is not None:
+            table_row, rows, forwards, enabled, first = adaptive_route
+            self._adaptive_route_launch = (
+                table_row,
+                rows,
+                forwards,
+                enabled,
+                int(x.shape[0]),
+                first,
+            )
         return MoEFusedRouteQuant(
-            ids, weights, x_fp4, x_sf, routes_counted=route_counters is not None
+            ids,
+            weights,
+            x_fp4,
+            x_sf,
+            routes_counted=route_counters is not None,
+            routes_mapped=adaptive_route is not None,
         )
 
     def _route_quant_bucket(self, num_tokens: int, top_k: int, device, output_dtype):
@@ -2096,11 +2140,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 query_megamoe_kernel_properties,
             )
 
-            (
-                shared_bytes,
-                supports_direct_inputs,
-                masks_invalid_routes,
-            ) = query_megamoe_kernel_properties(
+            properties = query_megamoe_kernel_properties(
                 world_size=1,
                 num_topk=top_k,
                 num_experts_per_rank=self.compute_slot_count,
@@ -2125,15 +2165,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
                 combine_format=self.combine_format,
             )
-            if supports_direct_inputs:
+            if properties.supports_direct_inputs:
                 self._genphase_direct_input_buckets.add(max_T)
-            if masks_invalid_routes:
+            if properties.masks_invalid_routes:
                 self._padding_drop_buckets.add(max_T)
             # zeros (not empty): the leading counter prefix is an atomic-add
             # target the kernel only tail-resets for the NEXT launch, so the
             # FIRST launch needs it pre-zeroed (one-time; cached per bucket).
             staging["shared_workspace"] = torch.zeros(
-                shared_bytes, dtype=torch.uint8, device=device
+                properties.shared_workspace_bytes, dtype=torch.uint8, device=device
             )
         cached[cache_key] = staging
         return staging
@@ -2408,6 +2448,26 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             if torch.compiler.is_compiling()
             else run_cute_dsl_megamoe_nvfp4_blackwell
         )
+        # An adaptive balancer's routes staged as expert ids: the router of this launch maps and counts them.
+        adaptive_route, self._adaptive_route_launch = self._adaptive_route_launch, None
+        adaptive_kwargs = {}
+        if adaptive_route is not None:
+            table_row, rows, forwards, enabled, route_tokens, first = adaptive_route
+            word = (
+                live_rows.current_word(combine_output.device)
+                if launch_max_T in self._padding_drop_buckets
+                else live_rows.all_rows_word(combine_output.device)
+            )
+            adaptive_kwargs = dict(
+                adaptive_route_experts=int(self.num_experts),
+                adaptive_route_tables=table_row,
+                adaptive_route_rows=rows,
+                adaptive_route_forwards=forwards,
+                adaptive_route_enabled=enabled,
+                adaptive_route_live_word=word,
+                adaptive_route_tokens=int(route_tokens),
+                adaptive_route_first=bool(first),
+            )
         set_active_megamoe_cute_weight_cache(self._cute_weight_cache)
         # The provider owns its symmetric regions, so it owns their cute views.
         provider = self._symm_providers.get(launch_max_T) if staged_inputs else None
@@ -2458,6 +2518,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 helper_expert_count=_S_active,
                 hot_expert_weight_ready_flags=helper_ready_flags,
                 hot_expert_weight_ready_generation=int(helper_ready_generation),
+                **adaptive_kwargs,
             )
         finally:
             # Always clear: a raising op call must not leave the factory
