@@ -243,38 +243,12 @@ def _run() -> list:
                 )
             _assert_on_all_ranks(problem)
 
-        # A runtime install rewrites a layer's route table row in place: a graph captured on the home
-        # tables replays the replicated ones as an eager forward routes them (replica slots hold no
-        # copied weights here, so the check is replay against eager, not against the plain layer).
+        # The route tables a runtime install rewrites in place (fixed address), and a replicated version.
         tables = balancer.route_tables(device)
         home_tables = tables.clone()
         replica_tables = torch.stack(
             [_replica_row(home_tables[i].tolist()) for i in range(_LAYERS)]
         ).to(device)
-        use_router(True)
-        for rows in (64, 1024):
-            counts = [rows] * world_size
-            x = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
-            for _ in range(2):
-                adaptive[0](x, all_rank_num_tokens=counts)
-            torch.cuda.synchronize()
-            graph, slot = torch.cuda.CUDAGraph(), None
-            with torch.cuda.graph(graph):
-                slot = adaptive[0](x, all_rank_num_tokens=counts).clone()
-            tables.copy_(replica_tables)
-            torch.cuda.synchronize()
-            slot.fill_(float("nan"))
-            graph.replay()
-            torch.cuda.synchronize()
-            eager = adaptive[0](x, all_rank_num_tokens=counts).clone()
-            torch.cuda.synchronize()
-            same = torch.equal(slot, eager)
-            tables.copy_(home_tables)
-            del graph
-            _assert_on_all_ranks(
-                None if same else f"{rows} rows: the replay after an install differs from eager"
-            )
-
         # Kernels per layer call (torch profiler): the router's route launches no route op or staging.
         names = {}
         for arm, router in (("adaptive_staged", False), ("adaptive_router", True)):
@@ -343,6 +317,36 @@ def _run() -> list:
                             tables="home" if table is None else "replicas",
                         )
                     )
+        # Last, after every eager pairing has run (as the executor captures after its warmup): a graph captured
+        # on the home tables replays an install's replicated tables as an eager forward routes them (replica
+        # slots hold no copied weights here, so the check is replay against eager, not against the plain layer).
+        tables.copy_(home_tables)
+        use_router(True)
+        inputs = {}
+        for rows in (64, 1024):
+            inputs[rows] = torch.randn((rows, _HIDDEN_SIZE), dtype=torch.bfloat16)
+            for _ in range(2):
+                adaptive[0](inputs[rows], all_rank_num_tokens=[rows] * world_size)
+        torch.cuda.synchronize()
+        graphs = {}
+        for rows, x in inputs.items():
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                slot = adaptive[0](x, all_rank_num_tokens=[rows] * world_size).clone()
+            graphs[rows] = (graph, slot)
+        tables.copy_(replica_tables)
+        torch.cuda.synchronize()
+        for rows, (graph, slot) in graphs.items():
+            slot.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            eager = adaptive[0](inputs[rows], all_rank_num_tokens=[rows] * world_size).clone()
+            torch.cuda.synchronize()
+            same = torch.equal(slot, eager)
+            _assert_on_all_ranks(
+                None if same else f"{rows} rows: the replay after an install differs from eager"
+            )
+        del graphs
         tables.copy_(home_tables)
         use_router(True)
     return results
