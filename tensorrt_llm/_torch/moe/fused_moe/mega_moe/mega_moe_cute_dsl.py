@@ -779,6 +779,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._prestaged: Optional[Tuple[torch.Tensor, ...]] = None
         # An adaptive balancer's route for the next launch, which its dispatch router maps and counts.
         self._adaptive_route_launch: Optional[tuple] = None
+        # The home view (set_home_view): launches run the kernel without the balancer on the leading
+        # home_slot_count slots of the weights, as a model without adaptive EPLB does.
+        self._home_view = False
+        self._home_weights: Optional[tuple] = None
         # Expert -> slot table of a static placement (built in create_weights), with copies a
         # ``replica_slot_table``, and its slot -> expert assignments.
         self._slot_of_expert: Optional[torch.Tensor] = None
@@ -846,6 +850,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     # Compute axis
     # ------------------------------------------------------------------
     @property
+    def home_slot_count(self) -> int:
+        """Each rank's home experts: the leading local slots of an adaptive layout hold them in expert
+        order (``ExpertGeometry.home_layout``), the slot axis of a launch without the balancer."""
+        return int(self.num_experts) // int(self.ep_size)
+
+    @property
     def compute_slot_count(self) -> int:
         """Return the kernel-only slot axis ``M = H + S``.
 
@@ -854,6 +864,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         without one, M is H. Only the seven live kernel planes, symmetric
         workspace, and launch geometry use this wider axis.
         """
+        if getattr(self, "_home_view", False):
+            return self.home_slot_count
         resident_experts = int(self.expert_size_per_partition)
         layer_load_balancer = self.layer_load_balancer
         if layer_load_balancer is None or not layer_load_balancer.produces_replica_plan:
@@ -1625,8 +1637,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """Bundle the MegaMoE-format weight tensors registered by the
         quant method. ``run_moe`` calls this once per chunk so the
         kernel sees the latest dynamic-EPLB migration outcome (once
-        that path lands; currently the slots are static).
+        that path lands; currently the slots are static). In the home view,
+        the leading home_slot_count slots of each (slot-major) tensor.
         """
+        if self._home_view:
+            return self._home_weight_view()
         return MegaMoECuteDslWeightView(
             fc1_weight=self.mega_fc1_weight,
             fc1_weight_sf=self.mega_fc1_weight_sf,
@@ -1635,6 +1650,96 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             fc31_alpha=self.fc31_alpha,
             fc2_alpha=self.fc2_alpha,
             fc1_norm_const=self.fc1_norm_const,
+        )
+
+    def _home_weight_view(self) -> MegaMoECuteDslWeightView:
+        """The home view of the weights: views of the leading home_slot_count slots, made again only
+        when a weight tensor was replaced (a migration moves them once)."""
+        tensors = (
+            self.mega_fc1_weight,
+            self.mega_fc1_weight_sf,
+            self.mega_fc2_weight,
+            self.mega_fc2_weight_sf,
+            self.fc31_alpha,
+            self.fc2_alpha,
+            self.fc1_norm_const,
+        )
+        key = tuple(t.data_ptr() for t in tensors)
+        if self._home_weights is None or self._home_weights[0] != key:
+            home = self.home_slot_count
+            self._home_weights = (
+                key,
+                MegaMoECuteDslWeightView(*(t[:home] for t in tensors)),
+            )
+        return self._home_weights[1]
+
+    def set_home_view(self, on: bool) -> None:
+        """Run the following launches on the home view (no balancer, home slots) or not."""
+        self._home_view = bool(on)
+
+    def prepare_home_view(self) -> None:
+        """Make the home view ready before any forward or graph capture: check that each bucket's
+        symmetric workspace, sized for this layer's slots, holds the home view's kernel, which drops
+        padding rows alike, then launch every bucket once in the home view (compile and the one-time
+        barrier fence of its workspace pairing, outside capture). Collective over the EP group."""
+        top_k = self.routing_method.experts_per_token
+        for max_T in self._maxt_buckets:
+            slots, home = self._kernel_properties(max_T, self.compute_slot_count), self._kernel_properties(
+                max_T, self.home_slot_count
+            )
+            if home[0] > slots[0] or home[1:] != slots[1:]:
+                raise RuntimeError(
+                    f"MegaMoECuteDsl home view of bucket {max_T}: its kernel needs {home[0]} shared "
+                    f"workspace bytes and properties {home[1:]}, the bucket's provider was sized for "
+                    f"{slots[0]} bytes and {slots[1:]}"
+                )
+        device = torch.device("cuda", torch.cuda.current_device())
+        self.set_home_view(True)
+        try:
+            self._prime_ladder(
+                live_T=-1,
+                weight_view=self._build_weight_view(),
+                top_k=top_k,
+                hidden=self.hidden_size,
+                device=device,
+                output_dtype=self.dtype or torch.bfloat16,
+            )
+        finally:
+            self.set_home_view(False)
+
+    def _kernel_properties(self, max_T: int, slots: int) -> tuple:
+        """``query_megamoe_kernel_properties`` of this layer's kernel for bucket ``max_T`` and ``slots``
+        local slots: (shared workspace bytes, direct inputs, masks invalid routes)."""
+        from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+            query_megamoe_kernel_properties,
+        )
+
+        return tuple(
+            query_megamoe_kernel_properties(
+                world_size=self.ep_size,
+                num_topk=self.routing_method.experts_per_token,
+                num_experts_per_rank=int(slots),
+                hidden_size=self.hidden_size,
+                intermediate_size_per_partition=int(self.intermediate_size_per_partition),
+                expand_intermediate_size_per_partition=int(
+                    self.expand_intermediate_size_per_partition
+                ),
+                max_tokens_per_rank=max_T,
+                apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
+                gate_up_clamp=self.act_clamp,
+                swiglu_alpha=(
+                    self.act_alpha if self.activation_type is ActivationType.SwigluBias else None
+                ),
+                swiglu_beta=(
+                    self.act_beta if self.activation_type is ActivationType.SwigluBias else None
+                ),
+                situ_beta=(self.act_alpha if self.activation_type is ActivationType.SiTu else None),
+                situ_linear_beta=(
+                    self.act_beta if self.activation_type is ActivationType.SiTu else None
+                ),
+                in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_T),
+                combine_format=self.combine_format,
+            )
         )
 
     # ------------------------------------------------------------------
