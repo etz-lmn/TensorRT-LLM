@@ -9,7 +9,7 @@ cumulative_shares`` per slot, at a fixed device address). Both dispatch routers 
 statistics are the same whichever router a launch bucket uses.
 """
 
-from typing import ClassVar
+from typing import ClassVar, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -19,30 +19,16 @@ from cutlass.cutlass_dsl import Int32, Int64, T, dsl_user_op
 
 @dsl_user_op
 def _ld_nc_s32(address: Int64, *, loc=None, ip=None) -> Int32:
-    """A read-only (non-coherent cache) load: route tables the launch never writes."""
+    """A read-only (non-coherent cache) load of words no launch of the forward writes: the route tables, the
+    recording flag and the live-row word change only between launches. No side effect, so it issues with the
+    loads around it instead of in program order."""
     return Int32(
         llvm.inline_asm(
             T.i32(),
             [address.ir_value()],
             "ld.global.nc.b32 $0, [$1];",
             "=r,l",
-            has_side_effects=True,
-            asm_dialect=0,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _ld_s32(address: Int64, *, loc=None, ip=None) -> Int32:
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [address.ir_value()],
-            "ld.global.b32 $0, [$1];",
-            "=r,l",
-            has_side_effects=True,
+            has_side_effects=False,
             asm_dialect=0,
             loc=loc,
             ip=ip,
@@ -93,7 +79,8 @@ class AdaptiveRouteMixin:
         word (adaptiveEplbKernels.cu liveIdCount), none while the recording flag is clear. Thread 0 of CTA 0 also
         adds the forward to the forward count on the forward's first call."""
         _, _, forwards, enabled, word_address, num_tokens, first = adaptive
-        word = _ld_s32(word_address)
+        word = _ld_nc_s32(word_address)
+        recording = _ld_nc_s32(enabled)
         real = word & Int32(0xFFFF)
         requests = (word >> Int32(16)) & Int32(0xFFFF)
         counted_rows = num_tokens
@@ -102,7 +89,7 @@ class AdaptiveRouteMixin:
         elif real < requests:
             if num_tokens % requests == Int32(0):
                 counted_rows = num_tokens // requests * real
-        if _ld_s32(enabled) == Int32(0):
+        if recording == Int32(0):
             counted_rows = Int32(0)
         elif cta_idx == Int32(0):
             if thread_idx == Int32(0):
@@ -112,24 +99,72 @@ class AdaptiveRouteMixin:
 
     @cute.jit
     def _adaptive_pick(
-        self, adaptive: tuple, counted_rows: Int32, expert: Int32, token: Int32, ep_rank: Int32
+        self,
+        adaptive: tuple,
+        counted_rows: Int32,
+        expert: Int32,
+        token: Int32,
+        ep_rank: Int32,
+        staged: Optional[cute.Tensor] = None,
     ) -> Int32:
         """One pick of ``expert`` (a valid id) in token row ``token``: counted into the statistics row when the
-        row is counted, and routed to its slot (-1 for a malformed table entry)."""
+        row is counted, and routed to its slot (-1 for a malformed table entry); ``staged``: the table's leading
+        entries in shared memory (:meth:`_adaptive_table_load`)."""
         tables, rows = adaptive[0], adaptive[1]
         if token < counted_rows:
             _red_add_f32(rows + Int64(expert) * Int64(4), cutlass.Float32(1.0))
-        return self._adaptive_slot(tables, expert, token, ep_rank)
+        return self._adaptive_slot(tables, expert, token, ep_rank, staged)
 
     @cute.jit
-    def _adaptive_slot(self, tables: Int64, expert: Int32, token: Int32, ep_rank: Int32) -> Int32:
+    def _adaptive_table_load(self, tables: Int64, thread_idx: Int32, threads: int) -> cute.Tensor:
+        """This thread's share of the table's ``counts | starts | slots`` (one load per entry a CTA's threads
+        split), in registers: the CTA stores them to shared memory (:meth:`_adaptive_table_store`) once, so a
+        pick reads them there instead of chaining dependent global loads."""
+        entries = cute.make_rmem_tensor((self._adaptive_table_rounds(threads),), Int32)
+        for round_ in cutlass.range_constexpr(self._adaptive_table_rounds(threads)):
+            index = Int32(round_ * threads) + thread_idx
+            if index < Int32(self.adaptive_table_entries):
+                entries[round_] = _ld_nc_s32(tables + Int64(index) * Int64(4))
+        return entries
+
+    @cute.jit
+    def _adaptive_table_store(
+        self, entries: cute.Tensor, staged: cute.Tensor, thread_idx: Int32, threads: int
+    ) -> None:
+        for round_ in cutlass.range_constexpr(self._adaptive_table_rounds(threads)):
+            index = Int32(round_ * threads) + thread_idx
+            if index < Int32(self.adaptive_table_entries):
+                staged[index] = entries[round_]
+
+    @property
+    def adaptive_table_entries(self) -> int:
+        """Entries of the table a pick reads unconditionally: ``counts | starts`` per expert, ``slots``."""
+        return 2 * self.adaptive_route_experts + self.expert_count
+
+    def _adaptive_table_rounds(self, threads: int) -> int:
+        return (self.adaptive_table_entries + threads - 1) // threads
+
+    @cute.jit
+    def _adaptive_slot(
+        self,
+        tables: Int64,
+        expert: Int32,
+        token: Int32,
+        ep_rank: Int32,
+        staged: Optional[cute.Tensor] = None,
+    ) -> Int32:
         """The slot of a pick of ``expert`` (a valid id) in token row ``token``: its only copy, or for a replicated
         expert the copy whose cumulative-share range holds the pick's point (adaptive_eplb/router_route.py), -1
-        for a malformed entry. Tables: ``counts | starts`` per expert, ``slots | cumulative_shares`` per slot."""
+        for a malformed entry. Tables: ``counts | starts`` per expert, ``slots | cumulative_shares`` per slot;
+        with ``staged``, all but the shares are read from it."""
         experts = self.adaptive_route_experts
         slot_count = self.expert_count
-        copies = _ld_nc_s32(tables + Int64(expert) * Int64(4))
-        start = _ld_nc_s32(tables + (Int64(experts) + Int64(expert)) * Int64(4))
+        if cutlass.const_expr(staged is not None):
+            copies = staged[expert]
+            start = staged[Int32(experts) + expert]
+        else:
+            copies = _ld_nc_s32(tables + Int64(expert) * Int64(4))
+            start = _ld_nc_s32(tables + (Int64(experts) + Int64(expert)) * Int64(4))
         slots_base = tables + Int64(2 * experts) * Int64(4)
         shares_base = tables + Int64(2 * experts + slot_count) * Int64(4)
         slot = Int32(-1)
@@ -153,5 +188,8 @@ class AdaptiveRouteMixin:
                             if point >= bound:
                                 k = k + Int32(1)
                                 searching = cutlass.Boolean(True)
-            slot = _ld_nc_s32(slots_base + Int64(start + k) * Int64(4))
+            if cutlass.const_expr(staged is not None):
+                slot = staged[Int32(2 * experts) + start + k]
+            else:
+                slot = _ld_nc_s32(slots_base + Int64(start + k) * Int64(4))
         return slot

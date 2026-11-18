@@ -197,6 +197,7 @@ class _OneRoundRouter(AdaptiveRouteMixin, KernelComponent):
     smem_padded_region: ClassVar[str] = "nvlink.one_round.smem.padded"
     smem_prefix_region: ClassVar[str] = "nvlink.one_round.smem.prefix"
     smem_warp_totals_region: ClassVar[str] = "nvlink.one_round.smem.warp_totals"
+    smem_adaptive_table_region: ClassVar[str] = "nvlink.one_round.smem.adaptive_table"
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
@@ -318,6 +319,13 @@ class _OneRoundRouter(AdaptiveRouteMixin, KernelComponent):
         workspace.register_tensor(
             self.smem_warp_totals_region, cutlass.Int32, (self.warps_per_cta,), byte_alignment=16
         )
+        if self.adaptive_route_experts > 0:
+            workspace.register_tensor(
+                self.smem_adaptive_table_region,
+                cutlass.Int32,
+                (self.adaptive_table_entries,),
+                byte_alignment=16,
+            )
         workspace.finalize(max_bytes=48 * 1024)
         return workspace
 
@@ -595,6 +603,24 @@ class _OneRoundRouter(AdaptiveRouteMixin, KernelComponent):
         destination_count = self._smem_workspace.tensor(
             self.smem_destination_count_region, smem_base
         )
+        # Adaptive route: every load a pick depends on is issued here, ahead of the barrier below, so their
+        # latencies overlap instead of chaining after it: each lane's picks, the route table row (to shared
+        # memory, once per CTA), the recording flag and the live-row word (the rows this launch counts, none
+        # while the flag is clear; the forward count once per forward from one thread of the grid).
+        if cutlass.const_expr(self.adaptive_route_experts > 0):
+            adaptive_warp = warp_idx * Int32(self.one_round_cta_count) + cta_idx
+            picks = cute.make_rmem_tensor((self.token_rounds,), topk_indices.dtype)
+            for token_round in cutlass.range_constexpr(self.token_rounds):
+                token = adaptive_warp + Int32(token_round * self.global_warp_count)
+                if token < Int32(self.max_tokens_per_rank):
+                    if lane_idx < Int32(self.topk):
+                        picks[token_round] = topk_indices[token, lane_idx]
+            table_entries = self._adaptive_table_load(adaptive[0], thread_idx, self.threads_per_cta)
+            counted_rows = self._adaptive_counted_rows(adaptive, cta_idx, thread_idx)
+            staged_table = self._smem_workspace.tensor(self.smem_adaptive_table_region, smem_base)
+            self._adaptive_table_store(
+                table_entries, staged_table, thread_idx, self.threads_per_cta
+            )
         for zero_round in cutlass.range_constexpr(
             ceil_div(self.world_size_padded, self.threads_per_cta)
         ):
@@ -614,11 +640,6 @@ class _OneRoundRouter(AdaptiveRouteMixin, KernelComponent):
         # the grid (one SM's remote-store rate, ~50-60 GB/s, is what bounds a push).
         global_warp_idx = warp_idx * Int32(self.one_round_cta_count) + cta_idx
 
-        # Adaptive route: the rows this launch counts (the live rows of the forward's token rows, none while the
-        # recording flag is clear), and the forward count, once per forward from one thread of the grid.
-        if cutlass.const_expr(self.adaptive_route_experts > 0):
-            counted_rows = self._adaptive_counted_rows(adaptive, cta_idx, thread_idx)
-
         for token_round in cutlass.range_constexpr(self.token_rounds):
             token = global_warp_idx + Int32(token_round * self.global_warp_count)
             if token < Int32(self.max_tokens_per_rank):
@@ -626,19 +647,20 @@ class _OneRoundRouter(AdaptiveRouteMixin, KernelComponent):
                 expert = Int32(0)
                 score_bits = Int32(0)
                 if lane_idx < Int32(self.topk):
-                    raw_index = topk_indices[token, lane_idx]
                     if cutlass.const_expr(self.adaptive_route_experts > 0):
-                        # Expert ids: count the live rows' picks, then route each through the layer's tables.
+                        # Expert ids: count the live rows' picks, then route each through the staged table.
+                        raw_index = picks[token_round]
                         lane_valid = cutlass.Uint64(raw_index) < cutlass.Uint64(
                             self.adaptive_route_experts
                         )
                         expert = Int32(raw_index)
                         if lane_valid:
                             expert = self._adaptive_pick(
-                                adaptive, counted_rows, expert, token, local_rank
+                                adaptive, counted_rows, expert, token, local_rank, staged_table
                             )
                             lane_valid = expert >= Int32(0)
                     else:
+                        raw_index = topk_indices[token, lane_idx]
                         # Int64 ids; a negative one compares as a large unsigned value.
                         lane_valid = cutlass.Uint64(raw_index) < cutlass.Uint64(self.expert_count)
                         expert = Int32(raw_index)
