@@ -253,3 +253,29 @@ def test_staged_launch_drops_the_padding_rows_of_the_live_row_word(index_dtype):
         assert torch.equal(bucket[1][:live], all_rows[1][:live])
         assert (bucket[0][live:] == -1).all() and not bucket[1][live:].any(), hex(value)
         assert torch.equal(bucket[2], all_rows[2]) and torch.equal(bucket[3], all_rows[3])
+
+
+def _pending_launch_error():
+    """The launch error pending in TensorRT-LLM's CUDA runtime, which torch's checks do not see:
+    an op that checks its launches (route staging of one row) reports and clears it."""
+    ids = torch.zeros((1, TOP_K), dtype=torch.int32, device="cuda")
+    weights = torch.zeros((1, TOP_K), device="cuda")
+    try:
+        torch.ops.trtllm.megamoe_stage_routes(ids, weights, ids.clone(), weights.clone())
+    except RuntimeError as error:
+        return repr(error)
+    return None
+
+
+@torch.inference_mode()
+def test_routing_without_tokens_leaves_no_launch_error(record_property):
+    """Routing no tokens (gate_forward over an empty batch) launches nothing: no launch error is
+    left for the next op to report. Records an error pending before it, which an earlier test of
+    the module left."""
+    before = _pending_launch_error()
+    _, bias, _, _ = _inputs(0)
+    ids, weights = _routing(bias).apply(torch.empty((0, NUM_EXPERTS), device="cuda"))
+    after = _pending_launch_error()
+    record_property("pending_launch_error", f"before={before} after={after}")
+    assert ids.shape == (0, TOP_K) and weights.shape == (0, TOP_K)
+    assert before is None and after is None, (before, after)
