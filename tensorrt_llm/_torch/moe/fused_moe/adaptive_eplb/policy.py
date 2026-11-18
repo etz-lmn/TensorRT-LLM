@@ -67,6 +67,9 @@ class TimeModel:
     CUDA graph bucket, ascending by the rows a GPU's tokens route per forward in it (:meth:`at`);
     empty, the fields hold at every size. ``buckets`` holds, alike, ``(rows, ((field, value), ...))``:
     every field a bucket's warm-up fit sets (:mod:`.calibration`); it takes precedence over ``scales``.
+    A fitted bucket also sets ``covariance``, the flattened covariance of :attr:`COVARIED` (us at
+    scale 1), and ``gain_z``: :func:`resolved_gains` keeps a predicted gain only above ``gain_z``
+    standard errors of it. Without them (a built-in model) every gain stands.
     """
 
     per_active_slot_us: float
@@ -79,6 +82,10 @@ class TimeModel:
     route_us: float = 0.0
     time_shares: bool = False
     buckets: tuple[tuple[float, tuple[tuple[str, float], ...]], ...] = ()
+    covariance: tuple[float, ...] = ()
+    gain_z: float = 0.0
+
+    COVARIED = ("per_active_slot_us", "per_extra_tile_us", "per_row_us", "hot_slot_extra_tile_us", "route_us")
 
     def at(self, rows: float) -> TimeModel:
         """The model of the smallest bucket of at least ``rows`` rows per GPU per forward, the
@@ -394,6 +401,58 @@ def evaluate_gains(
         return moe + model.route_us * ((layout >= 0).sum(1) > geometry.num_experts)
 
     return (time_us(layout, shares) - time_us(new_layout, new_shares)) / 1e3
+
+
+def _busiest_features(rows: np.ndarray, layout: np.ndarray, model: TimeModel, geometry: ExpertGeometry) -> np.ndarray:
+    """``[L, 5]`` the :attr:`TimeModel.COVARIED` features of every layer's busiest GPU (scale 1): its
+    active slots, tiles beyond each slot's first, rows, tiles beyond its busiest slot's first, and
+    whether the layer holds a replica."""
+    gpu = rows.reshape(rows.shape[0], geometry.ep_size, -1)
+    tiles = np.ceil(gpu / float(model.tile_rows))
+    f = np.stack(
+        [
+            (gpu > 0).sum(2),
+            np.maximum(tiles - 1.0, 0.0).sum(2),
+            gpu.sum(2),
+            np.maximum(tiles.max(2) - 1.0, 0.0),
+        ],
+        2,
+    )
+    costs = np.array([getattr(model, k) for k in model.COVARIED[:4]])
+    busiest = np.argmax(f @ costs, 1)
+    out = f[np.arange(len(f)), busiest]
+    replica = ((layout >= 0).sum(1) > geometry.num_experts).astype(np.float64)
+    return np.concatenate([out, replica[:, None]], 1)
+
+
+def gain_standard_error(
+    load: np.ndarray,
+    layout: np.ndarray,
+    shares: np.ndarray,
+    new_layout: np.ndarray,
+    new_shares: np.ndarray,
+    model: TimeModel,
+    geometry: ExpertGeometry,
+) -> np.ndarray | None:
+    """``[L]`` standard error in ms of :func:`evaluate_gains`' gains from the model's coefficient
+    covariance: the variance of the difference of the two predictions, whose errors share the
+    coefficients (the busiest GPUs held), so it is far below either prediction's error. None without
+    a covariance."""
+    if not model.covariance or not len(load):
+        return None
+    before = _busiest_features(slot_rows(load, layout, shares), layout, model, geometry)
+    after = _busiest_features(slot_rows(load, new_layout, new_shares), new_layout, model, geometry)
+    d = (before - after) * np.array([model.scale] * 4 + [1.0])
+    cov = np.asarray(model.covariance, dtype=np.float64).reshape(5, 5)
+    return np.sqrt(np.maximum(np.einsum("li,ij,lj->l", d, cov, d), 0.0)) / 1e3
+
+
+def resolved_gains(gains: np.ndarray, errors: np.ndarray | None, model: TimeModel) -> np.ndarray:
+    """``gains`` where they exceed ``model.gain_z`` standard ``errors``, else 0: a plan whose gain
+    the model cannot tell from none installs nothing (all of them without errors)."""
+    if errors is None:
+        return gains
+    return np.where(gains > model.gain_z * errors, gains, 0.0)
 
 
 def choose_layers_to_install(

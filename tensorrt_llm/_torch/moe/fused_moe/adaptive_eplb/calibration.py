@@ -61,6 +61,9 @@ class CalibrationConfig:
       bucket whose hold-out scale differs by more than 3 standard errors).
     * ``warm``, ``timed``, ``reps``: launches before timing, launches per timing, passes.
     * ``max_iterations``: alternations of busiest-GPU assignment and least squares in one fit.
+    * ``gain_z``: standard errors of a predicted gain (new layout minus current, from the bucket's
+      coefficient covariance) the gain must exceed for the layer to install (:attr:`TimeModel.gain_z`);
+      the same 3 standard errors as ``z``.
     """
 
     enabled: bool = True
@@ -75,6 +78,7 @@ class CalibrationConfig:
     reps: int = 2
     max_iterations: int = 50
     seed: int = 0
+    gain_z: float = 3.0
 
 
 class Geometry(NamedTuple):
@@ -281,6 +285,22 @@ def fit_max(f: np.ndarray, y: np.ndarray, start: np.ndarray, iterations: int) ->
     return w
 
 
+def covariance(f: np.ndarray, y: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """``[d, d]`` covariance of the costs ``w[1:]`` of :func:`fit_max`'s fit: the least squares on the
+    busiest GPUs at ``w``, the residual variance times the inverse normal matrix of the coefficients
+    the fit left free (a cost the non-negativity pinned at 0 is held there: no variance)."""
+    busiest = np.argmax(f @ w[1:], 1)
+    a = np.concatenate([np.ones((len(y), 1)), f[np.arange(len(y)), busiest]], 1)
+    free = np.r_[True, w[1:] > 0.0]
+    dof = len(y) - int(free.sum())
+    out = np.zeros((a.shape[1], a.shape[1]))
+    if dof > 0:
+        resid = y - a @ w
+        sub = a[:, free]
+        out[np.ix_(free, free)] = float(resid @ resid) / dof * np.linalg.pinv(sub.T @ sub)
+    return out[1:, 1:]
+
+
 def predict(w: np.ndarray, f: np.ndarray) -> np.ndarray:
     return w[0] + (f @ w[1:]).max(1)
 
@@ -352,9 +372,17 @@ def fit_bucket(
     terms = {}
     if not why:
         c = dict(zip(FEATURES, w[1:5].tolist()))
+        cov = covariance(f if remote["resolved"] else f[..., :4], y, w)
         if remote["resolved"]:  # the route op spreads every source's rows alike: (ep - 1) / ep remote
             c["per_row_us"] += w[5] * (g.ep - 1) / g.ep
+            fold = np.eye(4, 5)
+            fold[2, 4] = (g.ep - 1) / g.ep
+            cov = fold @ cov @ fold.T
+        full = np.zeros((5, 5))  # the four kernel costs and route_us, in TimeModel.COVARIED order
+        full[:4, :4] = cov
+        full[4, 4] = route["se"] ** 2 if route["resolved"] else 0.0
         terms = dict(c, scale=1.0, route_us=route["route_us"], time_shares=True)
+        terms.update(covariance=tuple(full.ravel().tolist()), gain_z=cfg.gain_z)
     return BucketFit(rows, not why, why, terms, rmse, own_rmse, remote, route, len(y))
 
 
@@ -395,7 +423,7 @@ def time_model_of(table: dict | None, fallback: TimeModel) -> TimeModel:
     not accepted keeps the fallback's fields, as does every size without a table."""
     if not table or not any(b["accepted"] for b in table["buckets"]):
         return fallback
-    keep = {k: getattr(fallback, k) for k in (*FEATURES, "scale", "route_us", "time_shares")}
+    keep = {k: getattr(fallback, k) for k in (*FEATURES, "scale", "route_us", "time_shares", "covariance", "gain_z")}
     rows = [
         (float(b["rows"]), tuple(sorted((b["terms"] if b["accepted"] else keep).items())))
         for b in table["buckets"]

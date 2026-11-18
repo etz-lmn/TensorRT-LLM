@@ -43,7 +43,9 @@ from .policy import (
     build_route_tables,
     choose_layers_to_install,
     evaluate_gains,
+    gain_standard_error,
     plan_layout,
+    resolved_gains,
     solve_shares,
 )
 
@@ -278,7 +280,10 @@ class _Decider:
             old = (load, installed, self.shares[planned])
             refresh &= evaluate_gains(*old, installed, resolved, model, geometry) > 0.0
         current = (rows[planned], installed, np.where(refresh[:, None], resolved, old[2]))
+        # A plan gains only what the model can tell from no gain (:func:`resolved_gains`).
         gains = evaluate_gains(*current, new_layout, new_shares, model, geometry)
+        errors = gain_standard_error(*current, new_layout, new_shares, model, geometry)
+        gains = resolved_gains(gains, errors, model)
         # A layer's copy: its busiest receiving GPU's replicas at the lower median of the copy times per
         # replica of every timed copy (one slow copy prices nothing out; the start-up one counts). Not only
         # those within the steps left: installs are rarer than that, which left the start-up copy, timed
@@ -296,6 +301,8 @@ class _Decider:
         # Both candidates must also gain on that window, and the plan beat the home layout there.
         earlier = (previous_load, *current[1:])
         plan_gains = evaluate_gains(*earlier, new_layout, new_shares, model, geometry)
+        plan_errors = gain_standard_error(*earlier, new_layout, new_shares, model, geometry)
+        plan_gains = resolved_gains(plan_gains, plan_errors, model)
         back_gains = evaluate_gains(*earlier, home, home_shares, model, geometry)
         to_home |= (home_gains > 0.0) & (back_gains * left >= plan_gains * left - copy)
         gains, home_gains = np.minimum(gains, plan_gains), np.minimum(home_gains, back_gains)

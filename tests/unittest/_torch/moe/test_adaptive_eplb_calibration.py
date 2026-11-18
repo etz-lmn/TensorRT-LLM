@@ -162,3 +162,29 @@ def test_policy_uses_time_shares_with_the_fitted_model():
     by_rows = solve_shares(load, layout, geometry)
     by_time = solve_shares(load, layout, geometry, small)
     assert by_rows.shape == by_time.shape == (geometry.num_slots,)
+
+
+def test_a_gain_inside_its_standard_error_installs_nothing():
+    from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
+        gain_standard_error,
+        resolved_gains,
+    )
+
+    designs = cal.make_designs(G, CFG, (G.tokens,))
+    fit = cal.fit_bucket(G, designs, times(designs, np.random.default_rng(5), noise=2.0), BUILT_IN, CFG)
+    model = cal.time_model_of(cal.make_table([fit], {}), BUILT_IN).at(1.0)
+    assert len(model.covariance) == 25 and model.gain_z == CFG.gain_z
+    geometry = ExpertGeometry(num_experts=G.ep * G.homes, num_slots=G.ep * G.local_slots, ep_size=G.ep)
+    home = geometry.home_layout()
+    new = home.copy()
+    new[G.local_slots + G.homes] = 0
+    load = np.full((2, geometry.num_experts), 8.0)
+    load[1, 0] = 600.0  # layer 1: expert 0 is hot
+    shares = (home >= 0).astype(float)
+    new_shares = (new >= 0).astype(float)
+    layouts = np.stack([home, home]), np.stack([new, new])
+    se = gain_standard_error(load, layouts[0], np.stack([shares] * 2), layouts[1], np.stack([new_shares] * 2), model, geometry)
+    assert se.shape == (2,) and (se >= 0).all()
+    gains = np.array([0.5 * model.gain_z * se[0], 2.0 * model.gain_z * se[1] + 1e-9])
+    assert (resolved_gains(gains, se, model) == np.array([0.0, gains[1]])).all()
+    assert gain_standard_error(load, *layouts[:1], np.stack([shares] * 2), layouts[1], np.stack([new_shares] * 2), BUILT_IN, geometry) is None
