@@ -860,7 +860,9 @@ def test_statistics_count_only_inside_the_windows_the_runtime_schedules(host_cud
     balancer = manager()
     flag = balancer.recording_flag("cpu")
     balancer.observe_scheduled_batch(4, True, False, lambda start, stop: (0, 0, 0))
-    assert balancer.recording and flag.item() == 0, "no window is open before the runtime opens one"
+    assert balancer.recording and flag.item() == 1, (
+        "without a runtime every recorded forward counts"
+    )
     seen, clock, _, ranks = spied_ranks(monkeypatch)
     runtime = ranks[0]
     runtime.on_window = balancer._set_window_open

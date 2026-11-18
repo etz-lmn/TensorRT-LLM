@@ -411,8 +411,10 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         self.off_reason: str | None = None
         # Whether the forwards now running record their routes.
         self.recording = False
-        # Whether the runtime's window is open: the device flag counts only while both hold.
-        self.window_open = False
+        # Whether a window is open: the device flag counts only while this and ``recording`` hold.
+        # Without a runtime no window is scheduled and every recorded forward counts; the runtime
+        # closes and opens windows on its own schedule (``on_window``).
+        self.window_open = True
         self._recording_flag: torch.Tensor | None = None
         self._flag_value = 0
         self._route_tables: torch.Tensor | None = None
@@ -581,7 +583,9 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         """The ``[1]`` int32 flag the statistics read: set for generation steps outside warmup
         while the runtime's window is open (:meth:`_sync_recording_flag`)."""
         if self._recording_flag is None:
-            self._recording_flag = torch.full((1,), self._flag_value, dtype=torch.int32, device=device)
+            self._recording_flag = torch.full(
+                (1,), self._flag_value, dtype=torch.int32, device=device
+            )
         return self._recording_flag
 
     def observe_scheduled_batch(
