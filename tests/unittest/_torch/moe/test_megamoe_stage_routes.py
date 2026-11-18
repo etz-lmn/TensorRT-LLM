@@ -586,11 +586,27 @@ kwargs = dict(world_size=32, local_rank=0, num_topk=6, num_experts_per_rank=16, 
               combine_format="16e2m1xbf16", tactic_autotune=False, helper_expert_count=0)
 if {adaptive_route_experts}:
     kwargs["adaptive_route_experts"] = {adaptive_route_experts}
+# The kernel builder reads the device's limits through the driver: it needs this process's CUDA context.
+torch.cuda.set_device(0)
+torch.zeros(1, device="cuda")
+out = pathlib.Path({str(out_dir)!r})
+out.mkdir(parents=True, exist_ok=True)
+import cutlass.cute as cute
+_compile = cute.compile
+class _KeepCode:
+    # cute.compile with the DSL's keep-PTX / keep-cubin dump of every kernel it builds into `out`.
+    keep = " --keep-ptx --keep-cubin --dump-dir " + str(out)
+    def _with(self, fn):
+        return lambda *a, **k: fn(*a, **dict(k, options=(k.get("options", "") + self.keep).strip()))
+    def __getitem__(self, item):
+        return self._with(_compile[item])
+    def __call__(self, *a, **k):
+        return self._with(_compile)(*a, **k)
+cute.compile = _KeepCode()
 runner = op._megamoe_get_runner(**kwargs)
 tactic = op._default_megamoe_tactic_for_key(runner._tactic_lookup_key(), num_tokens={tokens})
 kernel = runner._build_kernel_once(tactic)
 kernel.aot_compile()
-out = pathlib.Path({str(out_dir)!r})
 digests = {{}}
 for f in sorted(out.rglob("*")):
     if f.suffix == ".ptx":
