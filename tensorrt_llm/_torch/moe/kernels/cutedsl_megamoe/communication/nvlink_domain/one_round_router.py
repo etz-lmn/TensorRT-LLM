@@ -142,6 +142,67 @@ def _st_release_sys_s32(address: Int64, value: Int32, *, loc=None, ip=None) -> N
 
 
 @dsl_user_op
+def _ld_nc_s32(address: Int64, *, loc=None, ip=None) -> Int32:
+    """A read-only (non-coherent cache) load: route tables the launch never writes."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [address.ir_value()],
+            "ld.global.nc.b32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_s32(address: Int64, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [address.ir_value()],
+            "ld.global.b32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _red_add_f32(address: Int64, value: cutlass.Float32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), value.ir_value()],
+        "red.relaxed.gpu.global.add.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _red_add_u64(address: Int64, value: Int64, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), value.ir_value()],
+        "red.relaxed.gpu.global.add.u64 [$0], $1;",
+        "l,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def fence_proxy_async_global(*, loc=None, ip=None) -> None:
     """Order this thread's earlier generic-proxy acquires before its later async-proxy (TMA) reads."""
     llvm.inline_asm(
@@ -169,6 +230,11 @@ class _OneRoundRouter(KernelComponent):
     wait_sleep_cycles: ClassVar[int] = 64
     # Records per chunk the sorter keeps in registers between its two passes (the rest re-read with a scratch slot).
     sort_keep: ClassVar[int] = 8
+    # Adaptive route (``adaptive_route_experts`` > 0): the multipliers of the point that picks a replicated expert's
+    # copy, as adaptive_eplb/router_route.py defines them (its K_EXPERT, K_RANK, K_TOKEN).
+    adaptive_expert_multiplier: ClassVar[int] = 0x632BE5AB
+    adaptive_rank_multiplier: ClassVar[int] = 0x85EBCA6B
+    adaptive_token_multiplier: ClassVar[int] = 0x9E3779B9
 
     # Symmetric regions: sources write them through the peer pointer mapper.
     inbox_records_region: ClassVar[str] = "nvlink.one_round.inbox_records"
@@ -214,6 +280,9 @@ class _OneRoundRouter(KernelComponent):
         return {
             "token_padding_block": int,
             "one_round_cta_count": OptionalRequirement(int),
+            # > 0: the staged ids are this many experts' ids, which the router maps to slots through an adaptive
+            # load balancer's route tables and counts into its statistics (adaptive_eplb/router_route.py).
+            "adaptive_route_experts": OptionalRequirement(int),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -227,6 +296,7 @@ class _OneRoundRouter(KernelComponent):
         self.apply_topk_at_fc1 = problem_desc["apply_topk_at_fc1"]
         self.token_padding_block = impl_desc["token_padding_block"]
         self.one_round_cta_count = int(impl_desc.get("one_round_cta_count", 2))
+        self.adaptive_route_experts = int(impl_desc.get("adaptive_route_experts", 0) or 0)
         self._validate_configuration()
 
         self.experts_per_rank = self.expert_count // self.world_size
@@ -266,6 +336,8 @@ class _OneRoundRouter(KernelComponent):
             raise NotImplementedError("One-round dispatch packs the local expert into 10 bits.")
         if (self.hidden_size * int(self.quant_kind.activation_dtype.width) // 8) % 16 != 0:
             raise ValueError("One-round dispatch moves activation rows in 16-byte vectors.")
+        if not 0 <= self.adaptive_route_experts <= self.expert_count:
+            raise ValueError("An adaptive route maps at most as many experts as there are slots.")
 
     def worst_case_padded_tokens(self, block: int) -> int:
         """Same pool bound as ``_MetadataPushRouter.worst_case_padded_tokens``."""
@@ -477,9 +549,19 @@ class _OneRoundRouter(KernelComponent):
         peer_rank_ptr_mapper_host,
         device_workspace: DeviceWorkspace,
         stream: cuda.CUstream,
+        adaptive_route: Optional[tuple] = None,
     ) -> None:
         """Launch the push + sort grid. Not PDL: it starts after its predecessor completed, so it may read the
-        staged top-k and activation at entry; it releases the MoE kernel at entry like the metadata-push router."""
+        staged top-k and activation at entry; it releases the MoE kernel at entry like the metadata-push router.
+
+        ``adaptive_route`` (iff ``adaptive_route_experts`` > 0): the device addresses of the layer's packed route
+        table row, its statistics row (float32 per expert) and forward count (int64), the recording flag (int32)
+        and the forward's live-row word (int32), then the forward's token rows and whether it is the forward's
+        first call (Int32 each)."""
+        if cutlass.const_expr((adaptive_route is not None) != (self.adaptive_route_experts > 0)):
+            raise ValueError("adaptive_route is passed iff the router is built with adaptive_route_experts")
+        if cutlass.const_expr(adaptive_route is None):
+            adaptive_route = (None,) * 7
         kernel = self._kernel(
             topk_indices,
             topk_scores,
@@ -490,6 +572,7 @@ class _OneRoundRouter(KernelComponent):
             shared_workspace,
             peer_rank_ptr_mapper_host.make_device_object(),
             device_workspace,
+            *adaptive_route,
         )
         kernel.launch(
             grid=[self.one_round_cta_count, 1, 1],
@@ -510,6 +593,13 @@ class _OneRoundRouter(KernelComponent):
         shared_workspace: cute.Pointer,
         peer_rank_ptr_mapper: SymmetricBufferDevice,
         device_workspace: DeviceWorkspace,
+        adaptive_tables: Optional[Int64],
+        adaptive_rows: Optional[Int64],
+        adaptive_forwards: Optional[Int64],
+        adaptive_enabled: Optional[Int64],
+        adaptive_live_word: Optional[Int64],
+        adaptive_num_tokens: Optional[Int32],
+        adaptive_first: Optional[Int32],
     ) -> None:
         cute.arch.griddepcontrol_launch_dependents()
         thread_idx, _, _ = cute.arch.thread_idx()
@@ -534,6 +624,15 @@ class _OneRoundRouter(KernelComponent):
             thread_idx,
             warp_idx,
             lane_idx,
+            (
+                adaptive_tables,
+                adaptive_rows,
+                adaptive_forwards,
+                adaptive_enabled,
+                adaptive_live_word,
+                adaptive_num_tokens,
+                adaptive_first,
+            ),
         )
         if cta_idx == Int32(0):
             self._sort(device_workspace, smem_base, thread_idx, warp_idx, lane_idx)
@@ -554,6 +653,7 @@ class _OneRoundRouter(KernelComponent):
         thread_idx: Int32,
         warp_idx: Int32,
         lane_idx: Int32,
+        adaptive: tuple,
     ) -> None:
         destination_count = self._smem_workspace.tensor(
             self.smem_destination_count_region, smem_base
@@ -577,6 +677,26 @@ class _OneRoundRouter(KernelComponent):
         # the grid (one SM's remote-store rate, ~50-60 GB/s, is what bounds a push).
         global_warp_idx = warp_idx * Int32(self.one_round_cta_count) + cta_idx
 
+        # Adaptive route: the rows this launch counts (the live rows of the forward's token rows, none while the
+        # recording flag is clear), and the forward count, once per forward from one thread of the grid.
+        if cutlass.const_expr(self.adaptive_route_experts > 0):
+            tables, rows, forwards, enabled, word_address, num_tokens, first = adaptive
+            word = _ld_s32(word_address)
+            real = word & Int32(0xFFFF)
+            requests = (word >> Int32(16)) & Int32(0xFFFF)
+            counted_rows = num_tokens
+            if requests == Int32(0):
+                counted_rows = Int32(0)
+            elif real < requests:
+                if num_tokens % requests == Int32(0):
+                    counted_rows = num_tokens // requests * real
+            if _ld_s32(enabled) == Int32(0):
+                counted_rows = Int32(0)
+            elif cta_idx == Int32(0):
+                if thread_idx == Int32(0):
+                    if first != Int32(0):
+                        _red_add_u64(forwards, Int64(1))
+
         for token_round in cutlass.range_constexpr(self.token_rounds):
             token = global_warp_idx + Int32(token_round * self.global_warp_count)
             if token < Int32(self.max_tokens_per_rank):
@@ -585,9 +705,21 @@ class _OneRoundRouter(KernelComponent):
                 score_bits = Int32(0)
                 if lane_idx < Int32(self.topk):
                     raw_index = topk_indices[token, lane_idx]
-                    # Int64 ids; a negative one compares as a large unsigned value.
-                    lane_valid = cutlass.Uint64(raw_index) < cutlass.Uint64(self.expert_count)
-                    expert = Int32(raw_index)
+                    if cutlass.const_expr(self.adaptive_route_experts > 0):
+                        # Expert ids: count the live rows' picks, then route each through the layer's tables.
+                        lane_valid = cutlass.Uint64(raw_index) < cutlass.Uint64(
+                            self.adaptive_route_experts
+                        )
+                        expert = Int32(raw_index)
+                        if lane_valid:
+                            if token < counted_rows:
+                                _red_add_f32(rows + Int64(expert) * Int64(4), cutlass.Float32(1.0))
+                            expert = self._adaptive_slot(tables, expert, token, local_rank)
+                            lane_valid = expert >= Int32(0)
+                    else:
+                        # Int64 ids; a negative one compares as a large unsigned value.
+                        lane_valid = cutlass.Uint64(raw_index) < cutlass.Uint64(self.expert_count)
+                        expert = Int32(raw_index)
                     if cutlass.const_expr(self.apply_topk_at_fc1):
                         score_bits = _f32_as_s32(cutlass.Float32(topk_scores[token, lane_idx]))
                 destination = expert // Int32(self.experts_per_rank)
@@ -663,6 +795,39 @@ class _OneRoundRouter(KernelComponent):
                     peer_rank_ptr_mapper.map(count_address, destination, Int64(0)),
                     epoch_tag | (destination_count[destination] + Int32(1)),
                 )
+
+    @cute.jit
+    def _adaptive_slot(self, tables: Int64, expert: Int32, token: Int32, ep_rank: Int32) -> Int32:
+        """The slot of a pick of ``expert`` (a valid id) in token row ``token``: its only copy, or for a replicated
+        expert the copy whose cumulative-share range holds the pick's point (adaptive_eplb/router_route.py), -1
+        for a malformed entry. Tables: ``counts | starts`` per expert, ``slots | cumulative_shares`` per slot."""
+        experts = self.adaptive_route_experts
+        slot_count = self.expert_count
+        copies = _ld_nc_s32(tables + Int64(expert) * Int64(4))
+        start = _ld_nc_s32(tables + (Int64(experts) + Int64(expert)) * Int64(4))
+        slots_base = tables + Int64(2 * experts) * Int64(4)
+        shares_base = tables + Int64(2 * experts + slot_count) * Int64(4)
+        slot = Int32(-1)
+        if copies > Int32(0) and start >= Int32(0) and start + copies <= Int32(slot_count):
+            k = Int32(0)
+            if copies > Int32(1):
+                point = (
+                    cutlass.Uint32(expert) * cutlass.Uint32(self.adaptive_expert_multiplier)
+                    + cutlass.Uint32(ep_rank) * cutlass.Uint32(self.adaptive_rank_multiplier)
+                    + cutlass.Uint32(token) * cutlass.Uint32(self.adaptive_token_multiplier)
+                )
+                searching = cutlass.Boolean(True)
+                while searching:
+                    searching = cutlass.Boolean(False)
+                    if k < copies - Int32(1):
+                        bound = cutlass.Uint32(_ld_nc_s32(shares_base + Int64(start + k) * Int64(4)))
+                        # A bound of 2^32 - 1 ends the range: no point passes it.
+                        if bound != cutlass.Uint32(0xFFFFFFFF):
+                            if point >= bound:
+                                k = k + Int32(1)
+                                searching = cutlass.Boolean(True)
+            slot = _ld_nc_s32(slots_base + Int64(start + k) * Int64(4))
+        return slot
 
     @cute.jit
     def _push_row(

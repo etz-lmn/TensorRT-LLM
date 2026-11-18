@@ -1709,7 +1709,10 @@ class TokenCommNonDeterministic(KernelComponent):
         activation: Optional[cute.Tensor] = None,
         activation_sf: Optional[cute.Tensor] = None,
         activation_scales: Optional[cute.Tensor] = None,
+        adaptive_route: Optional[tuple] = None,
     ) -> None:
+        if cutlass.const_expr(adaptive_route is not None and not self.one_round_dispatch):
+            raise ValueError("An adaptive route runs in the one-round router only.")
         if cutlass.const_expr(self.one_round_dispatch):
             self._router.launch_router(
                 topk_indices,
@@ -1722,6 +1725,7 @@ class TokenCommNonDeterministic(KernelComponent):
                 peer_rank_ptr_mapper_host,
                 device_workspace,
                 stream,
+                adaptive_route,
             )
         else:
             self._router.launch_router(

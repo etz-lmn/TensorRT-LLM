@@ -1206,6 +1206,9 @@ def _construct_megamoe_kernel(
         "token_back_ready_granularity": str(common.get("token_back_ready_granularity", "expert")),
         "reduce_topk_in_kernel": bool(common["in_kernel_fc2_reduce"]),
     }
+    if common.get("adaptive_route_experts"):
+        # Only an adaptive-route build carries the key: every other build keeps its descriptor.
+        impl_values["adaptive_route_experts"] = int(common["adaptive_route_experts"])
     if sm_version == 107:
         impl_values.update(
             mma_instruction_mnk=(
@@ -2604,6 +2607,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             shared_intermediate_size: Optional[int] = None,
             shared_gate_up_clamp: Optional[float] = None,
             helper_expert_count: int = 0,
+            adaptive_route_experts: int = 0,
         ) -> None:
             super().__init__()
             if (sm_version := get_sm_version()) not in (100, 103, 107):
@@ -2677,6 +2681,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # Set by the op right after construction; never a codegen input.
             self._helper_ready_flags = None
             self._helper_ready_generation = 0
+            # > 0: the router maps and counts an adaptive load balancer's routes of this many experts
+            # (codegen-changing, so in unique_id(), not in the tactic key: the tactic tables stay shared).
+            self.adaptive_route_experts = int(adaptive_route_experts)
+            # Per-launch adaptive route bundle (tensors, token rows, first call); set by the op per call.
+            self._adaptive_route = None
 
         def unique_id(self):
             # local_rank is intentionally excluded: every EP rank must run the
@@ -2691,6 +2700,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
         def _build_unique_id(self):
             key = self._tactic_lookup_key()
+            if self.adaptive_route_experts:
+                key = (*key, ("adaptive_route", self.adaptive_route_experts))
             if self.shared_intermediate_size is not None:
                 key = (
                     *key,
@@ -2993,6 +3004,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 shared_intermediate_size=self.shared_intermediate_size,
                 shared_gate_up_clamp=self.shared_gate_up_clamp,
                 helper_expert_count=self.helper_expert_count,
+                adaptive_route_experts=self.adaptive_route_experts,
                 **_LOCKED_KERNEL_KWARGS,
             )
             kernel, rejection = _construct_megamoe_kernel(
@@ -3375,6 +3387,24 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 runtime_kwargs["hot_expert_weight_ready_generation"] = cutlass.Uint64(
                     int(self._helper_ready_generation)
                 )
+            if self.adaptive_route_experts:
+                if self._adaptive_route is None:
+                    raise RuntimeError(
+                        "MegaMoE-CuteDSL: an adaptive-route kernel needs the layer's adaptive route; got None."
+                    )
+                tables, rows, forwards, enabled, live_word, route_tokens, first = self._adaptive_route
+                for name, tensor, dtype in (
+                    ("tables", tables, torch.int32),
+                    ("rows", rows, torch.float32),
+                    ("forwards", forwards, torch.int64),
+                    ("enabled", enabled, torch.int32),
+                    ("live_word", live_word, torch.int32),
+                ):
+                    if tensor.dtype != dtype or not tensor.is_cuda or not tensor.is_contiguous():
+                        raise RuntimeError(f"MegaMoE-CuteDSL: adaptive route {name} must be contiguous CUDA {dtype}")
+                    runtime_kwargs[f"adaptive_route_{name}"] = cutlass.Int64(tensor.data_ptr())
+                runtime_kwargs["adaptive_route_num_tokens"] = cutlass.Int32(int(route_tokens))
+                runtime_kwargs["adaptive_route_first"] = cutlass.Int32(1 if first else 0)
             # unique_id() includes helper_expert_count, separating cached ABIs.
             cached = self.__class__.kernel_cache.get(cache_key)
             if cached is None:
@@ -3428,6 +3458,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count,
         shared_intermediate_size=None,
         shared_gate_up_clamp=None,
+        adaptive_route_experts=0,
     ):
         """Reuse a runner by its complete constructor key.
 
@@ -3455,6 +3486,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             helper_expert_count,
             shared_intermediate_size,
             shared_gate_up_clamp,
+            adaptive_route_experts,
         )
 
         def _make():
@@ -3480,6 +3512,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 helper_expert_count=helper_expert_count,
                 shared_intermediate_size=shared_intermediate_size,
                 shared_gate_up_clamp=shared_gate_up_clamp,
+                adaptive_route_experts=adaptive_route_experts,
             )
 
         # A runner that may profile owns profiling scratch, so tuning-mode calls
@@ -3549,6 +3582,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        # Adaptive route tail (all or none): the router maps ``adaptive_route_experts`` experts' staged ids
+        # through the layer's packed route table row and adds the live rows' picks to its statistics row and
+        # forward count while ``adaptive_route_enabled`` is set (adaptive_eplb/router_route.py).
+        adaptive_route_experts: int = 0,
+        adaptive_route_tables: Optional[torch.Tensor] = None,
+        adaptive_route_rows: Optional[torch.Tensor] = None,
+        adaptive_route_forwards: Optional[torch.Tensor] = None,
+        adaptive_route_enabled: Optional[torch.Tensor] = None,
+        adaptive_route_live_word: Optional[torch.Tensor] = None,
+        adaptive_route_tokens: int = 0,
+        adaptive_route_first: bool = True,
     ) -> None:
         """Run the fused MegaMoE CuteDSL NVFP4 kernel.
 
@@ -3616,6 +3660,22 @@ if IS_MEGAMOE_OP_AVAILABLE:
             helper_expert_count,
             shared_intermediate_size=shared_intermediate_size,
             shared_gate_up_clamp=shared_gate_up_clamp,
+            adaptive_route_experts=adaptive_route_experts,
+        )
+        # The adaptive route belongs to this launch too.
+        adaptive_route = (
+            adaptive_route_tables,
+            adaptive_route_rows,
+            adaptive_route_forwards,
+            adaptive_route_enabled,
+            adaptive_route_live_word,
+        )
+        if adaptive_route_experts and any(tensor is None for tensor in adaptive_route):
+            raise ValueError("an adaptive-route launch needs every adaptive_route_* tensor")
+        runner._adaptive_route = (
+            (*adaptive_route, int(adaptive_route_tokens), bool(adaptive_route_first))
+            if adaptive_route_experts
+            else None
         )
         # READY inputs belong to this launch. Never regenerate them or retain stale
         # values across calls, even when the runner itself is cached.
@@ -3730,7 +3790,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
     # and skip the custom-op dispatch; traced code must use the registered op.
     cute_dsl_megamoe_nvfp4_blackwell = torch.library.custom_op(
         "trtllm::cute_dsl_megamoe_nvfp4_blackwell",
-        mutates_args=("combine_output", "shared_workspace"),
+        mutates_args=(
+            "combine_output",
+            "shared_workspace",
+            "adaptive_route_rows",
+            "adaptive_route_forwards",
+        ),
         device_types="cuda",
     )(run_cute_dsl_megamoe_nvfp4_blackwell)
 
@@ -3785,5 +3850,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        # Adaptive route tail (all or none): the router maps ``adaptive_route_experts`` experts' staged ids
+        # through the layer's packed route table row and adds the live rows' picks to its statistics row and
+        # forward count while ``adaptive_route_enabled`` is set (adaptive_eplb/router_route.py).
+        adaptive_route_experts: int = 0,
+        adaptive_route_tables: Optional[torch.Tensor] = None,
+        adaptive_route_rows: Optional[torch.Tensor] = None,
+        adaptive_route_forwards: Optional[torch.Tensor] = None,
+        adaptive_route_enabled: Optional[torch.Tensor] = None,
+        adaptive_route_live_word: Optional[torch.Tensor] = None,
+        adaptive_route_tokens: int = 0,
+        adaptive_route_first: bool = True,
     ) -> None:
         return None
