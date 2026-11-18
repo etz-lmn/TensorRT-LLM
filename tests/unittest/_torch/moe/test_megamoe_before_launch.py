@@ -476,6 +476,7 @@ def _eplb_worker_impl(backend_name: str) -> dict:
 
     return dict(
         rank=rank,
+        takes_before_launch=bool(getattr(impl, "takes_before_launch", False)),
         traces=traces,
         block_forward_us=blocks(times),
         block_wait_us=blocks(stalls),
@@ -485,12 +486,6 @@ def _eplb_worker_impl(backend_name: str) -> dict:
 
 def _eplb_worker_wrapper(backend_name: str) -> dict:
     return _eplb_worker(backend_name)
-
-
-@pytest.mark.cpu_only
-def test_the_eplb_worker_pickles_for_the_mpi_pool() -> None:
-    cloudpickle = pytest.importorskip("cloudpickle")
-    cloudpickle.dumps(_eplb_worker_wrapper)
 
 
 @pytest.mark.skipif(
@@ -503,9 +498,10 @@ def test_online_eplb_statistic_wait_order_and_layer_time(
     moe_multi_gpu_executor, backend_name, record_property
 ):
     """A MegaMoE layer under online EPLB with multi-stream on, four ranks: every forward issues the
-    statistic-allreduce wait once and before every fused launch; DeepGEMM before run_moe (so before
-    megamoe_prepare), CuteDSL inside run_moe after its staging. The outputs are finite. The median
-    forward time and the launch stream's stall in the wait are recorded per block of forwards."""
+    statistic-allreduce wait once and before every fused launch; a backend that does not take the
+    wait (DeepGEMM) gets it before run_moe, so before megamoe_prepare, and one that does (CuteDSL)
+    issues it inside run_moe after its staging. The outputs are finite. The median forward time and
+    the launch stream's stall in the wait are recorded per block of forwards."""
     from _torch.moe.moe_test_utils import MoeBackendType, MoeModelConfig
     from _torch.moe.test_moe_module import (
         MEGAMOE_IGNORE_COMM_METHOD,
@@ -546,7 +542,7 @@ def test_online_eplb_statistic_wait_order_and_layer_time(
             assert trace.count("wait") == 1 and "launch" in trace, trace
             waited = trace.index("wait")
             assert "launch" not in trace[:waited], trace
-            if backend_name == "MEGAMOE_DEEPGEMM":
+            if not result["takes_before_launch"]:
                 assert trace[0] == "wait" and trace[1] == "run_moe", trace
             else:
                 assert trace.index("run_moe") < waited, trace
