@@ -516,8 +516,11 @@ for f in sorted(out.rglob("*")):
         text = "\\n".join(l for l in f.read_text().splitlines() if not re.match(r"\\s*(\\.loc|\\.file|//)", l))
         digests[f.name] = ["ptx", hashlib.sha256(text.encode()).hexdigest()]
     elif f.suffix == ".cubin":
-        usage = subprocess.run(["cuobjdump", "--dump-resource-usage", str(f)], capture_output=True, text=True)
-        digests[f.name] = ["cubin", hashlib.sha256(f.read_bytes()).hexdigest(), usage.stdout]
+        try:
+            usage = subprocess.run(["cuobjdump", "--dump-resource-usage", str(f)], capture_output=True, text=True).stdout
+        except OSError as error:
+            usage = f"cuobjdump: {{error}}"
+        digests[f.name] = ["cubin", hashlib.sha256(f.read_bytes()).hexdigest(), usage]
 print("DIGESTS " + json.dumps(digests))
 """
     env = dict(os.environ, CUTE_DSL_KEEP_PTX="1", CUTE_DSL_KEEP_CUBIN="1", CUTE_DSL_DUMP_DIR=str(out_dir))
@@ -535,7 +538,8 @@ def test_megamoe_kernels_without_the_adaptive_route_record_their_ptx(tmp_path, r
     import json
 
     digests = _kernel_ptx_digests(0, tmp_path / "base")
-    assert any(kind == "ptx" for kind, *_ in digests.values()), "the compile kept no PTX"
+    kept = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
+    assert any(kind == "ptx" for kind, *_ in digests.values()), f"the compile kept no PTX: {kept[:20]}"
     record_property("no_eplb_kernel_digests", json.dumps({k: v[:2] for k, v in digests.items()}, sort_keys=True))
     record_property("no_eplb_resource_usage", json.dumps({k: v[2] for k, v in digests.items() if v[0] == "cubin"}))
     from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.communication.nvlink_domain import one_round_router
