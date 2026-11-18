@@ -340,3 +340,40 @@ def test_bf16_inputs_launch_apart_where_the_next_run_stages_nothing(monkeypatch)
             MegaMoECuteDsl.supports_fused_prepare(SimpleNamespace(layer_load_balancer=plans))
             is fused
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_live_row_word_writes_are_stream_ordered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cuda.bindings import driver
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    word = live_rows.LiveRowWord()
+    word.write(live_rows.encode(3, 8))  # before the word exists: it is allocated holding this
+    tensor = word.tensor(device)
+    seen = [tensor.clone()]
+    expected = [live_rows.encode(3, 8)]
+    for value in (live_rows.encode(5, 8), live_rows.ALL_ROWS, live_rows.NO_ROWS, live_rows.NO_ROWS):
+        # Work enqueued before a write reads the old value even while the host runs ahead.
+        torch.cuda._sleep(2_000_000)
+        seen.append(tensor.clone())
+        expected.append(expected[-1])
+        word.write(value)
+        seen.append(tensor.clone())
+        expected.append(value)
+    torch.cuda.synchronize()
+    assert [int(t.item()) for t in seen] == expected
+
+    # Without stream memory operations the word keeps every row and is never written.
+    monkeypatch.setattr(
+        driver, "cuStreamWriteValue32", lambda *_: (driver.CUresult.CUDA_ERROR_NOT_SUPPORTED,)
+    )
+    unsupported = live_rows.LiveRowWord()
+    unsupported.write(live_rows.encode(3, 8))
+    assert int(unsupported.tensor(device).item()) == live_rows.ALL_ROWS
+    unsupported.write(live_rows.NO_ROWS)
+    assert (
+        int(unsupported.tensor(device).item()) == live_rows.ALL_ROWS
+        and not unsupported._stream_writes_supported
+    )

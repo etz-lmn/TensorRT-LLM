@@ -12,14 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GPU tests of the live-row word: its writes are ordered on the stream, and the MegaMoE
-launch drops the padding rows (the route staging computes the host's live rows on the
-device: test_megamoe_stage_routes.py).
+"""GPU test that the MegaMoE launch drops the padding rows (the route staging computes the
+host's live rows on the device, and the word's writes are stream-ordered:
+test_megamoe_stage_routes.py).
 
 The drop test runs one MegaMoE layer on four ranks twice over the same inputs: once with
 every row live, once with each rank's padding requests dropped. The live rows must come
 out bit for bit the same, the dropped rows zero, and the per-expert counts the router
-publishes to its peers must equal the host histogram of the live rows' routes.
+publishes to its peers must equal the host histogram of the live rows' routes. It runs with
+the generic routing, staged by megamoe_stage_inputs, and with DeepSeek-V4 routing, whose fused
+route+quant stages the bucket under the word itself.
 """
 
 import os
@@ -34,10 +36,14 @@ import cloudpickle
 import pytest
 import torch
 from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm._torch.moe import live_rows
 from tensorrt_llm._utils import get_sm_version, mpi_rank
+
+if torch.cuda.is_available():
+    # The 4-GPU MoE cases' shared pool. test_moe_module queries the device when imported, so the
+    # CPU stage, which collects this module for its cpu_only case, does not import it.
+    from _torch.moe.test_moe_module import moe_multi_gpu_executor  # noqa: F401
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
@@ -58,49 +64,10 @@ _REQUESTS, _ROWS_PER_REQUEST = 8, 4
 _REAL_REQUESTS = (8, 5, 0, 3)
 # The top-k reduce has one store path per combine wire format; each must zero the dropped rows.
 _COMBINE_FORMATS = ("bf16", "32e4m3xe8m0", "16e2m1xbf16")
-
-
-@requires_blackwell
-def test_megamoe_cutedsl_live_row_word_writes_are_stream_ordered(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from cuda.bindings import driver
-
-    device = torch.device("cuda", torch.cuda.current_device())
-    word = live_rows.LiveRowWord()
-    word.write(live_rows.encode(3, 8))  # before the word exists: it is allocated holding this
-    tensor = word.tensor(device)
-    seen = [tensor.clone()]
-    expected = [live_rows.encode(3, 8)]
-    for value in (live_rows.encode(5, 8), live_rows.ALL_ROWS, live_rows.NO_ROWS, live_rows.NO_ROWS):
-        # Work enqueued before a write reads the old value even while the host runs ahead.
-        torch.cuda._sleep(2_000_000)
-        seen.append(tensor.clone())
-        expected.append(expected[-1])
-        word.write(value)
-        seen.append(tensor.clone())
-        expected.append(value)
-    torch.cuda.synchronize()
-    assert [int(t.item()) for t in seen] == expected
-
-    # Without stream memory operations the word keeps every row and is never written.
-    monkeypatch.setattr(
-        driver, "cuStreamWriteValue32", lambda *_: (driver.CUresult.CUDA_ERROR_NOT_SUPPORTED,)
-    )
-    unsupported = live_rows.LiveRowWord()
-    unsupported.write(live_rows.encode(3, 8))
-    assert int(unsupported.tensor(device).item()) == live_rows.ALL_ROWS
-    unsupported.write(live_rows.NO_ROWS)
-    assert (
-        int(unsupported.tensor(device).item()) == live_rows.ALL_ROWS
-        and not unsupported._stream_writes_supported
-    )
-
-
-def _init_worker(custom_paths: list) -> None:
-    for custom_path in custom_paths:
-        if custom_path.endswith("tests/unittest") and custom_path not in sys.path:
-            sys.path.append(custom_path)
+# DeepSeek-V4 routing takes the fused route+quant launch, which stages the bucket itself; its
+# kernel routes a multiple of 32 experts (and the rest of the CI shape).
+_DSV4_SHAPE = (64, 6, 2048, 1408)
+_ROUTINGS = ("renormalize", "dsv4")
 
 
 @contextmanager
@@ -198,15 +165,17 @@ def test_published_counts_uses_the_forward_descriptor_not_cached_variants(monkey
     assert callable(cloudpickle.loads(cloudpickle.dumps(_drop_worker)))
 
 
-def _drop_worker(real_requests_by_rank: tuple, combine_format: str) -> None:
+def _drop_worker(real_requests_by_rank: tuple, combine_format: str, routing: str) -> None:
     try:
-        _drop_worker_impl(real_requests_by_rank, combine_format)
+        _drop_worker_impl(real_requests_by_rank, combine_format, routing)
     except Exception:
         traceback.print_exc()
         raise
+    finally:
+        patch.stopall()  # the pool's workers serve the module's other cases
 
 
-def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str) -> None:
+def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str, routing: str) -> None:
     from _torch.moe.moe_test_utils import MoeBackendType
     from _torch.moe.quantize_utils import get_test_quant_params
     from _torch.moe.test_moe_module import (
@@ -221,6 +190,8 @@ def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str) -> None
         create_moe,
     )
     from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe import mega_moe_cute_dsl
+    from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod
     from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
     from tensorrt_llm._torch.utils import ActivationType, model_extra_attrs
     from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -233,16 +204,30 @@ def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str) -> None
     torch.cuda.set_device(rank)
     backend_name = MoeBackendType.MEGAMOE_CUTEDSL.value
     _ensure_dist_for_megamoe(backend_name, rank, _WORLD)
-    num_experts, top_k, hidden_size, intermediate_size = _SHAPE
+    dsv4 = routing == "dsv4"
+    num_experts, top_k, hidden_size, intermediate_size = _DSV4_SHAPE if dsv4 else _SHAPE
     rows = _REQUESTS * _ROWS_PER_REQUEST
     dtype = torch.bfloat16
 
     with torch.device(f"cuda:{rank}"):
         # The same inputs and weights on every rank, as in the multi-GPU module tests.
         torch.manual_seed(0)
-        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k, force_enable_pytorch_op=True)
         x = torch.randn((rows, hidden_size), dtype=dtype, device="cuda")
-        router_logits = torch.randn((rows, num_experts), dtype=dtype, device="cuda")
+        if dsv4:
+            bias = torch.randn(num_experts, device="cuda") * 0.1
+            routing_method = DeepSeekV4MoeRoutingMethod(
+                top_k=top_k,
+                n_group=1,
+                topk_group=1,
+                routed_scaling_factor=1.5,
+                callable_e_score_correction_bias=lambda: bias,
+                callable_tid2eid=lambda: None,
+                is_hashed=False,
+            )
+            router_logits = torch.randn((rows, num_experts), device="cuda")
+        else:
+            routing_method = RenormalizeMoeRoutingMethod(top_k=top_k, force_enable_pytorch_op=True)
+            router_logits = torch.randn((rows, num_experts), dtype=dtype, device="cuda")
         quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
             QuantAlgo.NVFP4, x, MoeBackendType.MEGAMOE_CUTEDSL
         )
@@ -291,6 +276,16 @@ def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str) -> None
 
             word = live_rows.LiveRowWord()
             attrs = {live_rows.LIVE_ROW_WORD_ATTR: word}
+            # DeepSeek-V4's fused route+quant must stage the bucket under the word itself.
+            fused_words = []
+            fused = mega_moe_cute_dsl.dsv4_route_nvfp4_quant
+
+            def spy(*args, **kwargs):
+                fused_words.append(kwargs.get("live_row_word"))
+                return fused(*args, **kwargs)
+
+            patcher = patch.object(mega_moe_cute_dsl, "dsv4_route_nvfp4_quant", spy)
+            patcher.start()
 
             def forward(value: int) -> tuple:
                 word.write(value)
@@ -333,17 +328,26 @@ def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str) -> None
             assert torch.equal(counts_drop, histogram_live)
             assert torch.equal(out_drop[:live], out_all[:live])
             assert not out_drop[live:].any()
+            if dsv4:
+                assert fused_words and all(w is not None for w in fused_words), fused_words
+            else:
+                assert not fused_words
 
 
 @requires_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < _WORLD, reason=f"needs {_WORLD} GPUs")
 @pytest.mark.threadleak(enabled=False)  # the pool's manager thread persists by design
+@pytest.mark.parametrize("routing", _ROUTINGS)
 @pytest.mark.parametrize("combine_format", _COMBINE_FORMATS)
-def test_megamoe_cutedsl_drops_padding_rows(combine_format: str) -> None:
-    with MPIPoolExecutor(
-        initializer=_init_worker, initargs=(sys.path,), max_workers=_WORLD
-    ) as executor:
-        results = list(
-            executor.map(_drop_worker, [_REAL_REQUESTS] * _WORLD, [combine_format] * _WORLD)
+def test_megamoe_cutedsl_drops_padding_rows(
+    moe_multi_gpu_executor, combine_format: str, routing: str
+) -> None:
+    results = list(
+        moe_multi_gpu_executor.map(
+            _drop_worker,
+            [_REAL_REQUESTS] * _WORLD,
+            [combine_format] * _WORLD,
+            [routing] * _WORLD,
         )
+    )
     assert results == [None] * _WORLD
