@@ -142,7 +142,9 @@ __global__ void __launch_bounds__(kMegaMoeStageThreads)
 }
 
 //! Launch writer.blocks writer blocks with sharedBytes of dynamic shared memory each (a writer that needs more than
-//! the default raises the kernel's limit first) and as many quantization blocks as stay resident beside them.
+//! the default raises the kernel's limit first) and as many quantization blocks as stay resident on the device, at
+//! most one per item. The quantization grid does not shrink by the writer's blocks: those finish almost at once, and a
+//! large bucket would otherwise leave the quantization a few blocks.
 template <typename Writer>
 void launchMegaMoeStageInputs(
     MegaMoeQuantize const& quantize, Writer const& writer, size_t sharedBytes, cudaStream_t stream)
@@ -169,7 +171,7 @@ void launchMegaMoeStageInputs(
         resident = it->second;
     }
     auto const quantizeBlocks
-        = static_cast<int>(std::min<int64_t>(megaMoeQuantizeItems(quantize), std::max(1, resident - writer.blocks)));
+        = static_cast<int>(std::min<int64_t>(megaMoeQuantizeItems(quantize), std::max(1, resident)));
     if (writer.blocks + quantizeBlocks > 0)
     {
         common::launchWithPdlWhenEnabled("megaMoeStageInputs", kernel, dim3(writer.blocks + quantizeBlocks),
