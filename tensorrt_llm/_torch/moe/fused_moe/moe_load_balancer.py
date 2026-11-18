@@ -718,11 +718,11 @@ class SingleLayerMoeLoadBalancer:
         the kernel (fused communication) must not run alongside it: which of
         the two becomes resident first can differ from rank to rank, in eager
         forwards and in CUDA graph replays alike, and a rank whose MoE kernel
-        holds the SMs its allreduce needs blocks every rank. Such a kernel's
-        caller waits here before the launch. Work the current stream enqueued
-        before the wait overlaps the allreduce; work enqueued after it does
-        not. Without multi-stream the allreduce already ran on the current
-        stream.
+        holds the SMs its allreduce needs blocks every rank. The wait is
+        issued right before that launch, after the backend's own input
+        preparation, so routing, quantization and staging overlap the
+        allreduce (MoERunContext.before_launch). Without multi-stream the
+        allreduce already ran on the current stream.
         """
         if self.updates_enabled and do_multi_stream():
             self.statistic_allreduce_event.wait()

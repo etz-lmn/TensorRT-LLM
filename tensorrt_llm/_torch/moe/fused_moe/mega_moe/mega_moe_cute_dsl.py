@@ -512,6 +512,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
 
     input_requirement = descriptor.input_requirement
 
+    # run_moe issues MoERunContext.before_launch itself: after staging and
+    # before the kernel, bucket priming included.
+    takes_before_launch = True
+
     _SUPPORTED_ACTIVATION_DTYPES = frozenset({torch.bfloat16})
 
     # The elementwise function and its constants are codegen-time literals, so
@@ -1851,6 +1855,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             device=device,
             output_dtype=output_dtype,
             replica_plan=replica_plan,
+            before_launch=getattr(ctx, "before_launch", None),
         )
 
     def _ensure_local_staging(self, *, top_k: int, hidden: int, device, output_dtype, max_T: int):
@@ -2137,6 +2142,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         launch_max_T: int,
         replica_plan=None,
         staged_inputs: bool = False,
+        before_launch=None,
     ) -> torch.Tensor:
         """Launch the fused MegaMoE CuteDSL kernel and return its reduced output.
 
@@ -2147,7 +2153,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         :func:`_as_fp8_sf` helpers (the kernel rejects raw uint8 byte
         tensors). ``staged_inputs`` states that activation, activation_sf,
         topk_idx and topk_weights are this bucket's launch buffers, whose cute
-        views the op may then reuse.
+        views the op may then reuse. ``before_launch`` is
+        ``MoERunContext.before_launch``, issued right before the op.
         """
         # Hand the symmetric profiling scratch (or a deferred factory) to the
         # op for tuning-mode profiling launches; cleared in the ``finally`` so
@@ -2244,6 +2251,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Quantization, independent staging, output clears, and host setup
         # are already enqueued. The router inside this op first reads routes.
         self._wait_rebalance_routes(replica_plan)
+        if before_launch is not None:
+            before_launch()
         # Eager launches call the op's implementation directly: the custom-op
         # dispatch costs tens of microseconds of host time per layer.
         megamoe_op = (
@@ -2439,6 +2448,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         device,
         output_dtype: torch.dtype,
         replica_plan=None,
+        before_launch=None,
     ) -> torch.Tensor:
         """Unified MegaMoE CuteDSL forward: acquire -> stage -> launch.
 
@@ -2491,6 +2501,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and _MEGAMOE_PRIME_LADDER
             and AutoTuner.get().is_tuning_mode
         ):
+            # The ladder launches the fused kernel too (MoERunContext.before_launch).
+            if before_launch is not None:
+                before_launch()
             self._prime_ladder(
                 live_T=launch_max_T,
                 weight_view=weight_view,
@@ -2603,6 +2616,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             replica_plan=replica_plan,
             # Direct routing inputs imply direct activation inputs.
             staged_inputs=not use_direct_inputs,
+            before_launch=before_launch,
         )
 
 
