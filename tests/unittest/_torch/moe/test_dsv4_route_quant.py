@@ -270,12 +270,13 @@ def _pending_launch_error():
 @torch.inference_mode()
 def test_routing_without_tokens_leaves_no_launch_error(record_property):
     """Routing no tokens (gate_forward over an empty batch) launches nothing: no launch error is
-    left for the next op to report. Records an error pending before it, which an earlier test of
-    the module left."""
-    before = _pending_launch_error()
+    left for the next op to report. An error an earlier test left pending is read (and so cleared)
+    first and recorded, so the check holds whatever ran before."""
+    earlier = _pending_launch_error()
+    record_property("earlier_pending_launch_error", str(earlier))
+    assert _pending_launch_error() is None
     _, bias, _, _ = _inputs(0)
     ids, weights = _routing(bias).apply(torch.empty((0, NUM_EXPERTS), device="cuda"))
     after = _pending_launch_error()
-    record_property("pending_launch_error", f"before={before} after={after}")
     assert ids.shape == (0, TOP_K) and weights.shape == (0, TOP_K)
-    assert before is None and after is None, (before, after)
+    assert after is None, after

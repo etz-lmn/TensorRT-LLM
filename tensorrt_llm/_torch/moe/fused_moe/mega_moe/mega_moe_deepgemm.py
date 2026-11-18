@@ -333,10 +333,6 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
 
     input_requirement = descriptor.input_requirement
 
-    # run_moe issues MoERunContext.before_launch itself, first: before the tile
-    # priming and megamoe_prepare, so every launch of the kernel follows it.
-    takes_before_launch = True
-
     _SUPPORTED_ACTIVATION_DTYPES = frozenset({torch.bfloat16})
 
     # ActivationType -> the DeepGEMM library's own ``activation`` argument. The
@@ -929,11 +925,6 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
             f"{self.max_num_tokens}. Raise model_config.moe_max_num_tokens."
         )
 
-        # Before megamoe_prepare: a prepare beside the statistic allreduce slows
-        # the allreduce, which the launch waits for.
-        before_launch = getattr(ctx, "before_launch", None)
-        if before_launch is not None:
-            before_launch()
         if not self._kernels_primed:
             self._prime_kernels()
 

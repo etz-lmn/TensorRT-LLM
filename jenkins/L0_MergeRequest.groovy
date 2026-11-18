@@ -2115,6 +2115,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/unittest/_torch/attention/multi_gpu/",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/moe/multi_gpu/",
+        "tests/unittest/_torch/moe/test_megamoe_before_launch.py",
         "tests/unittest/_torch/moe/test_megamoe_live_rows_gpu.py",
         "tests/unittest/kv_cache_manager_v2_tests/",
         "tests/unittest/_torch/multi_gpu_modeling/",

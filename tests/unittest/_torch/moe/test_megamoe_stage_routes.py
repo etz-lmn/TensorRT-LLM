@@ -390,6 +390,28 @@ def _median_us(launch, iters: int = 20, warmup: int = 3) -> float:
     return sorted(times)[len(times) // 2]
 
 
+def _stage_inputs_grid(launch) -> int:
+    """The grid of the one megamoe_stage_inputs kernel ``launch`` runs, from the profiler's trace."""
+    import json
+    import tempfile
+
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        launch()
+        torch.cuda.synchronize()
+    with tempfile.NamedTemporaryFile(suffix=".json") as trace:
+        prof.export_chrome_trace(trace.name)
+        events = json.load(open(trace.name))["traceEvents"]
+    grids = [
+        e["args"]["grid"][0]
+        for e in events
+        if e.get("cat") == "kernel" and "megaMoeStageInputsKernel" in e.get("name", "")
+    ]
+    assert len(grids) == 1, grids
+    return grids[0]
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
     reason="needs a Blackwell CUDA device",
@@ -398,7 +420,8 @@ def _median_us(launch, iters: int = 20, warmup: int = 3) -> float:
 def test_stage_inputs_one_launch_against_two_large_buckets(bucket, record_property):
     """megamoe_stage_inputs (quantize + route staging in one launch) writes the bytes of
     fp4_quantize.into + megamoe_stage_routes at the large prefill buckets, and its quantization
-    grid does not shrink with the bucket: both launches' median times are recorded."""
+    grid does not shrink with the bucket: past the route writer's blocks it launches as many
+    blocks at this bucket as at the smallest one. Both launches' median times are recorded."""
     hidden, top_k = 7168, 8
     gen = torch.Generator(device="cuda").manual_seed(bucket)
     x = (torch.randn(bucket, hidden, device="cuda", generator=gen) * 3).to(torch.bfloat16)
@@ -428,6 +451,32 @@ def test_stage_inputs_one_launch_against_two_large_buckets(bucket, record_proper
     one_us, two_us = _median_us(one_launch), _median_us(two_launches)
     for a, b in zip(one, two):
         assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+    # The route writer takes one 256-thread block per 256 route elements, at most 1024 blocks; every
+    # bucket here has more quantization items (rows x 2) than blocks fit on the device at once.
+    def writer_blocks(rows: int) -> int:
+        return min(-(-rows * top_k // 256), 1024)
+
+    small = 4096
+    reference = buffers()
+    quantize_blocks = _stage_inputs_grid(one_launch) - writer_blocks(bucket)
+    reference_blocks = _stage_inputs_grid(
+        lambda: torch.ops.trtllm.megamoe_stage_inputs(
+            x[:small],
+            scale,
+            reference[0][:small],
+            reference[1][:small],
+            ids[:small],
+            weights[:small],
+            reference[2][:small],
+            reference[3][:small],
+        )
+    ) - writer_blocks(small)
+    assert (
+        quantize_blocks
+        == reference_blocks
+        >= torch.cuda.get_device_properties(0).multi_processor_count
+    )
     record_property(f"bucket{bucket}_one_launch_us", round(one_us, 2))
     record_property(f"bucket{bucket}_two_launches_us", round(two_us, 2))
 
@@ -438,9 +487,9 @@ def test_replica_plan_stages_only_the_slot_ids_after_the_route_wait(
     num_tokens, bucket, record_property
 ):
     """With a replica plan, the gate weights and both tails stage before the route wait and only
-    the live rows' slot ids after it: the bucket's bytes equal one staging after the wait, and the
-    time from the end of the wait to the end of the staging (the launch's critical path behind
-    HALO-Q) is recorded for both forms."""
+    the live rows' slot ids after it: the launches are issued in that order around the wait, the
+    bucket's bytes equal one staging after the wait, and the time from the end of the wait to the
+    end of the staging (the launch's critical path behind HALO-Q) is recorded for both forms."""
     top_k = 6
     gen = torch.Generator(device="cuda").manual_seed(num_tokens)
     ids = torch.randint(
@@ -497,6 +546,19 @@ def test_replica_plan_stages_only_the_slot_ids_after_the_route_wait(
         torch.ops.trtllm.megamoe_stage_routes(
             ids, weights, whole.topk_idx_local, whole.topk_weights
         )
+
+    calls = []
+    stage_routes = torch.ops.trtllm.megamoe_stage_routes
+
+    def recorded_stage_routes(*args, live_ids=True, rest=True):
+        calls.append(("stage", live_ids, rest))
+        return stage_routes(*args, live_ids=live_ids, rest=rest)
+
+    plan = SimpleNamespace(wait_for_routes=lambda: calls.append("wait"))
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(torch.ops.trtllm, "megamoe_stage_routes", recorded_stage_routes)
+        split_stage(plan)
+    assert calls == [("stage", False, True), "wait", ("stage", True, False)]
 
     split_us, whole_us = after_wait_us(split_stage), after_wait_us(whole_stage)
     assert torch.equal(split.topk_idx_local, whole.topk_idx_local)

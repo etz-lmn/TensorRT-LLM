@@ -380,6 +380,7 @@ def test_megamoe_cutedsl_drops_padding_rows(
 # (the one-round router needs 16 or more ranks).
 _TIMED_ROWS = 200
 _TIMED_FORWARDS = 8
+_TIMED_BLOCKS = 3
 
 
 def _layer_worker(mode: str) -> dict:
@@ -396,7 +397,8 @@ def _layer_worker_impl(mode: str) -> dict:
     """One DeepSeek-V4-routed MegaMoE layer timed over repeated forwards: attention DP with the
     bucket hint (``hinted``), or attention TP without one (``no_hint``), whose launches take the full
     bucket. Returns this rank's output digest, whether the forwards repeat it, the median forward
-    microseconds and the staging launches per forward after the bucket's first launch."""
+    microseconds of each block of forwards and the staging launches per forward after the bucket's
+    first launch."""
     import hashlib
 
     parallel_mode = "DEP" if mode == "hinted" else "TEP"
@@ -411,21 +413,29 @@ def _layer_worker_impl(mode: str) -> dict:
         # Read by name: an attribute named ``ops`` next to the global ``torch`` makes cloudpickle ship
         # torch.ops, which is not a module, as a submodule of this worker.
         trtllm_ops = getattr(torch, "ops").trtllm
+        from tensorrt_llm._torch.moe.fused_moe.mega_moe import mega_moe_cute_dsl
+
+        def counted(op, name):
+            def call(*a, **k):
+                # A launch is counted once: a torch-function handler may call the op back by name
+                # while the launch runs.
+                (reentered if entered else staged).append(name)
+                entered.append(name)
+                try:
+                    return op(*a, **k)
+                finally:
+                    entered.pop()
+
+            return call
+
         for name in ("megamoe_stage_inputs", "megamoe_stage_routes", "fp4_quantize"):
             if hasattr(trtllm_ops, name):
-                op = getattr(trtllm_ops, name)
-
-                def counted(*a, _op=op, _name=name, **k):
-                    # A launch is counted once: a torch-function handler may call the op back by name
-                    # while the launch runs.
-                    (reentered if entered else staged).append(_name)
-                    entered.append(_name)
-                    try:
-                        return _op(*a, **k)
-                    finally:
-                        entered.pop()
-
-                patch.object(trtllm_ops, name, counted).start()
+                patch.object(trtllm_ops, name, counted(getattr(trtllm_ops, name), name)).start()
+        # DeepSeek-V4's fused route+quant writes the bucket's inputs itself.
+        name = "dsv4_route_nvfp4_quant"
+        patch.object(
+            mega_moe_cute_dsl, name, counted(getattr(mega_moe_cute_dsl, name), name)
+        ).start()
         counts = [_TIMED_ROWS] * _WORLD if mode == "hinted" else None
         outputs, times = [], []
         with torch.inference_mode():
@@ -433,7 +443,7 @@ def _layer_worker_impl(mode: str) -> dict:
             torch.cuda.synchronize()
             staged.clear()
             reentered.clear()
-            for _ in range(_TIMED_FORWARDS):
+            for _ in range(_TIMED_BLOCKS * _TIMED_FORWARDS):
                 begin = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 begin.record()
@@ -443,16 +453,20 @@ def _layer_worker_impl(mode: str) -> dict:
                 times.append(begin.elapsed_time(end) * 1e3)
                 outputs.append(out.clone())
         digest = hashlib.sha256(outputs[0].contiguous().view(torch.uint8).cpu().numpy().tobytes())
+        forwards = _TIMED_BLOCKS * _TIMED_FORWARDS
         return dict(
             rank=rank,
             digest=digest.hexdigest(),
             repeats=all(torch.equal(out, outputs[0]) for out in outputs),
-            forward_us=sorted(times)[len(times) // 2],
-            staging_launches=len(staged) / _TIMED_FORWARDS,
-            staging_reentries=len(reentered) / _TIMED_FORWARDS,
-            staging_ops={
-                name: staged.count(name) / _TIMED_FORWARDS for name in sorted(set(staged))
-            },
+            # Consecutive blocks of forwards on one layer instance: their medians give the spread
+            # of one build.
+            block_forward_us=[
+                sorted(times[b * _TIMED_FORWARDS : (b + 1) * _TIMED_FORWARDS])[_TIMED_FORWARDS // 2]
+                for b in range(_TIMED_BLOCKS)
+            ],
+            staging_launches=len(staged) / forwards,
+            staging_reentries=len(reentered) / forwards,
+            staging_ops={name: staged.count(name) / forwards for name in sorted(set(staged))},
         )
 
 
@@ -472,15 +486,21 @@ def test_megamoe_cutedsl_layer_digest_time_and_staging_launches(
     moe_multi_gpu_executor, mode: str, record_property
 ) -> None:
     """A MegaMoE layer on four ranks (the metadata-push router, so the token-in path) repeats its
-    output bit for bit; its digest and median forward time are recorded per rank, for an A/B of two
-    builds on the same inputs. Without a bucket hint (attention TP) the staging still takes one
-    launch per forward, as with the hint."""
+    output bit for bit; its digest and the median forward time of each block of forwards are
+    recorded per rank, for an A/B of two builds on the same inputs. With the bucket hint, DeepSeek-V4's
+    fused route+quant writes the bucket and is the forward's one staging launch. Without one
+    (attention TP) it writes ordinary tensors, and one route-staging launch copies the routes into
+    the full bucket."""
     results = list(moe_multi_gpu_executor.map(_layer_worker, [mode] * _WORLD))
     for result in results:
         record_property(f"rank{result['rank']}_digest", result["digest"])
-        record_property(f"rank{result['rank']}_forward_us", round(result["forward_us"], 2))
+        for block, value in enumerate(result["block_forward_us"]):
+            record_property(f"rank{result['rank']}_block{block}_forward_us", round(value, 2))
         record_property(f"rank{result['rank']}_staging_launches", result["staging_launches"])
         record_property(f"rank{result['rank']}_staging_ops", result["staging_ops"])
         record_property(f"rank{result['rank']}_staging_reentries", result["staging_reentries"])
     assert all(result["repeats"] for result in results)
-    assert all(result["staging_launches"] <= 1 for result in results), results
+    expected = {"dsv4_route_nvfp4_quant": 1.0}
+    if mode == "no_hint":
+        expected["megamoe_stage_routes"] = 1.0
+    assert all(result["staging_ops"] == expected for result in results), results

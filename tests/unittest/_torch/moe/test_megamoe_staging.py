@@ -408,7 +408,8 @@ def test_quantization_prepares_the_requested_output_dtype(preparation_backend):
         torch.zeros(2, 2, dtype=torch.int64),
         torch.ones(2, 2),
     )
-    activation, sf = backend.quantize_input(x, output_dtype=torch.float16)
+    backend.set_adaptive_launch_tokens(None, output_dtype=torch.float16)
+    activation, sf = backend.quantize_input(x)
     context = MoERunContext(
         x=activation,
         x_sf=sf,

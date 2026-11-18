@@ -1745,10 +1745,10 @@ class FusedCommMoEScheduler(MoEScheduler):
         quantize -> ``run_moe`` -> ``start_set_cpu_stage`` ->
         ``done_set_cpu_stage``. The statistic AllReduce runs on the load
         balancer's auxiliary stream under multi-stream and the fused kernel
-        must not run alongside it: ``run_moe`` of a backend that declares
-        ``takes_before_launch`` joins it (``MoERunContext.before_launch``)
-        after its own input preparation, right before the fused launch; for
-        any other backend the scheduler joins it before ``run_moe``.
+        must not run alongside it: the scheduler joins it before ``run_moe``,
+        except for a backend that declares ``takes_before_launch`` (CuteDSL),
+        whose ``run_moe`` joins it (``MoERunContext.before_launch``) after its
+        staging, right before the fused launch.
         ``start/done_set_cpu_stage`` are placed AFTER ``run_moe``; otherwise
         dynamic-EPLB weight migration would race with the fused kernel using
         those weights. A per-layer dynamic EPLB layer has no CPU stage and no
@@ -1798,10 +1798,10 @@ class FusedCommMoEScheduler(MoEScheduler):
         # a fused route+quant launch can write straight into that bucket.
         set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
         if set_adaptive is not None:
-            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
-        set_output_dtype = getattr(moe.backend, "set_adaptive_launch_output_dtype", None)
-        if set_output_dtype is not None:
-            set_output_dtype(output_dtype)
+            set_adaptive(
+                max(all_rank_num_tokens) if all_rank_num_tokens else None,
+                output_dtype=output_dtype,
+            )
 
         # ----- routing -----
         # int32 matches the EPLB stats kernel contract used by the external-comm
@@ -1930,9 +1930,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         # The fused kernel waits for the other ranks inside the kernel, so it
         # must not run alongside the statistic allreduce on the load
         # balancer's auxiliary stream (eager or replayed). A backend that
-        # takes ``before_launch`` issues the wait after its own input
-        # preparation (DeepGEMM's megamoe_prepare, CuteDSL's staging), so that
-        # preparation overlaps the allreduce too; for any other backend the
+        # takes ``before_launch`` (CuteDSL) issues the wait after its staging,
+        # which then overlaps the allreduce too; for any other backend the
         # wait is issued here.
         before_launch = None
         if statistic_allreduce_pending:

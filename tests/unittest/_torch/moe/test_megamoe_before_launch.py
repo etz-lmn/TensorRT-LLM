@@ -3,13 +3,14 @@
 """Where the MegaMoE backends issue ``MoERunContext.before_launch``.
 
 A fused-communication scheduler hands a backend that declares
-``takes_before_launch`` the wait for the EPLB statistic allreduce instead of
-issuing it before ``run_moe``. The backend must issue it before every launch of
-its fused kernel, bucket priming included, because that kernel must not run
-alongside the allreduce. CuteDSL issues it after its staging, which then
-overlaps the allreduce; DeepGEMM issues it before ``megamoe_prepare``, which
-beside the allreduce slows it. The real ``run_moe`` paths run here on CPU
-tensors with the kernels and preparation ops replaced by recorders.
+``takes_before_launch`` (CuteDSL) the wait for the EPLB statistic allreduce
+instead of issuing it before ``run_moe``. That backend must issue it before
+every launch of its fused kernel, bucket priming included, because that kernel
+must not run alongside the allreduce; CuteDSL issues it after its staging,
+which then overlaps the allreduce. DeepGEMM does not take the wait: the
+scheduler issues it before ``run_moe``, so before ``megamoe_prepare``. The real
+``run_moe`` paths run here on CPU tensors with the kernels and preparation ops
+replaced by recorders; on four GPUs both backends run under online EPLB.
 """
 
 import types
@@ -34,8 +35,8 @@ def _tuning(module, monkeypatch, tuning: bool) -> None:
 
 
 @pytest.mark.cpu_only
-def test_both_megamoe_backends_take_the_wait():
-    assert DEEPGEMM.takes_before_launch is True
+def test_only_cute_dsl_takes_the_wait():
+    assert DEEPGEMM.takes_before_launch is False
     assert CUTE_DSL.takes_before_launch is True
 
 
@@ -73,8 +74,7 @@ def _deepgemm(trace, *, primed: bool):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("priming", [False, True], ids=["primed", "priming"])
-@pytest.mark.parametrize("takes_wait", [True, False], ids=["wait", "no_wait"])
-def test_deepgemm_waits_before_megamoe_prepare_and_each_launch(monkeypatch, priming, takes_wait):
+def test_deepgemm_primes_and_prepares_after_the_scheduler_wait(monkeypatch, priming):
     trace = []
     _tuning(deepgemm, monkeypatch, True)
     monkeypatch.setattr(deepgemm, "_MEGA_MOE_PRIMED_TILES", set())
@@ -89,15 +89,15 @@ def test_deepgemm_waits_before_megamoe_prepare_and_each_launch(monkeypatch, prim
         x=torch.ones(2, 8, dtype=torch.bfloat16),
         x_sf=None,  # fused prepare: run_moe stages the BF16 input itself
         output_dtype=torch.bfloat16,
-        before_launch=(lambda: trace.append("wait")) if takes_wait else None,
     )
 
+    # The scheduler issues the wait before run_moe for a backend that does not take it.
+    trace.append("wait")
     DEEPGEMM.run_moe(impl, ctx)
 
-    wait = ["wait"] if takes_wait else []
     # The ladder primes every tile with masked routes, one launch per tile.
     prime = [("launch", 0)] if priming else []
-    assert trace == [*wait, *prime, "prepare", ("launch", 2)]
+    assert trace == ["wait", *prime, "prepare", ("launch", 2)]
 
 
 def _cute_dsl_staging(trace, wait):
@@ -263,14 +263,21 @@ def test_cute_dsl_issues_the_wait_right_before_the_kernel(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# GPU: MegaMoEDeepGemm under online EPLB on four ranks, multi-stream on, so the statistic
-# allreduce runs on the load balancer's auxiliary stream. Per rank it records the median forward
-# time and how long the launch stream stalls in the statistic-allreduce wait (wherever the build
-# issues it: before run_moe, or from the backend's launch path), for an A/B of two builds.
+# GPU: each MegaMoE backend under online EPLB on four ranks, multi-stream on, so the statistic
+# allreduce runs on the load balancer's auxiliary stream. Each forward records where the wait is
+# issued against run_moe, the staging and the fused launches; the forward times of consecutive
+# blocks of forwards on one layer instance are recorded for an A/B of two builds.
 # ---------------------------------------------------------------------------
 _WORLD = 4
-_ROWS = 64
 _FORWARDS = 8
+_BLOCKS = 3
+# backend -> (quantization, rows per rank). CuteDSL's rows stay below the 64-row bucket, so it
+# stages its inputs (an exact-size bucket may read them in place).
+_EPLB_BACKENDS = {
+    "MEGAMOE_DEEPGEMM": ("W4A8_MXFP4_MXFP8", 64),
+    "MEGAMOE_CUTEDSL": ("NVFP4", 60),
+}
+_STAGING_OPS = ("megamoe_prepare", "megamoe_stage_inputs", "megamoe_stage_routes")
 
 if torch.cuda.is_available():
     import pickle
@@ -287,17 +294,22 @@ if torch.cuda.is_available():
     MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
 
-def _deepgemm_eplb_worker() -> dict:
+def _eplb_worker(backend_name: str) -> dict:
     import traceback
+    from unittest.mock import patch
 
     try:
-        return _deepgemm_eplb_worker_impl()
+        return _eplb_worker_impl(backend_name)
     except Exception:
         traceback.print_exc()
         raise
+    finally:
+        patch.stopall()
 
 
-def _deepgemm_eplb_worker_impl() -> dict:
+def _eplb_worker_impl(backend_name: str) -> dict:
+    from unittest.mock import patch
+
     from _torch.moe.moe_test_utils import MoeBackendType, MoeModelConfig
     from _torch.moe.quantize_utils import get_test_quant_params
     from _torch.moe.test_moe_module import (
@@ -308,6 +320,7 @@ def _deepgemm_eplb_worker_impl() -> dict:
     )
 
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
     from tensorrt_llm._torch.moe.fused_moe import (
         DEFAULT_MOE_ACTIVATION,
         RenormalizeMoeRoutingMethod,
@@ -319,9 +332,10 @@ def _deepgemm_eplb_worker_impl() -> dict:
     from tensorrt_llm._utils import mpi_rank
     from tensorrt_llm.models.modeling_utils import QuantAlgo
 
+    quant_name, rows = _EPLB_BACKENDS[backend_name]
     model = MoeModelConfig(8, 2, 512, 512)
     num_slots, dtype = 16, torch.bfloat16
-    backend = MoeBackendType.MEGAMOE_DEEPGEMM
+    backend = MoeBackendType[backend_name]
     rank = mpi_rank()
     mapping = _create_mapping_for_parallel_mode(_WORLD, "DEP")
     mapping.rank = rank
@@ -330,10 +344,10 @@ def _deepgemm_eplb_worker_impl() -> dict:
     with torch.device(f"cuda:{rank}"):
         torch.manual_seed(0)
         routing_method = RenormalizeMoeRoutingMethod(top_k=model.top_k)
-        x = torch.randn((_ROWS, model.hidden_size), dtype=dtype, device="cuda")
-        router_logits = torch.randn((_ROWS, model.num_experts), dtype=dtype, device="cuda")
+        x = torch.randn((rows, model.hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((rows, model.num_experts), dtype=dtype, device="cuda")
         quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
-            QuantAlgo.W4A8_MXFP4_MXFP8, x, backend
+            QuantAlgo[quant_name], x, backend
         )
         quant_kwargs.pop("ref_cls", None)
         quantize_util = quantize_util_cls(
@@ -361,7 +375,7 @@ def _deepgemm_eplb_worker_impl() -> dict:
             enable_eplb=True,
             num_slots=num_slots,
             layer_updates_per_iter=1,
-            max_num_tokens=max(256, _ROWS),
+            max_num_tokens=256,
         )
         balancer = _create_moe_load_balancer(model_cfg, True)
         with (
@@ -389,23 +403,54 @@ def _deepgemm_eplb_worker_impl() -> dict:
             balancer.finalize_model()
             balancer.set_iter_info(enable_statistic=True, enable_update_weights=True)
 
-            # The wait, wherever the build issues it, timed on the launch stream.
-            waits = []
+            # What each forward enqueues, in host order (the order on the launch stream): the
+            # statistic wait wherever the build issues it, run_moe, the staging and the fused
+            # launches. The wait is also timed on the launch stream.
+            trace, waits = [], []
+
+            def recorded(name, function):
+                def call(*args, **kwargs):
+                    trace.append(name)
+                    return function(*args, **kwargs)
+
+                return call
+
             wait = fused_moe._load_balancer_wait_for_statistic_allreduce
 
             def timed_wait():
                 begin = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 begin.record()
+                trace.append("wait")
                 wait()
                 end.record()
                 waits.append((begin, end))
 
             fused_moe._load_balancer_wait_for_statistic_allreduce = timed_wait
-            counts = [_ROWS] * _WORLD
-            times, outputs = [], []
+            impl = fused_moe.backend
+            impl.run_moe = recorded("run_moe", impl.run_moe)
+            if backend_name == "MEGAMOE_DEEPGEMM":
+                impl._launch_kernel = recorded("launch", impl._launch_kernel)
+            else:
+                patch.object(
+                    op,
+                    "run_cute_dsl_megamoe_nvfp4_blackwell",
+                    recorded("launch", op.run_cute_dsl_megamoe_nvfp4_blackwell),
+                ).start()
+            # Read by name: an attribute named ``ops`` next to the global ``torch`` makes
+            # cloudpickle ship torch.ops, which is not a module, as a submodule of this worker.
+            trtllm_ops = getattr(torch, "ops").trtllm
+            for name in _STAGING_OPS:
+                if hasattr(trtllm_ops, name):
+                    patch.object(
+                        trtllm_ops, name, recorded("stage", getattr(trtllm_ops, name))
+                    ).start()
+
+            counts = [rows] * _WORLD
+            times, traces, outputs = [], [], []
             with torch.inference_mode(), with_multi_stream(True):
-                for i in range(_FORWARDS + 1):
+                for i in range(_BLOCKS * _FORWARDS + 1):
+                    trace.clear()
                     begin = torch.cuda.Event(enable_timing=True)
                     end = torch.cuda.Event(enable_timing=True)
                     with MoeLoadBalancerIterContext(balancer):
@@ -415,16 +460,37 @@ def _deepgemm_eplb_worker_impl() -> dict:
                     end.synchronize()
                     if i:  # the first forward primes the kernels
                         times.append(begin.elapsed_time(end) * 1e3)
+                        traces.append(list(trace))
                         outputs.append(out.float())
             torch.cuda.synchronize()
             stalls = [b.elapsed_time(e) * 1e3 for b, e in waits[1:]]
+
+    # Consecutive blocks of forwards on one layer instance: their medians give the spread of one
+    # build, and a drift from block to block would be work that accumulates across forwards.
+    def blocks(values):
+        return [
+            sorted(values[b * _FORWARDS : (b + 1) * _FORWARDS])[_FORWARDS // 2]
+            for b in range(_BLOCKS)
+            if len(values) >= (b + 1) * _FORWARDS
+        ]
+
     return dict(
         rank=rank,
-        forward_us=sorted(times)[len(times) // 2],
-        wait_us=sorted(stalls)[len(stalls) // 2] if stalls else None,
-        waits=len(waits),
+        traces=traces,
+        block_forward_us=blocks(times),
+        block_wait_us=blocks(stalls),
         finite=all(bool(torch.isfinite(out).all()) for out in outputs),
     )
+
+
+def _eplb_worker_wrapper(backend_name: str) -> dict:
+    return _eplb_worker(backend_name)
+
+
+@pytest.mark.cpu_only
+def test_the_eplb_worker_pickles_for_the_mpi_pool() -> None:
+    cloudpickle = pytest.importorskip("cloudpickle")
+    cloudpickle.dumps(_eplb_worker_wrapper)
 
 
 @pytest.mark.skipif(
@@ -432,23 +498,33 @@ def _deepgemm_eplb_worker_impl() -> dict:
     reason=f"needs {_WORLD} GPUs",
 )
 @pytest.mark.threadleak(enabled=False)  # the pool's manager thread persists by design
-def test_deepgemm_online_eplb_layer_time_and_statistic_wait(
-    moe_multi_gpu_executor, record_property
+@pytest.mark.parametrize("backend_name", sorted(_EPLB_BACKENDS))
+def test_online_eplb_statistic_wait_order_and_layer_time(
+    moe_multi_gpu_executor, backend_name, record_property
 ):
-    """MegaMoEDeepGemm under online EPLB with multi-stream on: every forward finishes (no rank waits
-    on another whose kernel runs beside the allreduce) and gives finite rows; the median forward
-    time and the launch stream's stall in the statistic-allreduce wait are recorded per rank."""
+    """A MegaMoE layer under online EPLB with multi-stream on, four ranks: every forward issues the
+    statistic-allreduce wait once and before every fused launch; DeepGEMM before run_moe (so before
+    megamoe_prepare), CuteDSL inside run_moe after its staging. The outputs are finite. The median
+    forward time and the launch stream's stall in the wait are recorded per block of forwards."""
     from _torch.moe.moe_test_utils import MoeBackendType, MoeModelConfig
-    from _torch.moe.test_moe_module import MEGAMOE_IGNORE_COMM_METHOD, should_skip_MegaMoEDeepGemm
+    from _torch.moe.test_moe_module import (
+        MEGAMOE_IGNORE_COMM_METHOD,
+        should_skip_MegaMoECuteDsl,
+        should_skip_MegaMoEDeepGemm,
+    )
 
     from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
     from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-    reason = should_skip_MegaMoEDeepGemm(
+    skip = {
+        "MEGAMOE_DEEPGEMM": should_skip_MegaMoEDeepGemm,
+        "MEGAMOE_CUTEDSL": should_skip_MegaMoECuteDsl,
+    }[backend_name]
+    reason = skip(
         "DEP",
         MEGAMOE_IGNORE_COMM_METHOD,
-        MoeBackendType.MEGAMOE_DEEPGEMM,
-        QuantAlgo.W4A8_MXFP4_MXFP8,
+        MoeBackendType[backend_name],
+        QuantAlgo[_EPLB_BACKENDS[backend_name][0]],
         torch.bfloat16,
         MoeModelConfig(8, 2, 512, 512),
         RenormalizeMoeRoutingMethod,
@@ -456,14 +532,22 @@ def test_deepgemm_online_eplb_layer_time_and_statistic_wait(
     )
     if reason:
         pytest.skip(reason)
-    results = list(moe_multi_gpu_executor.map(_deepgemm_eplb_worker_wrapper, range(_WORLD)))
+    results = list(moe_multi_gpu_executor.map(_eplb_worker_wrapper, [backend_name] * _WORLD))
     for result in results:
-        record_property(f"rank{result['rank']}_forward_us", round(result["forward_us"], 2))
-        if result["wait_us"] is not None:
-            record_property(f"rank{result['rank']}_statistic_wait_us", round(result["wait_us"], 2))
-        record_property(f"rank{result['rank']}_statistic_waits", result["waits"])
-    assert all(result["finite"] for result in results)
-
-
-def _deepgemm_eplb_worker_wrapper(_index: int) -> dict:
-    return _deepgemm_eplb_worker()
+        rank = result["rank"]
+        for block, value in enumerate(result["block_forward_us"]):
+            record_property(f"rank{rank}_block{block}_forward_us", round(value, 2))
+        for block, value in enumerate(result["block_wait_us"]):
+            record_property(f"rank{rank}_block{block}_statistic_wait_us", round(value, 2))
+    for result in results:
+        assert result["finite"], result["rank"]
+        assert len(result["traces"]) == _BLOCKS * _FORWARDS
+        for trace in result["traces"]:
+            assert trace.count("wait") == 1 and "launch" in trace, trace
+            waited = trace.index("wait")
+            assert "launch" not in trace[:waited], trace
+            if backend_name == "MEGAMOE_DEEPGEMM":
+                assert trace[0] == "wait" and trace[1] == "run_moe", trace
+            else:
+                assert trace.index("run_moe") < waited, trace
+                assert "stage" in trace[:waited] and "stage" not in trace[waited:], trace

@@ -719,10 +719,10 @@ class SingleLayerMoeLoadBalancer:
         the two becomes resident first can differ from rank to rank, in eager
         forwards and in CUDA graph replays alike, and a rank whose MoE kernel
         holds the SMs its allreduce needs blocks every rank. The wait is
-        issued right before that launch, after the backend's own input
-        preparation, so routing, quantization and staging overlap the
-        allreduce (MoERunContext.before_launch). Without multi-stream the
-        allreduce already ran on the current stream.
+        issued before that launch, so routing and quantization overlap the
+        allreduce; a backend that takes MoERunContext.before_launch (CuteDSL)
+        issues it after its staging, which then overlaps it too. Without
+        multi-stream the allreduce already ran on the current stream.
         """
         if self.updates_enabled and do_multi_stream():
             self.statistic_allreduce_event.wait()

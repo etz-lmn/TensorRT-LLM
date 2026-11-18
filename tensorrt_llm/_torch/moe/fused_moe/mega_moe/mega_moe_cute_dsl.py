@@ -764,6 +764,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # ``set_adaptive_launch_tokens``); ``None`` -> full bucket.
         self._active_launch_max_tokens: Optional[int] = None
         self._active_launch_output_dtype: Optional[torch.dtype] = None
+        # data_ptr of the bucket route staging the one-launch staging handed out to the next run_moe.
+        self._handed_out_route_staging: Optional[int] = None
         # (bucket ids buffer, ids, weights, x, x_sf) written by the last fused route+quant launch.
         self._prestaged: Optional[Tuple[torch.Tensor, ...]] = None
         # Expert -> slot table of a static placement (built in create_weights), with copies a
@@ -931,10 +933,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._active_launch_max_tokens = chunk_max_tokens
         self._active_launch_output_dtype = output_dtype
 
-    def set_adaptive_launch_output_dtype(self, output_dtype: torch.dtype) -> None:
-        """Bind preparation to the scheduler's resolved output dtype."""
-        self._active_launch_output_dtype = output_dtype
-
     def _may_read_inputs_in_place(self, num_tokens: int, bucket: int) -> bool:
         """Whether a launch of ``num_tokens`` rows into ``bucket`` may read its inputs where they
         are (an exact-size generation-phase bucket across ranks) instead of staging them.
@@ -967,8 +965,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             num_tokens,
             top_k,
         )
-        handed_out = getattr(self, "_handed_out_route_staging", None)
-        self._handed_out_route_staging = None
+        handed_out, self._handed_out_route_staging = self._handed_out_route_staging, None
         if not staged:
             if handed_out is not None:
                 raise ValueError(
@@ -999,7 +996,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         bucket = self._select_launch_max_tokens(self._active_launch_max_tokens)
         if num_tokens > bucket or self._may_read_inputs_in_place(num_tokens, bucket):
             return None
-        output_dtype = getattr(self, "_active_launch_output_dtype", None)
+        output_dtype = self._active_launch_output_dtype
         if output_dtype is None:
             return None  # The next launch's output buffer, and hence staging, is not known.
         key = _StagingKey(
@@ -1539,7 +1536,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         write them directly, else None."""
         if self._active_launch_max_tokens is None or self.tactic_autotune or num_tokens == 0:
             return None
-        output_dtype = getattr(self, "_active_launch_output_dtype", None)
+        output_dtype = self._active_launch_output_dtype
         if output_dtype is None:
             return None
         launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
@@ -1560,7 +1557,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         *,
         post_quant_comm: bool = False,
         reserved_sms: int = 0,
-        output_dtype: Optional[torch.dtype] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """BF16 -> NVFP4 packed activation + plain K-major FP8 SF.
@@ -1599,8 +1595,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """
         del post_quant_comm  # MegaMoE owns dispatch / combine in-kernel.
         del kwargs
-        if output_dtype is not None:
-            self._active_launch_output_dtype = output_dtype
         if isinstance(x, Fp4QuantizedTensor):
             raise NotImplementedError(
                 "MegaMoECuteDsl.quantize_input expects BF16 activation; "
@@ -1731,7 +1725,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             topk_idx,
             topk_weights,
             bufs.topk_idx_local,
-            bufs.topk_weights[:, :top_k],
+            bufs.topk_weights,
             live_rows.current_word(x.device)
             if bufs.topk_idx_local.shape[0] in self._padding_drop_buckets
             else None,
@@ -2530,7 +2524,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         )
         # Validate the handed-out slot view before any conversion can discard its identity.
         routes_staged = inputs_staged
-        if not inputs_staged or getattr(self, "_handed_out_route_staging", None) is not None:
+        if not inputs_staged or self._handed_out_route_staging is not None:
             routes_staged = self._routes_staged(bufs, topk_idx, num_tokens, top_k, replica_plan)
         if not routes_staged:
             if replica_plan is None and (
