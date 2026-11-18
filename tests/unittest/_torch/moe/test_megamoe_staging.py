@@ -132,13 +132,13 @@ def test_the_staging_of_the_next_run_is_handed_out_only_for_a_run_that_stages():
         hidden_size=4,
         routing_method=SimpleNamespace(experts_per_token=2),
         _local_staging_cache={},
-        _select_launch_max_tokens=lambda hint: 4 if hint <= 4 else 8,
+        _select_launch_max_tokens=lambda hint: 4 if hint is not None and hint <= 4 else 8,
         _acquire_buffers=lambda **kw: acquired.append(kw) or bufs,
     )
     backend._may_read_inputs_in_place = types.MethodType(IMPL._may_read_inputs_in_place, backend)
     cpu = torch.device("cpu")
     staging = types.MethodType(IMPL._staging_of_next_run, backend)
-    assert staging(2, cpu) is None  # no bucket hint yet
+    assert staging(2, cpu) is None  # no bucket hint: the full bucket 8, not built yet
     backend._active_launch_max_tokens = 3
     assert staging(2, cpu) is None  # the staging is not built
     backend._local_staging_cache[mm._StagingKey(4, 2, 4, "cpu", torch.bfloat16)] = {}
@@ -149,6 +149,10 @@ def test_the_staging_of_the_next_run_is_handed_out_only_for_a_run_that_stages():
     assert staging(5, cpu) is None  # more rows than the hinted bucket holds
     backend._active_launch_max_tokens = 5
     assert staging(5, cpu) is None  # bucket 8 is selected but not built
+    # Without a hint (EP1, attention TP) the run launches the full bucket: its staging, once built.
+    backend._local_staging_cache[mm._StagingKey(8, 2, 4, "cpu", torch.bfloat16)] = {}
+    backend._active_launch_max_tokens = None
+    assert staging(2, cpu) is bufs and acquired[-1]["launch_max_T"] == 8
 
 
 @pytest.mark.parametrize("route_dtype", [torch.int32, torch.int64])

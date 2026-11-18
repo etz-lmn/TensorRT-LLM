@@ -1026,14 +1026,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     def _staging_of_next_run(self, num_tokens: int, device) -> Optional[_MegaMoeBuffers]:
         """The buffers the next ``run_moe`` stages ``num_tokens`` rows on ``device`` into.
 
-        None when ``quantize_input`` should not write into the staging: no bucket hint yet,
-        tactic autotuning, a bucket whose inputs may be read in place, or a staging set not
-        built yet.
+        Without a bucket hint (EP1, attention TP) the next run launches the full bucket on every
+        rank, so that bucket's staging is the one. None when ``quantize_input`` should not write
+        into the staging: tactic autotuning, a bucket whose inputs may be read in place, or a
+        staging set not built yet.
         """
-        hint = self._active_launch_max_tokens
-        if hint is None or self.tactic_autotune or not self._weights_created:
+        if self.tactic_autotune or not self._weights_created:
             return None
-        bucket = self._select_launch_max_tokens(hint)
+        bucket = self._select_launch_max_tokens(self._active_launch_max_tokens)
         if num_tokens > bucket or self._may_read_inputs_in_place(num_tokens, bucket):
             return None
         output_dtype = getattr(self, "_active_launch_output_dtype", None)
@@ -1613,9 +1613,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         HALO-Q/TMA kernel of a replica plan; zero uses the default
         quantization overload.
 
-        With a bucket hint set (``set_adaptive_launch_tokens``) and an SF row
-        that needs no padding, the rows are quantized straight into the
-        staging of the bucket the next ``run_moe`` selects (with the same SM
+        With an SF row that needs no padding, the rows are quantized straight
+        into the staging of the bucket the next ``run_moe`` selects: the one
+        ``set_adaptive_launch_tokens`` hinted, or without a hint (EP1, attention
+        TP) the full bucket, once that staging is built (with the same SM
         reservation), and the returned tensors are views of it. On EP>1 that staging is the
         symmetric region every same-shape MegaMoE layer shares, so the views
         hold these rows only until the next MegaMoE ``quantize_input`` or
