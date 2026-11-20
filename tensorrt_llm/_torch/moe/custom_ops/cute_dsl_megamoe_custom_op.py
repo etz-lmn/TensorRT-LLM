@@ -3187,9 +3187,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 shared_intermediate_size=self.shared_intermediate_size,
                 shared_gate_up_clamp=self.shared_gate_up_clamp,
                 helper_expert_count=self.helper_expert_count,
-                adaptive_route_experts=self.adaptive_route_experts,
                 **_LOCKED_KERNEL_KWARGS,
             )
+            if self.adaptive_route_experts:
+                # Absent means none, as query_megamoe_kernel_properties builds the kernel.
+                common["adaptive_route_experts"] = self.adaptive_route_experts
             kernel, rejection = _construct_megamoe_kernel(
                 sm_version=self.sm_version,
                 common=common,
