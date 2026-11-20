@@ -8,8 +8,8 @@ bank re-encoded from MXFP4 to NVFP4.
 Against the reference: the routed experts' per-expert NVFP4 math, the fused shared expert within 2% of the separate
 one's error against FP32, the partials' ordered sum against the router GEMM, and the draft layer against FP32 math on
 the same quantization. Bit for bit: the other scheduler with separate staging and no evict-first hint, a repeat and
-an epoch-shifted pass, one CUDA graph of the whole schedule, and the one-round push dispatch (its EP16 gate lowered)
-against the metadata push.
+an epoch-shifted pass, one CUDA graph of the whole schedule, the one-round push dispatch (its EP16 gate lowered)
+against the metadata push, and token_tile return readiness against the default expert readiness.
 """
 
 import importlib
@@ -72,6 +72,39 @@ _PHASE_INTERLEAVE_TACTIC = (
     1,
     (1, 1),
 )
+# token_tile return readiness (FC2 completion per token tile instead of per expert) changes only when token-back may
+# return a tile, so its output equals the default path's bit for bit: grouped at mid, phase interleave on a (4, 1)
+# cluster with (2, 1) fallback groups at hi.
+_TOKEN_TILE_TACTICS = {
+    True: (
+        [256, 256, 256],
+        [2, 1, 1],
+        None,
+        ("grouped", 512),
+        "atomic_counter",
+        "reuse_dispatch_warps",
+        True,
+        2,
+        4,
+        (1, 1),
+        "token_tile",
+        False,
+    ),
+    False: (
+        [256, 256, 256],
+        [4, 1, 1],
+        [2, 1, 1],
+        ("phase_interleave", 3),
+        "atomic_counter",
+        "reuse_dispatch_warps",
+        True,
+        2,
+        4,
+        (1, 4),
+        "token_tile",
+        False,
+    ),
+}
 _REPLAYS = 5
 # Largest fused / separate ratio of the rel-RMS error against the FP32 reference.
 _ERROR_RATIO = 1.02
@@ -589,6 +622,25 @@ def _run(one_round: bool) -> list:
                 patch.setattr(MegaMoECuteDsl, "_route_quant_bucket", lambda *a, **k: None)
                 plain = run(call).clone()
                 plain_schedule = launched()
+                tile_tactic = _TOKEN_TILE_TACTICS[max(counts) <= 256]
+                patch.setattr(
+                    op, "_default_megamoe_tactic_for_key", lambda key, *, num_tokens: tile_tactic
+                )
+                tiled = run(call).clone()
+                tile_names = sorted({k.name() for k in kernels})
+                kernels.clear()
+            if rank == 0:
+                print(f"{label}: token_tile kernels {tile_names}", flush=True)
+            _assert_on_all_ranks(
+                None
+                if tile_names and all("_fc2readytile_v1" in n for n in tile_names)
+                else f"{label}: token_tile tactic built {tile_names}"
+            )
+            _assert_on_all_ranks(
+                None
+                if torch.equal(default, tiled)
+                else f"{label}: token_tile differs from the default"
+            )
             differs = schedule != plain_schedule or not tuned_defaults
             _assert_on_all_ranks(
                 None

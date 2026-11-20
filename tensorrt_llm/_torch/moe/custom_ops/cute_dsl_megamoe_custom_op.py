@@ -1637,17 +1637,15 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
         # every candidate in this function and simply drops what fails. The
         # kernel-side copy stays as the backstop for hand-supplied tactics.
         #
-        # Two of the kernel's nine conditions are not tactic-local and are not
-        # re-checked here:
+        # The kernel's conditions that are not tactic-local are not re-checked
+        # here:
         #   quant_kind == nvfp4     -- this op's ProblemDesc hardcodes nvfp4.
         #   not reduce_topk_in_kernel -- implied transitively: token_tile
         #     requires use_bulk_fc2_store, and get_valid_tactics already drops
         #     every bulk candidate when in_kernel_fc2_reduce is set.
+        #   not internode (SM100/SM103) -- this op builds only the
+        #     NVLink-domain kernel.
         unmet = []
-        if sm_version in (100, 103):
-            # The vendored Blackwell kernel builds only expert readiness (_validate_geometry:
-            # "Blackwell requires token_back_ready_granularity='expert'").
-            unmet.append(f"SM{sm_version} (token_tile builds on SM107 only)")
         if work_id_mode != "atomic_counter":
             unmet.append(f"work_id_mode={work_id_mode!r} (need 'atomic_counter')")
         if token_back_mode not in ("standalone_warps", "reuse_dispatch_warps"):

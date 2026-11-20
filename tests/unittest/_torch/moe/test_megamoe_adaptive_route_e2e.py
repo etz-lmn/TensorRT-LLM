@@ -5,9 +5,10 @@ balancer (512 slots, home route tables, no runtime), at decode (8 / 64 / 128 row
 and prefill (1024 / 4096 / 8192, the metadata-push router) sizes.
 
 Bit for bit: an adaptive layer whose dispatch router maps and counts its routes returns what the same layer returns
-on the staged route, and what a layer without the balancer returns; its statistics are the routing's picks of the
-live rows, nothing while the recording flag is clear. A graph captured on home tables replays an install as eager
-routes it, and the server's mixed forward captures after its warmup and replays as eager.
+on the staged route, and what a layer without the balancer returns, also with token_tile return readiness; its
+statistics are the routing's picks of the live rows, nothing while the recording flag is clear. A graph captured on
+home tables replays an install as eager routes it, and the server's mixed forward captures after its warmup and
+replays as eager.
 """
 
 import pickle
@@ -41,6 +42,22 @@ _DECODE_ROWS = (8, 64, 128)
 _PREFILL_ROWS = (1024, 4096, 8192)
 _MAX_NUM_TOKENS = 8192
 _LAYERS = 8  # distinct layers per arm
+# token_tile return readiness (FC2 completion per token tile instead of per expert) on the router's route: it changes
+# only when token-back may return a tile, so the output is the same bit for bit.
+_TOKEN_TILE_TACTIC = (
+    [256, 256, 256],
+    [2, 1, 1],
+    None,
+    ("grouped", 512),
+    "atomic_counter",
+    "reuse_dispatch_warps",
+    True,
+    2,
+    4,
+    (1, 1),
+    "token_tile",
+    False,
+)
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
@@ -77,6 +94,7 @@ def _replica_row(packed: list) -> torch.Tensor:
 
 
 def _run() -> list:
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
     from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.transport import (
         find_backends,
         prepare_layers,
@@ -232,6 +250,33 @@ def _run() -> list:
                 problem = (
                     f"{rows} rows: the router counted {int(stats['forwards'][0].item())} forwards"
                 )
+            _assert_on_all_ranks(problem)
+
+            tile_names, resolve = set(), op.Sm100MegaMoENvfp4Runner._resolve_kernel_descriptor
+
+            def recording(self, *args, _resolve=resolve, _names=tile_names, **kwargs):
+                resolved = _resolve(self, *args, **kwargs)
+                _names.add(resolved[0].name())
+                return resolved
+
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(op.Sm100MegaMoENvfp4Runner, "_resolve_kernel_descriptor", recording)
+                patch.setattr(
+                    op,
+                    "_default_megamoe_tactic_for_key",
+                    lambda key, *, num_tokens: _TOKEN_TILE_TACTIC,
+                )
+                # A rejected tactic must fail here, not fall back to another one.
+                patch.setattr(op, "_megamoe_default_tactic_candidates", lambda t: (t,))
+                tiled = forward(adaptive, x, counts)
+            torch.cuda.synchronize()
+            if rank == 0:
+                print(f"{rows} rows: token_tile kernels {sorted(tile_names)}", flush=True)
+            problem = None
+            if not tile_names or not all("_fc2readytile_v1" in n for n in tile_names):
+                problem = f"{rows} rows: the token_tile tactic built {sorted(tile_names)}"
+            elif not all(torch.equal(a, b) for a, b in zip(tiled, want)):
+                problem = f"{rows} rows: the token_tile route's output differs from the layer without a balancer"
             _assert_on_all_ranks(problem)
 
         # The route tables a runtime install rewrites in place (fixed address), and a replicated version.

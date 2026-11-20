@@ -205,6 +205,8 @@ class _DedupMetadataPushRouter(KernelComponent):
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
+        if impl_desc.get("adaptive_route_experts"):
+            raise NotImplementedError("The adaptive route is implemented in token_comm.py's router only.")
 
         self.world_size = problem_desc["world_size"]
         self.expert_count = problem_desc["expert_count"]

@@ -23,6 +23,7 @@ from .....communication.nvlink_domain.token_comm import TokenCommArgs, TokenComm
 from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
+from .....helpers.fc2_ready_geometry import derive_fc2_ready_geometry
 from .....helpers.iket_compat import iket
 from .....helpers.megamoe_aot import make_megamoe_aot_callable
 from .....helpers.route_reset import ClearInvalidRoutes
@@ -153,6 +154,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "fallback_cluster_count": OptionalRequirement(Optional[int]),
             "token_in_flag_batch": int,
             "token_back_mode": str,
+            "token_back_ready_granularity": OptionalRequirement(str),
             "reduce_topk_in_kernel": bool,
             "skip_topk_reduce": OptionalRequirement(bool),
             "helper_expert_count": OptionalRequirement(int),
@@ -176,9 +178,6 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         problem_desc, impl_desc = resolve_dlb_expert_counts(
             problem_desc, impl_desc, world_size=problem_desc["world_size"]
         )
-        # The Blackwell epilogue publishes expert counters, not token-tile counters.
-        if impl_desc.get("token_back_ready_granularity", "expert") != "expert":
-            raise ValueError("Blackwell requires token_back_ready_granularity='expert'.")
 
         self.expert_count = problem_desc["expert_count"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
@@ -239,6 +238,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.launch_cluster_count = impl_desc["launch_cluster_count"]
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode = impl_desc["token_back_mode"]
+        self.token_back_ready_granularity = impl_desc.get("token_back_ready_granularity", "expert")
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
         self.skip_topk_reduce = impl_desc.get("skip_topk_reduce", False)
         self.helper_expert_count = impl_desc.get("helper_expert_count", 0)
@@ -324,19 +324,29 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             sf_vec_size=self.sf_vec_size,
         )
         tmem_plan = make_tcgen05_tmem_plan(mma_instruction, self.architecture, self.mma_tiler_mnk)
-        tokens_per_fc1_ready_slot = self.mma_tiler_mnk[1] * self.cluster_shape_mn[1]
-        hidden_per_fc2_cluster_tile = self.mma_tiler_mnk[0] // mma_cta_count * self.cluster_shape_mn[0]
-        fc2_done_signals_per_token_tile = (
-            ceil_div(self.hidden_size, hidden_per_fc2_cluster_tile)
-            * self.cluster_shape_mn[0]
-            * self.cluster_shape_mn[1]
-        )
+        if self.token_back_ready_granularity == "token_tile":  # nosec B105
+            tokens_per_fc1_ready_slot, fc2_done_signals_per_token_tile = derive_fc2_ready_geometry(
+                hidden_size=self.hidden_size,
+                mma_tiler_mnk=self.mma_tiler_mnk,
+                cluster_shape_mn=self.cluster_shape_mn,
+                use_2cta_instrs=self.use_2cta_instrs,
+                fallback_cluster_shape_mn=self.fallback_cluster_shape_mn,
+            )
+        else:
+            tokens_per_fc1_ready_slot = self.mma_tiler_mnk[1] * self.cluster_shape_mn[1]
+            hidden_per_fc2_cluster_tile = self.mma_tiler_mnk[0] // mma_cta_count * self.cluster_shape_mn[0]
+            fc2_done_signals_per_token_tile = (
+                ceil_div(self.hidden_size, hidden_per_fc2_cluster_tile)
+                * self.cluster_shape_mn[0]
+                * self.cluster_shape_mn[1]
+            )
         token_comm_impl_desc = ImplDesc(
             {
                 **impl_desc,
                 "fallback_cluster_shape_mn": self.fallback_cluster_shape_mn,
                 "preferred_cluster_count": self.preferred_cluster_count,
                 "fallback_cluster_count": self.fallback_cluster_count,
+                "token_back_ready_granularity": self.token_back_ready_granularity,
                 "tokens_per_fc1_ready_slot": tokens_per_fc1_ready_slot,
                 "fc2_done_signals_per_token_tile": fc2_done_signals_per_token_tile,
                 "promised_launchable_sm_count": self.mixed_cga_config.total_cta_cnt,
@@ -398,6 +408,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     else {}
                 ),
                 "publish_fc2_done": self.token_comm.publishes_fc2_done,
+                "token_back_ready_granularity": self.token_back_ready_granularity,
             }
         )
         scheduler_type = (
@@ -407,6 +418,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.epilogue = SwapABGatedActEpilogue(fc12_problem_desc, resolved_impl_desc)
         if self.fuse_shared:
             self._init_shared_expert()
+        if self.token_back_ready_granularity == "token_tile":  # nosec B105
+            self._validate_token_tile_ready_contract()
         if self.epilogue.fc1_output_dtype is not self.b_dtype:
             raise ValueError("Epilogue FC1 output dtype must match the Mainloop B dtype.")
         if self.epilogue.fc1_output_sf_dtype is not self.sf_dtype:
@@ -500,7 +513,50 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         # those wait on gate/up tiles whose CTAs only get their next tile once the router is done.
         self.epilogue.shared_fc1_signal_early = not self.shared_fc2_claims
 
+    def _validate_token_tile_ready_contract(self) -> None:
+        """Check the consumer target against the actual scheduler and publisher.
+
+        Both preferred clusters and a complete fallback group cover the same
+        logical CTA coordinates. Using active-cluster dimensions here would
+        permit token-back before the other fallback clusters finish their data.
+        """
+        if not self.epilogue.fc2_use_tma:
+            raise ValueError("token_tile return-ready requires FC2 TMA stores.")
+        mapping_tile = self.scheduler.mapping_cta_tile_shape_mnk
+        mapping_cluster = self.scheduler.mapping_cluster_shape_mn
+        if (
+            mapping_cluster != (1, self.cluster_shape_mn[0])
+            or mapping_tile[:2] != (self.epilogue.cta_tile_n, self.epilogue.cta_tile_m)
+        ):
+            raise ValueError("token_tile scheduler and epilogue must share the preferred logical CTA geometry.")
+        expected_signals = ceil_div(self.hidden_size, mapping_tile[1] * mapping_cluster[1]) * mapping_cluster[1]
+        if (
+            self.token_comm.tokens_per_fc1_ready_slot != mapping_tile[0]
+            or self.token_comm.fc2_done_signals_per_token_tile != expected_signals
+        ):
+            raise ValueError("token_tile producer and consumer must share logical ready slots and completion counts.")
+
     def _validate_geometry(self) -> None:
+        if self.token_back_ready_granularity not in ("expert", "token_tile"):
+            raise ValueError(f"Unsupported token_back_ready_granularity {self.token_back_ready_granularity!r}.")
+        if self.token_back_ready_granularity == "token_tile":  # nosec B105
+            # The same configurations as Rubin; the internode component counts FC2 completion per expert.
+            if not (
+                self.schedule_mode in ("grouped", "phase_interleave")
+                and self.work_id_mode == "atomic_counter"
+                and self.token_back_mode in ("standalone_warps", "reuse_dispatch_warps")
+                and self.use_2cta_instrs
+                and self.fc2_use_bulk
+                and self.quant_kind == QuantKind.nvfp4
+                and not self.reduce_topk_in_kernel
+                and not self.internode
+            ):
+                raise ValueError(
+                    "token_tile return-ready requires grouped or phase_interleave/atomic_counter, "
+                    "standalone_warps or reuse_dispatch_warps, "
+                    "two-CTA MMA with hidden-only preferred/fallback clusters, "
+                    "FC2 TMA stores, NVFP4, separate top-k reduction, and the NVLink-domain component."
+                )
         if self.skip_topk_reduce and self.internode:
             raise ValueError("skip_topk_reduce does not expose internode partials.")
         if self.skip_topk_reduce and self.topk_reduce_persistent:
@@ -779,6 +835,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             # Empty for the NVLink-domain component: the internode=False kernel keeps main's name.
             + (f"_{self.token_comm.name_token}" if self.token_comm.name_token else "")
             + "_dlb_v1"
+            + ("_fc2readytile_v1" if self.token_back_ready_granularity == "token_tile" else "")  # nosec B105
             # Off / SwiGLU keep the historical name so existing compiled-kernel caches stay valid.
             + ("_fc1actscale" if self.fc1_activation_per_token_scale else "")
             + (f"_act{self.gate_activation}" if self.gate_activation != "swiglu" else "")

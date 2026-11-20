@@ -4802,27 +4802,41 @@ _MEGAMOE_PREFILL_TOKENS = 8192
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("sm_version", [100, 103])
-def test_megamoe_blackwell_candidates_offer_no_token_tile(sm_version: int) -> None:
-    """Regression: token_tile was offered on SM100/SM103, where the kernel cannot build it."""
+def test_megamoe_blackwell_candidates_offer_token_tile(sm_version: int) -> None:
+    """The Blackwell kernel builds token_tile readiness, so load-balanced tuning compares both modes on SM100/SM103."""
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 
     for tokens in (_MEGAMOE_HELPER_TOKENS, 2048, _MEGAMOE_PREFILL_TOKENS):
+        plain = megamoe_op.enumerate_megamoe_candidate_tactics(tokens, sm_version=sm_version)
+        # Field 10 of a canonical tactic is token_back_ready_granularity (field 11 combine_dedup).
+        assert all(megamoe_op._unpack_tactic(t)[10] == "expert" for t in plain)
         tactics = megamoe_op.enumerate_megamoe_candidate_tactics(
             tokens, sm_version=sm_version, load_balance=True
         )
-        assert tactics
-        # Field 10 of a canonical tactic is token_back_ready_granularity (field 11 combine_dedup).
-        assert all(megamoe_op._unpack_tactic(t)[10] == "expert" for t in tactics)
-    token_tile = megamoe_op._unpack_tactic(megamoe_op._MEGAMOE_NVFP4_COMBINE_BULK_TACTIC)
-    token_tile = (
-        *token_tile[:4],
-        "atomic_counter",
-        *token_tile[5:10],
-        "token_tile",
-        *token_tile[11:],
-    )
-    with pytest.raises(ValueError, match="token_tile builds on SM107 only"):
-        megamoe_op.validate_megamoe_tactic(token_tile, sm_version=sm_version)
+        fields = [megamoe_op._unpack_tactic(t) for t in tactics]
+        token_tile = [f for f in fields if f[10] == "token_tile"]
+        assert any(f[10] == "expert" for f in fields)
+        # The curated SM100/SM103 candidates hold a bulk-store, reuse-dispatch base from 2048 tokens on.
+        assert bool(token_tile) == (tokens >= 2048)
+        for f in token_tile:
+            assert f[0][0] == 256 and f[4] == "atomic_counter" and f[6]
+            assert f[5] in ("standalone_warps", "reuse_dispatch_warps")
+    base = megamoe_op._unpack_tactic(megamoe_op._MEGAMOE_NVFP4_COMBINE_BULK_TACTIC)
+    token_tile = (*base[:4], "atomic_counter", *base[5:10], "token_tile", *base[11:])
+    megamoe_op.validate_megamoe_tactic(token_tile, sm_version=sm_version)
+    # The tactic-local conditions stay: work ids, token-back warps, 2-CTA MMA and FC2 TMA stores.
+    for index, value, reason in (
+        (4, "grid_stride", "work_id_mode='grid_stride'"),
+        (5, "epi_warps", "token_back_mode='epi_warps'"),
+    ):
+        damaged = list(token_tile)
+        damaged[index] = value
+        with pytest.raises(ValueError, match=reason):
+            megamoe_op.validate_megamoe_tactic(tuple(damaged), sm_version=sm_version)
+    no_bulk = list(token_tile)
+    no_bulk[6], no_bulk[7] = False, None
+    with pytest.raises(ValueError, match="use_bulk_fc2_store=False"):
+        megamoe_op.validate_megamoe_tactic(tuple(no_bulk), sm_version=sm_version)
 
 
 @pytest.mark.cpu_only
@@ -5136,6 +5150,25 @@ def test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch(
             "default tactic, atomic-counter work ids",
             megamoe_op._with_atomic_counter_work_ids([default], sm_version)[-1],
         )
+        # token_tile return readiness, which load-balanced tuning offers on the bulk-store,
+        # reuse-dispatch, atomic-counter candidates: per-tile FC2 completion with helper slots.
+        token_tile = (
+            [256, 256, 256],
+            [2, 1, 1],
+            None,
+            ("grouped", 512),
+            "atomic_counter",
+            "reuse_dispatch_warps",
+            True,
+            2,
+            4,
+            tuple(megamoe_op._unpack_tactic(default)[9]),
+            "token_tile",
+            False,
+        )
+        name = runner._build_kernel_once(token_tile).name()
+        assert "_fc2readytile_v1" in name and f"helpers{len(sources)}" in name, name
+        add("token_tile readiness, atomic-counter work ids", token_tile)
         mismatched = {}
         with torch.inference_mode():
             for name, tactic in cases.items():
