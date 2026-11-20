@@ -1,7 +1,7 @@
 # adaptive-eplb-full: build and run
 
 Branch `adaptive-eplb-full` on `git@github.com:etz-lmn/TensorRT-LLM.git`, based on upstream TensorRT-LLM
-`1f3b31be8` (the commit of the `1.4.0rc5.dev202611190007` nightly). It carries, in order (the tip commit adds only this file):
+`1f3b31be8` (the commit of the `1.4.0rc5.dev202611190007` nightly). It carries, in order (after them: this file and a fix of the runner's kernel arguments):
 
 | commit | content |
 |---|---|
@@ -110,9 +110,5 @@ GB300 (SM103), image `1.4.0rc5.dev202611190007` with a C++ build of this branch 
   and the adaptive route; with helper slots it equals the helper-free launch.
 - CPU: the commit's pre-commit hooks all pass; bandit reports one finding inherited from the parent
   (`adaptive_eplb/runtime.py:25`, B404 `import subprocess`).
-- Known test failures, also on the parent:
-  - `test_megamoe_combine_dedup_tactic.py::test_query_and_runner_build_the_same_dedup_kernel`: the kernel-property
-    query and the runner build the kernel with different arguments (`adaptive_route_experts=0` only on the runner).
-    It affects the combine-dedup option, which is SM107-only, not the GB300 path above; a fix is in progress.
-  - `test_dynamic_eplb_contracts.py`: two checks that read C++ sources failed in a run whose copy of the tests had
-    no `cpp/` tree; not yet rerun in a full checkout.
+- `test_megamoe_combine_dedup_tactic.py` (with the new regression test for the runner's kernel arguments) and
+  `test_dynamic_eplb_contracts.py` pass on CPU in the image, run from a checkout that includes `cpp/`.
