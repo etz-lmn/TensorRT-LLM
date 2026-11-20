@@ -111,4 +111,5 @@ GB300 (SM103), image `1.4.0rc5.dev202611190007` with a C++ build of this branch 
 - CPU: the commit's pre-commit hooks all pass; bandit reports one finding inherited from the parent
   (`adaptive_eplb/runtime.py:25`, B404 `import subprocess`).
 - `test_megamoe_combine_dedup_tactic.py` (with the new regression test for the runner's kernel arguments) and
-  `test_dynamic_eplb_contracts.py` pass on CPU in the image, run from a checkout that includes `cpp/`.
+  `test_dynamic_eplb_contracts.py` pass on CPU in the image, run from a checkout that includes `cpp/` (on a host without
+  a GPU driver, `test_pyexecutor_shutdown_tail_failure_is_retryable` needs a `libcuda.so.1` stub on the library path).
