@@ -22,7 +22,7 @@ import mmap
 import os
 import queue
 import socket
-import subprocess
+import subprocess  # nosec B404 - starts decision_main.py under sys.executable: fixed argv, no shell
 import sys
 import threading
 import traceback
