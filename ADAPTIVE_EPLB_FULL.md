@@ -1,7 +1,7 @@
 # adaptive-eplb-full: build and run
 
 Branch `adaptive-eplb-full` on `git@github.com:etz-lmn/TensorRT-LLM.git`, based on upstream TensorRT-LLM
-`1f3b31be8` (the commit of the `1.4.0rc5.dev202611190007` nightly). It carries, in order (after them: this file and a fix of the runner's kernel arguments):
+`1f3b31be8` (the commit of the `1.4.0rc5.dev202611190007` nightly). It carries, in order (after them: this file, a fix of the runner's kernel arguments, and the three fixes of #22100 v19 in the last row):
 
 | commit | content |
 |---|---|
@@ -9,6 +9,7 @@ Branch `adaptive-eplb-full` on `git@github.com:etz-lmn/TensorRT-LLM.git`, based 
 | `fc6638c43` | MTP checkpoint fix (#22096) |
 | `b5f6c189d` `cb8db663f` `2527f16ab` | Adaptive EPLB (#22100): policy, runtime, transport, adaptive route in the MegaMoE router, on-GPU time-model calibration, tests |
 | `3fb84c503` | the rest of the MegaMoE kernel changes of cutedsl_megamoe!173: Blackwell `token_tile` return readiness, adaptive-route guards in the dedup and Rubin local routers; the op no longer refuses `token_tile` on SM100/SM103 |
+| `db2836a30` `67ae6a83b` `6fcaaf8c6` | #22100 v19: statistics of mixed steps (a batch with context requests records its generation rows); a MegaMoE bucket whose kernel has no adaptive route in its dispatch router (every SM107 kernel) routes through the adaptive EPLB route op; `num_slots` must leave every rank two spare slots |
 
 ## Build
 
@@ -33,8 +34,11 @@ package alone is not enough: build the wheel.
 ## Enable adaptive EPLB
 
 Requirements: `moe_config.backend: MEGAMOE_CUTEDSL`, expert parallelism (`moe_expert_parallel_size > 1`, attention
-DP), all EP ranks in one NVLink domain (one node or one MNNVL rack), `num_slots` >= number of experts and divisible
-by the EP size.
+DP), all EP ranks in one NVLink domain (one node or one MNNVL rack), the number of experts divisible by the EP size,
+and `num_slots` divisible by the EP size and at least experts + 2 x EP size: every rank needs two spare slots, because a
+planned layout keeps half of a rank's spare slots free for the next install. With fewer, the first MoE layer fails at
+model build with ``ValueError: `num_slots` (N) must be at least M for adaptive EPLB with E experts at `ep_size` P ...``
+(384 experts: at least 448 slots at EP32, 640 at EP128).
 
 ```yaml
 enable_attention_dp: true
@@ -61,8 +65,8 @@ Python API (`from tensorrt_llm.llmapi.llm_args import MoeAdaptiveLoadBalancerCon
 
 ### Disaggregated (PD) serving: decode only
 
-Adaptive EPLB counts only steps whose batch holds generation requests alone, so it belongs on the generation
-servers. Put the `load_balancer` block only in the `gen` worker config; leave the `ctx` workers without it:
+Adaptive EPLB balances for decode, so on a disaggregated deployment it belongs on the generation servers. Put the
+`load_balancer` block only in the `gen` worker config; leave the `ctx` workers without it:
 
 ```yaml
 worker_config:
@@ -79,7 +83,8 @@ worker_config:
         calibration_cache_dir: /shared/adaptive_eplb
 ```
 
-On an aggregated server the context steps run on the installed placement without being counted.
+On an aggregated server a step with context requests records the rows of its generation tokens (context rows are
+not counted) and runs on the installed placement, so continuous arrivals no longer keep the statistics windows empty.
 
 ## Known limits
 
@@ -90,6 +95,8 @@ On an aggregated server the context steps run on the installed placement without
 - A runtime error (including ranks reaching different decisions) turns adaptive EPLB off for the rest of the run;
   serving continues on the installed placements.
 - At most half of the replica slots hold replicas at any time (the other half receives the next install).
+- On SM107 (Rubin) every MegaMoE bucket routes through the adaptive EPLB route op, a separate launch per layer: only
+  the Blackwell kernel has the adaptive route in its dispatch router. The log names each such bucket once.
 - `token_tile` return readiness on SM100/SM103: the kernel builds it for the NVLink-domain component only (not
   internode). The op offers it only to load-balanced autotuning with helper experts (per-layer dynamic EPLB), from
   2048 tokens per launch on; the default tactics and the adaptive-EPLB path keep expert readiness unless a tactic
@@ -98,6 +105,21 @@ On an aggregated server the context steps run on the installed placement without
   multi-node MNNVL were not run on this exact branch tip.
 
 ## Validation
+
+With the v19 fixes (`db2836a30` `67ae6a83b` `6fcaaf8c6`), GB300 (SM103), the `1.4.0rc5.dev202611190007` image with the
+C++ build of this branch (the fixes change no C++): every test file below run whole against `8ae882fe6`, one GB300 node.
+
+- MegaMoE and adaptive EPLB unit tests (stage routes, staging, proxy fences, mixed-step statistics, dedup tactic,
+  dynamic-EPLB contracts, the MegaMoE adaptive-EPLB backend, balancer, policy, runtime, `test_llm_args.py`): 961
+  passed, 8 failed on both sides, no lost pass. The 15 cases that fail before the fixes are the fixes' own tests. The
+  8 that fail on both sides are environment cases: in `test_llm_args.py`, four need the `ray` package and two need a
+  local Hugging Face model; two source-reading contract tests need `cpp/` in the test tree.
+- With MPI (before-launch, adaptive-route e2e, MegaMoE e2e, live rows): 10 passed on both sides.
+- `test_dsv4_route_quant.py`: 22 passed on both sides.
+- Kernel gate (route, statistics and input staging against the pinned reference kernels, bitwise and timed): PASS.
+- Pre-commit hooks pass; bandit still reports the parent's `adaptive_eplb/runtime.py:25` (B404).
+
+Before the v19 fixes:
 
 GB300 (SM103), image `1.4.0rc5.dev202611190007` with a C++ build of this branch (`3fb84c503` changes no C++ against
 `2527f16ab`).
