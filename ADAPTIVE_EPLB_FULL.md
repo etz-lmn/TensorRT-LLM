@@ -109,6 +109,10 @@ not counted) and runs on the installed placement, so continuous arrivals no long
 With the v19 fixes (`db2836a30` `67ae6a83b` `6fcaaf8c6`), GB300 (SM103), the `1.4.0rc5.dev202611190007` image with the
 C++ build of this branch (the fixes change no C++): every test file below run whole against `8ae882fe6`, one GB300 node.
 
+- GSM8K, DeepSeek-V4-Pro NVFP4, DEP4, MTP (3 drafts), adaptive EPLB on (`num_slots` = experts + 16 = 400, four spare
+  slots per GPU, so the slot check passes), at `e5ebd21e2`: accuracy 96.51 (reference 95.90), 7 installs, acceptance
+  length 3.13, the same as before the fixes. The calibration ran at start-up and all 33 decode buckets held; the test
+  sets no cache directory, so it stayed in memory.
 - MegaMoE and adaptive EPLB unit tests (stage routes, staging, proxy fences, mixed-step statistics, dedup tactic,
   dynamic-EPLB contracts, the MegaMoE adaptive-EPLB backend, balancer, policy, runtime, `test_llm_args.py`): 961
   passed, 8 failed on both sides, no lost pass. The 15 cases that fail before the fixes are the fixes' own tests. The
@@ -117,7 +121,7 @@ C++ build of this branch (the fixes change no C++): every test file below run wh
 - With MPI (before-launch, adaptive-route e2e, MegaMoE e2e, live rows): 10 passed on both sides.
 - `test_dsv4_route_quant.py`: 22 passed on both sides.
 - Kernel gate (route, statistics and input staging against the pinned reference kernels, bitwise and timed): PASS.
-- Pre-commit hooks pass; bandit still reports the parent's `adaptive_eplb/runtime.py:25` (B404).
+- Pre-commit hooks and bandit pass (`e5ebd21e2` annotates the decision process's `import subprocess`, as #22100 does).
 
 Before the v19 fixes:
 
