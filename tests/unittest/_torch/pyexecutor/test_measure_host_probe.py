@@ -58,6 +58,17 @@ def test_patched_boundary_spins_its_dose_after_its_work():
     assert slept == [250_000, 4_000_000, 250_000, 4_000_000]
 
 
+def test_a_second_executor_does_not_double_the_dose():
+    cls = type("R", (Runtime,), {})
+    slept = []
+    inject_boundary(cls, 4, (250,), sleep=slept.append)
+    inject_boundary(cls, 4, (250,), sleep=slept.append)  # the serving executor after the profiling one
+    rt = cls()
+    for _ in range(4):
+        rt._boundary()
+    assert slept == [250_000]
+
+
 def test_spin_holds_the_thread_for_its_time():
     now = [0]
 

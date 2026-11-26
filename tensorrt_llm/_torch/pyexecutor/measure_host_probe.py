@@ -51,7 +51,11 @@ def dose_of(call: int, every: int, doses_us: tuple) -> int:
 
 
 def inject_boundary(cls, every: int, doses_us: tuple, sleep=spin) -> None:
-    """Make ``cls._boundary`` (adaptive EPLB's ``AdaptiveRuntime``) spin its dose after its work."""
+    """Make ``cls._boundary`` (adaptive EPLB's ``AdaptiveRuntime``) spin its dose after its work, once
+    per process: the executor is built twice (a profiling one, then the serving one), and a second
+    patch over the first would spin every dose twice."""
+    if getattr(cls._boundary, "measure_host_probe", None) is not None:
+        return
     original = cls._boundary
 
     def _boundary(self):
