@@ -35,9 +35,9 @@ class IterationStatsRecord(NamedTuple):
     # The record was taken without a forward pass: it reports the queues, and
     # its duration and per-loop timings are not measurements.
     is_queue_snapshot: bool = False
-    # Cumulative adaptive-MoE load-balancer counters of the rank (windows, installs,
-    # installedLayers), when an adaptive load balancer runs.
-    moe_load_balancer_stats: dict[str, int] | None = None
+    # Adaptive-MoE load-balancer counters of the rank (windows, installs, installedLayers,
+    # copiedBytes, imbalance, enabled), when an adaptive load balancer runs.
+    moe_load_balancer_stats: dict[str, int | float] | None = None
 
     @classmethod
     def from_tuple(cls, stats: tuple) -> IterationStatsRecord:
