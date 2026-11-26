@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch.moe.fused_moe import adaptive_eplb_ablation as ablation
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import runtime as rt
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.balancer import AdaptiveMoeLoadBalancer
 from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
@@ -948,3 +949,87 @@ def test_statistics_count_only_inside_the_windows_the_runtime_schedules(host_cud
         assert torch.equal(counted, reference)
     balancer.observe_scheduled_batch(0, True, False, lambda start, stop: (0, 0, 0))
     assert flag.item() == 0
+
+
+def ablated(monkeypatch, value, copy_ms=0.5) -> rt._Decider:
+    """Rank 0's measured decider under the measurement-only ablation ``value``."""
+    ablation.apply(rt, value, monkeypatch.setattr)
+    return measured_decider(copy_ms)
+
+
+def test_no_ablation_serves_the_product_decider(monkeypatch):
+    decide, solve, patched = rt._Decider.decide, rt.solve_shares, []
+    monkeypatch.delenv(ablation.VARIABLE, raising=False)
+    ablation.apply(rt, ablation.mode(), lambda *args: patched.append(args))
+    assert not patched and rt._Decider.decide is decide and rt.solve_shares is solve
+    monkeypatch.setenv(ablation.VARIABLE, "install-all")
+    with pytest.raises(ValueError):
+        ablation.mode()
+
+
+def test_even_shares_installs_only_copies_that_repay_and_never_refreshes(monkeypatch):
+    decider = ablated(monkeypatch, "even_shares")
+    window_stats(decider.stats)  # many steps left: both layers repay their copies
+    assert decider.decide(0).moved == [0, 1]
+    assert np.allclose(decider.shares[0], even_split(None, decider.layout[0], GEOMETRY))
+    decider.schedule(0, np.array([[10, 2, 1.0, 0]] * R))
+    # One step left repays no copy of warm expert 4, and even shares solved again gain nothing:
+    # nothing publishes (the product publishes the solved shares here, without a copy).
+    window_stats(decider.stats, live=0, remaining=8)[:, 4 : L * E : E] = 200
+    update = decider.decide(1)
+    assert update.tables == {} and update.moved == []
+
+
+@pytest.mark.parametrize("value", ["install_all", "install_all_solved"])
+def test_install_all_installs_every_gaining_layer_at_once(monkeypatch, value):
+    held = ablated(monkeypatch, "even_shares")
+    window_stats(held.stats, remaining=8)  # the product's rule: one step left repays no copy
+    assert held.decide(0).moved == []
+    monkeypatch.undo()  # install_all_solved keeps the product's solve_shares
+    decider = ablated(monkeypatch, value, copy_ms=None)  # no copy timed yet either
+    for w, hot in enumerate(((0, 1), (4, 5))):
+        window_stats(decider.stats, hot, live=w - 1, remaining=8)
+        update = decider.decide(w)
+        assert update.moved == [0, 1] and sorted(update.tables) == [0, 1]
+        live = decider.layout[0] >= 0
+        assert np.allclose(np.bincount(decider.layout[0][live], decider.shares[0][live]), 1.0)
+        decider.schedule(w, np.array([[10 + 20 * w, 2, 1.0, 0]] * R))
+    window_stats(decider.stats, (4, 5), live=1, remaining=8)  # the same rows: nothing gains
+    assert decider.decide(2).tables == {}
+    monkeypatch.setattr(rt, "plan_layout", lambda *args: SimpleNamespace(layout=args[3].copy()))
+    window_stats(decider.stats, (4, 5), live=1, remaining=8)[:, 0 : L * E : E] = 400  # GPU 0 hot
+    update = decider.decide(3)  # the same layouts: solved shares refresh without a copy, as in R
+    assert sorted(update.tables) == [[], [0, 1]][value == "install_all_solved"] and not update.moved
+
+
+def test_freeze_keeps_the_first_priced_plan_and_its_shares(monkeypatch):
+    monkeypatch.setattr(rt, "solve_shares", even_split)
+    deciders = {v: ablated(monkeypatch, v, copy_ms=None) for v in ("", "freeze")}
+    for d in deciders.values():  # no copy timed yet: the product installs its best layer alone
+        window_stats(d.stats)
+        assert d.decide(0).moved == [0]
+        d.schedule(0, np.array([[10, 1, 0.5, 0]] * R))
+        window_stats(d.stats, live=0)
+        assert d.decide(1).moved == [1]  # priced now: the rest of the plan installs
+        d.schedule(1, np.array([[30, 1, 0.5, 0]] * R))
+    product, frozen = deciders[""], deciders["freeze"]
+    assert (frozen.layout == product.layout).all()
+    layout, shares = frozen.layout.copy(), frozen.shares.copy()
+    for w in (2, 3):  # the rows move: FREEZE publishes nothing, its layouts and shares stay
+        window_stats(frozen.stats, (4, 5), live=1)
+        assert frozen.decide(w).tables == {}
+        frozen.schedule(w, np.array([[30 + 20 * w, 0, 0.0, 0]] * R))
+    assert (frozen.layout == layout).all() and (frozen.shares == shares).all()
+
+
+def test_xfit_installs_the_file_layouts_once(monkeypatch, tmp_path):
+    layout = np.tile(np.where(np.arange(R * LOCAL) == LOCAL + 4, 0, HOME), (L, 1))
+    shares = np.where(layout >= 0, np.where(layout == 0, 0.5, 1.0), 0.0)
+    np.savez(tmp_path / "fit.npz", layout=layout, shares=shares)
+    monkeypatch.setenv(ablation.XFIT_LAYOUT, str(tmp_path / "fit.npz"))
+    decider = ablated(monkeypatch, "xfit", copy_ms=None)
+    window_stats(decider.stats, (4, 5))  # rows the file was not fitted on
+    assert decider.decide(0).moved == [0, 1] and (decider.layout == layout).all()
+    decider.schedule(0, np.array([[10, 2, 1.0, 0]] * R))
+    window_stats(decider.stats, (4, 5), live=0)
+    assert decider.decide(1).tables == {} and (decider.shares == shares).all()

@@ -39,7 +39,7 @@ def main(argv: list[str]) -> None:
     for library in argv[2:]:
         torch.ops.load_library(library)
     load("policy")
-    load("runtime").serve(Connection(int(argv[1])))
+    load("../adaptive_eplb_ablation").serve(load("runtime"), Connection(int(argv[1])))
 
 
 if __name__ == "__main__":
