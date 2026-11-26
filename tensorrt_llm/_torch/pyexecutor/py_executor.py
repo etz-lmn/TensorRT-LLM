@@ -125,6 +125,7 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           initialize_multimodal_encoder_request,
                           is_mm_context_chunk_ready, release_consumed_mm_items)
 from .measure_admission_gate import MeasuredAdmission
+from .measure_host_probe import HostProbe
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
@@ -729,6 +730,7 @@ class PyExecutor:
     # Set on a rank that reports completions while requests its first-token
     # check finished, which run no batch, wait for an iteration-stats record.
     _has_close_outs_pending_iter_stats = False
+    _stage_steps = None
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -1106,6 +1108,11 @@ class PyExecutor:
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self._measured_admission = MeasuredAdmission()
+        # Measurement only (measure_host_probe): boundary doses, per-pass
+        # stage times, the thread switch interval.
+        self._host_probe = HostProbe.from_env()
+        self._host_probe.install()
+        self._stage_steps = self._host_probe.steps
         self.shutdown_event = threading.Event()
 
         # Rolling true acceptance-rate tracking for permanent speculation
@@ -1758,8 +1765,9 @@ class PyExecutor:
         # vector). Config-derived, so identical on every rank; see
         # _resolve_packed_sync_enabled.
         self._packed_sync_enabled = self._resolve_packed_sync_enabled()
-        self._stage_timing = os.environ.get("TLLM_EXECUTOR_STAGE_TIMING",
-                                            "0") == "1"
+        self._stage_timing = os.environ.get(
+            "TLLM_EXECUTOR_STAGE_TIMING",
+            "0") == "1" or self._stage_steps is not None
         self._stage_acc: Dict[str, float] = {}
         self._stage_n = 0
         self._stage_busy = 0
@@ -3164,6 +3172,8 @@ class PyExecutor:
             return
         self._stage_pass_t0 = self._stage_t = time.perf_counter()
         self._stage_cpu0 = time.thread_time()
+        if self._stage_steps is not None:
+            self._stage_steps.begin()
 
     def _stage_mark(self, name: str) -> None:
         if not self._stage_timing:
@@ -3172,6 +3182,8 @@ class PyExecutor:
         self._stage_acc[name] = self._stage_acc.get(name,
                                                     0.0) + (now - self._stage_t)
         self._stage_t = now
+        if self._stage_steps is not None:
+            self._stage_steps.mark(name)
 
     def _stage_end(self, busy: bool) -> None:
         if not self._stage_timing:
@@ -4215,6 +4227,9 @@ class PyExecutor:
             self._quiescent_stats_iter = self.iter_counter
 
     def _executor_loop_cleanup(self):
+        probe = getattr(self, "_host_probe", None)
+        if probe is not None:  # measurement only: the per-pass stage times
+            probe.dump(getattr(self.dist, "rank", 0))
         # Responses held for the next GPU wait go out first.
         self._stage_responses = False
         self._flush_staged_responses()
