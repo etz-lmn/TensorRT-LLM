@@ -683,11 +683,31 @@ def test_megamoe_kernels_without_the_adaptive_route_record_their_ptx(
         "no_eplb_resource_usage",
         json.dumps({k: v[2] for k, v in digests.items() if v[0] == "cubin"}),
     )
-    adaptive = _kernel_ptx_digests(_AR_EXPERTS, tmp_path / "adaptive", tokens)
-    record_property(
-        "adaptive_resource_usage",
-        json.dumps({k: v[2] for k, v in adaptive.items() if v[0] == "cubin"}),
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
+
+    props = op.query_megamoe_kernel_properties(
+        world_size=32,
+        num_topk=6,
+        num_experts_per_rank=16,
+        hidden_size=7168,
+        intermediate_size_per_partition=3072,
+        expand_intermediate_size_per_partition=6144,
+        max_tokens_per_rank=tokens,
+        apply_topk_in_fc1=True,
+        gate_up_clamp=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        situ_beta=None,
+        situ_linear_beta=None,
+        in_kernel_fc2_reduce=False,
+        combine_format="16e2m1xbf16",
     )
+    if props.routes_adaptive_in_router:
+        adaptive = _kernel_ptx_digests(_AR_EXPERTS, tmp_path / "adaptive", tokens)
+        record_property(
+            "adaptive_resource_usage",
+            json.dumps({k: v[2] for k, v in adaptive.items() if v[0] == "cubin"}),
+        )
 
 
 @pytest.mark.skipif(
