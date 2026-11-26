@@ -124,6 +124,7 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           get_mm_items_for_chunk, get_mm_pending_items,
                           initialize_multimodal_encoder_request,
                           is_mm_context_chunk_ready, release_consumed_mm_items)
+from .measure_admission_gate import MeasuredAdmission
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
@@ -1104,6 +1105,7 @@ class PyExecutor:
 
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
+        self._measured_admission = MeasuredAdmission()
         self.shutdown_event = threading.Event()
 
         # Rolling true acceptance-rate tracking for permanent speculation
@@ -9867,9 +9869,17 @@ class PyExecutor:
             if self.dist.rank == 0:
                 preemption.maybe_log()
 
-        # 3. Pop requests from waiting queue
-        new_requests, placement = self._pop_from_waiting_queue(
-            waiting_queue, total_num_active_requests, all_rank_states)
+        # 3. Pop requests from waiting queue (a measurement may hold it
+        # until its whole run is queued: measure_admission_gate)
+        admit = True
+        if not self.is_warmup:
+            admit, all_rank_states = self._measured_admission.step(
+                all_rank_states, waiting_queue, self.max_num_active_requests)
+        if admit:
+            new_requests, placement = self._pop_from_waiting_queue(
+                waiting_queue, total_num_active_requests, all_rank_states)
+        else:
+            new_requests, placement = [], {}
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -9889,6 +9899,8 @@ class PyExecutor:
                     all_rank_states, new_requests,
                     self.max_num_active_requests, placement=placement)
             self.request_broadcaster.deliver_prompts(all_ranks_new_requests)
+            if not self.is_warmup:
+                self._measured_admission.record(all_ranks_new_requests)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
             all_new_flat = [
