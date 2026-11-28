@@ -792,6 +792,13 @@ class TestMoeConfigAdaptiveEplb:
         assert "runs only on the MEGAMOE_CUTEDSL MoE backend" in text
         assert "Set moe_config.backend to 'MEGAMOE_CUTEDSL' or 'AUTO'" in text
 
+    def test_tactic_must_match_an_implementation_that_balances(self) -> None:
+        adaptive = {"mode": "adaptive", "num_slots": 512}
+        MoeConfig(tactic="cutedsl.mega_moe", load_balancer=adaptive)
+        with pytest.raises(ValidationError,
+                           match="none of which supports adaptive EPLB"):
+            MoeConfig(tactic="cutlass", load_balancer=adaptive)
+
     @pytest.mark.parametrize(
         "num_slots, num_experts, message",
         [

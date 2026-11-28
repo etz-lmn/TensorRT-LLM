@@ -2774,12 +2774,12 @@ class MoeConfig(StrictBaseModel):
         return self
 
     def _check_adaptive_backend(self) -> None:
-        """Refuse a backend under which no MoE layer can balance.
+        """Refuse a backend or tactic under which no MoE layer can balance.
 
         ``AUTO`` stays: resolution picks an implementation that supports
         adaptive EPLB for each layer that has one and runs the others (an MTP
         layer in another format, say) as plain EP outside the balancer. A
-        backend that excludes every such implementation would leave
+        backend or tactic that excludes every such implementation would leave
         the balancer with no layer, so it is refused here, before the model
         loads.
         """
@@ -2791,7 +2791,19 @@ class MoeConfig(StrictBaseModel):
                "(NVFP4 experts, SM100 / SM103 / SM107): the balancer installs "
                "replicas into that backend's expert slots and routes through "
                "its route table")
-        if self.tactic is None and self.backend not in ("AUTO", supported):
+        if self.tactic is not None:
+            request = _moe_tactic_request(self.tactic, "moe_config.tactic")
+            if not any(impl_cls.capabilities.supports_adaptive_eplb
+                       for impl_cls in request.impls):
+                matched = [
+                    impl_cls.descriptor.impl_id for impl_cls in request.impls
+                ]
+                raise ValueError(
+                    f"moe_config.tactic={self.tactic!r} matches {matched}, none "
+                    f"of which supports adaptive EPLB; {why}. Use a tactic "
+                    f"that matches {supported} (e.g. 'cutedsl.mega_moe'), or drop "
+                    "moe_config.load_balancer.")
+        elif self.backend not in ("AUTO", supported):
             raise ValueError(f"moe_config.backend={self.backend!r} cannot run "
                              f"adaptive EPLB: {why}. {fix}")
 

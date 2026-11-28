@@ -5237,6 +5237,10 @@ def test_megamoe_refused_decode_default_runs_its_phase_interleave_twin(
         def problem_desc_require(cls) -> dict:
             return {}
 
+        @classmethod
+        def impl_desc_require(cls) -> dict:
+            return {}
+
         def get_workspace_sizes(self) -> Tuple[int, int]:
             return 0, 4096
 
@@ -5433,6 +5437,9 @@ def test_megamoe_runner_refuses_a_shared_workspace_smaller_than_its_kernel_needs
     runner = megamoe_op.Sm100MegaMoENvfp4Runner.__new__(megamoe_op.Sm100MegaMoENvfp4Runner)
     runner.world_size, runner.num_experts_per_rank, runner._profiling_scratch = 1, 18, None
     runner.ugpu_weight_layout = "none"
+    runner.num_topk = runner.hidden_size = runner.intermediate_size_per_partition = 1  # its key
+    runner.max_tokens_per_rank, runner.combine_format = 1, None
+    monkeypatch.setattr(megamoe_op, "_MEGAMOE_LAUNCHED_TACTICS", {})  # this launch's tactic only
     monkeypatch.setattr(
         runner, "_resolve_kernel_descriptor", lambda tactic, allow_fallback: (kernel, tactic)
     )
@@ -5446,11 +5453,65 @@ def test_megamoe_runner_refuses_a_shared_workspace_smaller_than_its_kernel_needs
     with pytest.raises(ValueError, match=r"has 4095 bytes, but the kernel for 18 experts"):
         runner.forward(
             inputs,
-            tactic=("not", "the", "default"),
+            tactic=megamoe_op._MEGAMOE_QUANTIZED_COMBINE_TACTIC,  # not the default
             peer_offsets=[0],
             shared_workspace=torch.empty(needed - 1, dtype=torch.uint8),
         )
     assert not launched
+
+
+@pytest.mark.cpu_only
+def test_megamoe_symm_provider_is_never_shared_across_adaptive_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Layers whose dispatch router applies an adaptive route get their own symmetric buffer: a
+    shared workspace pairs with one local workspace layout, and the two kinds of layers differ."""
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
+    monkeypatch.setattr(megamoe_op, "_MEGAMOE_SYMM_PROVIDER_CACHE", {})
+    monkeypatch.setattr(
+        megamoe_op, "MegaMoeSymmMemProvider", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    layout = dict(
+        process_group=SimpleNamespace(group_name="ep"),
+        world_size=4,
+        rank=0,
+        hidden_size=7168,
+        max_tokens_per_rank=256,
+        num_topk=6,
+        output_dtype=torch.bfloat16,
+        combine_format="bf16",
+        shared_workspace_bytes=1 << 20,
+    )
+    plain = megamoe_op.get_megamoe_symm_provider(**layout)
+    assert megamoe_op.get_megamoe_symm_provider(**layout) is plain
+    adaptive = megamoe_op.get_megamoe_symm_provider(**layout, adaptive_route=True)
+    assert adaptive is not plain
+    assert megamoe_op.get_megamoe_symm_provider(**layout, adaptive_route=True) is adaptive
+
+
+@pytest.mark.cpu_only
+def test_megamoe_cached_local_workspace_is_taken_with_its_tmp_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launch that finds its local workspace cached takes it whole: the allocation holds the
+    kernel's tmp buffer behind the local workspace, so only another layout is refused."""
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        pytest.skip(str(megamoe_op.MEGAMOE_OP_UNAVAILABLE_REASON))
+    monkeypatch.setattr(megamoe_op, "_MEGAMOE_LOCAL_WORKSPACE_CACHE", {})
+    kernel = SimpleNamespace(
+        get_workspace_sizes=lambda: (1216, 0), get_tmp_buffer_bytes=lambda: 4096
+    )
+    cached = torch.empty(1280 + 4096, dtype=torch.uint8)  # the local bytes padded to 128, then tmp
+    megamoe_op._MEGAMOE_LOCAL_WORKSPACE_CACHE["key"] = cached
+    assert megamoe_op._get_or_alloc_local_workspace(kernel, "key", torch.device("cpu")) is cached
+    megamoe_op._MEGAMOE_LOCAL_WORKSPACE_CACHE["key"] = torch.empty(1216, dtype=torch.uint8)
+    with pytest.raises(RuntimeError, match="share its layout"):
+        megamoe_op._get_or_alloc_local_workspace(kernel, "key", torch.device("cpu"))
 
 
 def _with_slot_copies(tensor: torch.Tensor, slots: int, sources: Tuple[int, ...]) -> torch.Tensor:
@@ -8527,6 +8588,7 @@ def _chunking_moe(backend, num_chunks: int) -> SimpleNamespace:
         split_chunk=lambda n, k: [n // k + (i < n % k) for i in range(k)],
         determine_communication_method=no_op,
         _using_dynamic_load_balancer=lambda: False,
+        _load_balancer_uses_replica_plan=lambda: False,
         _warmup_placement_route_counters=lambda row_offset: None,
         _load_balancer_start_wait_gpu_stage=no_op,
         _load_balancer_start_set_cpu_stage=no_op,
