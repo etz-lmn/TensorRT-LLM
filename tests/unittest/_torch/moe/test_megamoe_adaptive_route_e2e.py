@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """DeepSeek-V4 MegaMoE layers on four GPUs (attention DP, EP4, 384 experts) with and without an adaptive load
-balancer (512 slots, home route tables, no runtime), at decode (8 / 64 / 128 rows per rank, the one-round router;
-on SM107 the generation-phase kernel up to 1024) and prefill (1024 / 4096 / 8192, the metadata-push router) sizes.
+balancer (512 slots, home route tables, no runtime), at decode (8 to 448 rows per rank: on Blackwell the one-round
+router up to 256 and the metadata-push router above; on SM107 one row count in each generation-phase bucket 32 to
+512, the 1024 bucket by the first prefill size) and prefill (1024 / 4096 / 8192, the metadata-push router) sizes.
 
 Bit for bit where both layers add the top-k picks in one fixed order (_same): an adaptive layer whose dispatch
 router maps and counts its routes returns what the same layer returns on the staged route, and what a layer without
@@ -40,7 +41,8 @@ _HIDDEN_SIZE = 7168
 _INTERMEDIATE_SIZE = 3072
 _CLAMP = 10.0
 _SCALING = 2.5
-_DECODE_ROWS = (8, 64, 128)
+# One row count per SM107 generation-phase bucket (32, 64, 128, 192, 256, 384, 512; 1024 is the first prefill size).
+_DECODE_ROWS = (8, 64, 128, 160, 256, 320, 448)
 _PREFILL_ROWS = (1024, 4096, 8192)
 _MAX_NUM_TOKENS = 8192
 _LAYERS = 8  # distinct layers per arm
@@ -467,6 +469,21 @@ def _run() -> None:
             del graph
             _assert_on_all_ranks(problem)
         use_router(True)
+
+
+def test_the_rows_cover_every_sm107_generation_phase_bucket(monkeypatch) -> None:
+    """The rows of the decode sizes and the first prefill size launch in every SM107 bucket with a
+    generation-phase tactic, one each: the backend's SM107 launch ladder, then its tactic bucket."""
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as op
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe import mega_moe_cute_dsl as backend
+
+    monkeypatch.setattr(backend, "get_sm_version", lambda: 107)
+    ladder = backend.TrtllmCutedslMegaMoeNvfp4Impl._resolve_maxt_buckets(_MAX_NUM_TOKENS)
+    rows = (*_DECODE_ROWS, _PREFILL_ROWS[0])
+    launched = [min(bucket for bucket in ladder if bucket >= count) for count in rows]
+    assert [op._sm107_tactic_bucket(bucket) for bucket in launched] == sorted(
+        op._SM107_GENPHASE_TACTICS
+    ), launched
 
 
 @pytest.mark.threadleak(enabled=False)
